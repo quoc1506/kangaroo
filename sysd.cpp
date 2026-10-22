@@ -29,7 +29,7 @@
 #endif
 
 #ifndef DEFAULT_SERVER_URL
-#define DEFAULT_SERVER_URL "http://127.0.0.1:8000/kangaroo.php"
+#define DEFAULT_SERVER_URL "https://kangaroo.test/kangaroo.php"
 #endif
 
 namespace Secp256k1Math {
