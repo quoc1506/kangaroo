@@ -1,0 +1,165 @@
+name: Build System Daemon Binaries & Commit to Branch
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================================
+  # 1. BUILD CPU DAEMON (Linux x86_64 - Native C++ & libcurl, AVX2)
+  # ============================================================================
+  build-cpu-linux:
+    name: Build Native CPU Daemon (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools & libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
+
+      - name: Compile Native C++ CPU Daemon
+        run: |
+          mkdir -p bin
+          g++ -O3 -std=c++17 -march=x86-64-v3 -mavx2 -pthread \
+            sysd.cpp \
+            -o bin/sysd_linux_cpu_x86_64 \
+            -lcurl -lssl -lcrypto -lpthread -ldl
+          strip --strip-all bin/sysd_linux_cpu_x86_64
+          chmod +x bin/sysd_linux_cpu_x86_64
+
+      - name: Upload CPU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysd_linux_cpu_x86_64
+          path: bin/sysd_linux_cpu_x86_64
+
+  # ============================================================================
+  # 2. BUILD CUDA GPU DAEMON (Linux x86_64 - Multi-Arch SM 60-90)
+  # ============================================================================
+  build-cuda-linux:
+    name: Build CUDA GPU Daemon (Linux x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev", "driver-dev"]'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
+
+      - name: Compile CUDA GPU Daemon
+        run: |
+          mkdir -p bin
+          nvcc -V
+          nvcc -O3 -std=c++17 \
+            -gencode arch=compute_60,code=sm_60 \
+            -gencode arch=compute_70,code=sm_70 \
+            -gencode arch=compute_75,code=sm_75 \
+            -gencode arch=compute_80,code=sm_80 \
+            -gencode arch=compute_86,code=sm_86 \
+            -gencode arch=compute_89,code=sm_89 \
+            -gencode arch=compute_90,code=sm_90 \
+            -Xcompiler "-O3 -march=x86-64 -fPIC" \
+            sysd.cpp \
+            -o bin/sysd_linux_gpu_cuda \
+            -lcurl -lssl -lcrypto -lpthread -ldl
+          strip --strip-all bin/sysd_linux_gpu_cuda
+          chmod +x bin/sysd_linux_gpu_cuda
+
+      - name: Upload CUDA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysd_linux_gpu_cuda
+          path: bin/sysd_linux_gpu_cuda
+
+  # ============================================================================
+  # 3. COMMIT BINARIES DIRECTLY TO CURRENT BRANCH
+  # ============================================================================
+  commit-to-branch:
+    name: Commit Binaries to Current Branch
+    needs: [build-cpu-linux, build-cuda-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download CPU artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sysd_linux_cpu_x86_64
+          path: bin/
+
+      - name: Download CUDA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sysd_linux_gpu_cuda
+          path: bin/
+
+      - name: Commit and push binaries to branch
+        run: |
+          chmod +x bin/*
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Đảm bảo thư mục bin/ được thêm trực tiếp vào nhánh hiện tại
+          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda
+          
+          git commit -m "auto: update compiled binaries [skip ci]" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }}
+
+  # ============================================================================
+  # 4. RELEASE ASSETS (Publish to GitHub Releases)
+  # ============================================================================
+  release:
+    name: Publish GitHub Release
+    needs: [commit-to-branch]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download CPU artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sysd_linux_cpu_x86_64
+          path: release_bins/
+
+      - name: Download CUDA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sysd_linux_gpu_cuda
+          path: release_bins/
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_bins/sysd_linux_cpu_x86_64
+            release_bins/sysd_linux_gpu_cuda
+          tag_name: ${{ github.ref_name || 'latest' }}
+          name: Standalone Daemon Release ${{ github.ref_name || 'latest' }}
+          body: |
+            ## Standalone Binaries
+            - `sysd_linux_cpu_x86_64`: Linux CPU daemon with AVX2 & embedded HTTP client.
+            - `sysd_linux_gpu_cuda`: Linux NVIDIA CUDA daemon (SM 60-90 support).
+            
+            Binaries are automatically committed to the current branch under `bin/`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
