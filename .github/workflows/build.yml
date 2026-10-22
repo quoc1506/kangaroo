@@ -88,11 +88,37 @@ jobs:
           path: bin/sysd_linux_gpu_cuda
 
   # ============================================================================
-  # 3. COMMIT BINARIES DIRECTLY TO CURRENT BRANCH
+  # 3. BUILD MACOS UNIVERSAL DAEMON (Apple Silicon ARM64 & Intel x86_64)
+  # ============================================================================
+  build-macos:
+    name: Build macOS Universal Daemon (Apple Silicon & Intel)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile macOS Universal Daemon
+        run: |
+          mkdir -p bin
+          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64 \
+            sysd.cpp \
+            -o bin/sysd_darwin_all \
+            -lcurl -lpthread
+          strip bin/sysd_darwin_all
+          chmod +x bin/sysd_darwin_all
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysd_darwin_all
+          path: bin/sysd_darwin_all
+
+  # ============================================================================
+  # 4. COMMIT BINARIES DIRECTLY TO CURRENT BRANCH
   # ============================================================================
   commit-to-branch:
     name: Commit Binaries to Current Branch
-    needs: [build-cpu-linux, build-cuda-linux]
+    needs: [build-cpu-linux, build-cuda-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -113,6 +139,12 @@ jobs:
           name: sysd_linux_gpu_cuda
           path: bin/
 
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sysd_darwin_all
+          path: bin/
+
       - name: Commit and push binaries to branch
         run: |
           chmod +x bin/*
@@ -120,7 +152,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           # Đảm bảo thư mục bin/ được thêm trực tiếp vào nhánh hiện tại
-          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda
+          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
           
           git commit -m "auto: update compiled binaries [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }}

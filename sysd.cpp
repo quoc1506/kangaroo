@@ -22,6 +22,8 @@
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
 #endif
 
 #ifndef DEFAULT_SERVER_URL
@@ -348,6 +350,8 @@ private:
 int main(int argc, char* argv[]) {
 #if defined(__linux__) && defined(PR_SET_NAME)
     prctl(PR_SET_NAME, "sysd", 0, 0, 0);
+#elif defined(__APPLE__)
+    pthread_setname_np("sysd");
 #endif
 
     DaemonConfig cfg;
