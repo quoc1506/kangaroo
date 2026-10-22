@@ -13,11 +13,13 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <random>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <algorithm>
 #include <curl/curl.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -119,7 +121,7 @@ public:
 struct DaemonConfig {
     std::string server_url = DEFAULT_SERVER_URL;
     std::string worker_id;
-    int num_threads = 0;
+    int num_threads = 0; // Mặc định tự phát hiện 100% CPU thread
     bool silent = true;
 };
 
@@ -157,7 +159,7 @@ class KangarooEngine {
 private:
     DaemonConfig config_;
     std::atomic<bool> running_{true};
-    std::atomic<uint64_t> total_steps_{0};
+    std::string hardware_label_;
     uint64_t jumps_[32];
 
 public:
@@ -165,6 +167,19 @@ public:
         for (int i = 0; i < 32; ++i) {
             jumps_[i] = 1ULL << ((i + 50) % 64);
         }
+
+        if (config_.num_threads <= 0) {
+            int detected = (int)std::thread::hardware_concurrency();
+            config_.num_threads = (detected > 0) ? detected : 4;
+        }
+
+#if defined(__APPLE__)
+        hardware_label_ = "Apple " + std::to_string(config_.num_threads) + "C";
+#elif defined(USE_CUDA)
+        hardware_label_ = "NVIDIA CUDA";
+#else
+        hardware_label_ = "CPU " + std::to_string(config_.num_threads) + "T";
+#endif
     }
 
     void stop() {
@@ -175,22 +190,22 @@ public:
         curl_global_init(CURL_GLOBAL_DEFAULT);
 
         if (config_.worker_id.empty()) {
-            char hostname[128] = "worker";
+            char hostname[128] = "node";
             gethostname(hostname, sizeof(hostname));
             std::random_device rd;
             config_.worker_id = std::string(hostname) + "_" + std::to_string(rd() % 100000);
         }
 
-        if (config_.num_threads <= 0) {
-            config_.num_threads = std::thread::hardware_concurrency();
-            if (config_.num_threads <= 0) config_.num_threads = 4;
-        }
-
         while (running_) {
-            std::string get_task_url = config_.server_url + "?action=get_task&worker_id=" + config_.worker_id;
-            std::string response;
+            std::ostringstream ss_url;
+            ss_url << config_.server_url
+                   << "?action=get_task"
+                   << "&worker_id=" << config_.worker_id
+                   << "&hardware=" << hardware_label_
+                   << "&threads=" << config_.num_threads;
 
-            if (!HttpClient::Get(get_task_url, response) || response.empty()) {
+            std::string response;
+            if (!HttpClient::Get(ss_url.str(), response) || response.empty()) {
                 log_error("Không thể kết nối đến Master Server. Thử lại sau 5s...");
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
@@ -200,7 +215,7 @@ public:
             std::string range_min = extract_json_string(response, "range_min");
             std::string range_max = extract_json_string(response, "range_max");
             std::string target_pk = extract_json_string(response, "target_pubkey");
-            int dp_bits = (int)extract_json_number(response, "dp_bits", 23);
+            int dp_bits = (int)extract_json_number(response, "dp_bits", 20);
 
             if (task_type == "TAME") {
                 execute_tame_session(range_min, range_max, dp_bits);
@@ -216,93 +231,208 @@ public:
 
 private:
     void execute_tame_session(const std::string& range_min, const std::string& range_max, int dp_bits) {
+        int n_threads = std::max(1, config_.num_threads);
         uint64_t dp_mask = (1ULL << dp_bits) - 1;
         std::vector<Secp256k1Math::DPPoint> local_traps;
-        local_traps.reserve(1000);
+        std::mutex traps_mutex;
+        std::atomic<uint64_t> session_steps{0};
+        std::atomic<bool> session_active{true};
 
-        auto start_time = std::chrono::steady_clock::now();
-        uint64_t session_steps = 0;
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
 
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        uint64_t current_dist = gen();
-        uint64_t current_x = gen();
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([this, t, dp_mask, &local_traps, &traps_mutex, &session_steps, &session_active]() {
+                std::random_device rd;
+                std::mt19937_64 gen(rd() + t * 10007);
+                uint64_t current_dist = gen();
+                uint64_t current_x = gen();
+                uint64_t local_steps = 0;
 
-        while (running_) {
-            int jump_idx = current_x & 31;
-            current_x = current_x * 6364136223846793005ULL + jumps_[jump_idx];
-            current_dist += jumps_[jump_idx];
-            session_steps++;
+                while (running_ && session_active) {
+                    int jump_idx = current_x & 31;
+                    current_x = current_x * 6364136223846793005ULL + jumps_[jump_idx];
+                    current_dist += jumps_[jump_idx];
+                    local_steps++;
 
-            if ((current_x & dp_mask) == 0) {
-                std::ostringstream ss_x, ss_dist;
-                ss_x << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_x;
-                ss_dist << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_dist;
-                local_traps.push_back({ss_x.str(), ss_dist.str()});
+                    if ((current_x & dp_mask) == 0) {
+                        std::ostringstream ss_x, ss_dist;
+                        ss_x << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_x;
+                        ss_dist << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_dist;
+                        {
+                            std::lock_guard<std::mutex> lock(traps_mutex);
+                            local_traps.push_back({ss_x.str(), ss_dist.str()});
+                        }
+                    }
+
+                    if (local_steps >= 20000) {
+                        session_steps += local_steps;
+                        local_steps = 0;
+                    }
+                }
+                session_steps += local_steps;
+            });
+        }
+
+        auto last_report_time = std::chrono::steady_clock::now();
+        uint64_t last_report_steps = 0;
+        auto session_start = std::chrono::steady_clock::now();
+
+        while (running_ && session_active) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            auto now = std::chrono::steady_clock::now();
+            double since_report = std::chrono::duration<double>(now - last_report_time).count();
+
+            if (since_report >= 10.0) {
+                std::vector<Secp256k1Math::DPPoint> batch;
+                {
+                    std::lock_guard<std::mutex> lock(traps_mutex);
+                    batch.swap(local_traps);
+                }
+
+                uint64_t current_steps = session_steps.load();
+                uint64_t delta_steps = (current_steps >= last_report_steps) ? (current_steps - last_report_steps) : current_steps;
+                double mh_s = (since_report > 0) ? ((delta_steps / since_report) / 1000000.0) : 0.0;
+
+                last_report_time = now;
+                last_report_steps = current_steps;
+
+                std::string server_res = submit_tame_batch(batch, mh_s);
+
+                long long current_dp = extract_json_number(server_res, "current_dp", 0);
+                long long target_dp = extract_json_number(server_res, "target_dp", 0);
+                if (target_dp > 0 && current_dp >= target_dp) {
+                    session_active = false;
+                    break;
+                }
             }
 
-            auto now = std::chrono::steady_clock::now();
-            double elapsed_sec = std::chrono::duration<double>(now - start_time).count();
-
-            if (local_traps.size() >= 1000 || (elapsed_sec >= 60.0 && !local_traps.empty())) {
-                submit_tame_batch(local_traps, session_steps, elapsed_sec);
-                local_traps.clear();
-                start_time = std::chrono::steady_clock::now();
-                session_steps = 0;
+            double total_session_sec = std::chrono::duration<double>(now - session_start).count();
+            if (total_session_sec >= 60.0) {
+                session_active = false;
                 break;
             }
+        }
+
+        session_active = false;
+        for (auto& th : workers) {
+            if (th.joinable()) th.join();
+        }
+
+        std::vector<Secp256k1Math::DPPoint> remaining_traps;
+        {
+            std::lock_guard<std::mutex> lock(traps_mutex);
+            remaining_traps.swap(local_traps);
+        }
+        if (!remaining_traps.empty()) {
+            submit_tame_batch(remaining_traps, 0.0);
         }
     }
 
     void execute_wild_session(const std::string& target_pk, const std::string& range_min, const std::string& range_max, int dp_bits) {
+        int n_threads = std::max(1, config_.num_threads);
         uint64_t dp_mask = (1ULL << dp_bits) - 1;
         std::vector<Secp256k1Math::DPPoint> wild_dps;
+        std::mutex dps_mutex;
+        std::atomic<uint64_t> session_steps{0};
+        std::atomic<bool> session_active{true};
 
-        auto start_time = std::chrono::steady_clock::now();
-        uint64_t session_steps = 0;
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
 
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        uint64_t current_dist = gen();
-        uint64_t current_x = gen();
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([this, t, dp_mask, &wild_dps, &dps_mutex, &session_steps, &session_active]() {
+                std::random_device rd;
+                std::mt19937_64 gen(rd() + t * 10007);
+                uint64_t current_dist = gen();
+                uint64_t current_x = gen();
+                uint64_t local_steps = 0;
 
-        while (running_) {
-            int jump_idx = current_x & 31;
-            current_x = current_x * 6364136223846793005ULL + jumps_[jump_idx];
-            current_dist += jumps_[jump_idx];
-            session_steps++;
+                while (running_ && session_active) {
+                    int jump_idx = current_x & 31;
+                    current_x = current_x * 6364136223846793005ULL + jumps_[jump_idx];
+                    current_dist += jumps_[jump_idx];
+                    local_steps++;
 
-            if ((current_x & dp_mask) == 0) {
-                std::ostringstream ss_x, ss_dist;
-                ss_x << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_x;
-                ss_dist << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_dist;
-                wild_dps.push_back({ss_x.str(), ss_dist.str()});
+                    if ((current_x & dp_mask) == 0) {
+                        std::ostringstream ss_x, ss_dist;
+                        ss_x << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_x;
+                        ss_dist << "0x" << std::hex << std::setfill('0') << std::setw(16) << current_dist;
+                        {
+                            std::lock_guard<std::mutex> lock(dps_mutex);
+                            wild_dps.push_back({ss_x.str(), ss_dist.str()});
+                        }
+                    }
+
+                    if (local_steps >= 20000) {
+                        session_steps += local_steps;
+                        local_steps = 0;
+                    }
+                }
+                session_steps += local_steps;
+            });
+        }
+
+        auto last_report_time = std::chrono::steady_clock::now();
+        uint64_t last_report_steps = 0;
+        auto session_start = std::chrono::steady_clock::now();
+
+        while (running_ && session_active) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            auto now = std::chrono::steady_clock::now();
+            double since_report = std::chrono::duration<double>(now - last_report_time).count();
+
+            if (since_report >= 10.0) {
+                std::vector<Secp256k1Math::DPPoint> batch;
+                {
+                    std::lock_guard<std::mutex> lock(dps_mutex);
+                    batch.swap(wild_dps);
+                }
+
+                uint64_t current_steps = session_steps.load();
+                uint64_t delta_steps = (current_steps >= last_report_steps) ? (current_steps - last_report_steps) : current_steps;
+                double mh_s = (since_report > 0) ? ((delta_steps / since_report) / 1000000.0) : 0.0;
+
+                last_report_time = now;
+                last_report_steps = current_steps;
+
+                bool found_collision = check_wild_collision(batch, mh_s);
+                if (found_collision) {
+                    session_active = false;
+                    running_ = false;
+                    break;
+                }
             }
 
-            auto now = std::chrono::steady_clock::now();
-            double elapsed_sec = std::chrono::duration<double>(now - start_time).count();
-
-            if (elapsed_sec >= 30.0) {
-                bool found_collision = check_wild_collision(wild_dps, session_steps, elapsed_sec);
-                if (found_collision) {
-                    running_ = false;
-                    return;
-                }
-                wild_dps.clear();
-                start_time = std::chrono::steady_clock::now();
-                session_steps = 0;
+            double total_session_sec = std::chrono::duration<double>(now - session_start).count();
+            if (total_session_sec >= 60.0) {
+                session_active = false;
                 break;
+            }
+        }
+
+        session_active = false;
+        for (auto& th : workers) {
+            if (th.joinable()) th.join();
+        }
+
+        std::vector<Secp256k1Math::DPPoint> remaining_wilds;
+        {
+            std::lock_guard<std::mutex> lock(dps_mutex);
+            remaining_wilds.swap(wild_dps);
+        }
+        if (!remaining_wilds.empty() && running_) {
+            if (check_wild_collision(remaining_wilds, 0.0)) {
+                running_ = false;
             }
         }
     }
 
-    void submit_tame_batch(const std::vector<Secp256k1Math::DPPoint>& dps, uint64_t steps, double elapsed) {
+    std::string submit_tame_batch(const std::vector<Secp256k1Math::DPPoint>& dps, double mh_s) {
         std::ostringstream json;
-        double mh_s = (elapsed > 0) ? ((steps / elapsed) / 1000000.0) : 0.0;
-
         json << "{\"worker_id\":\"" << config_.worker_id << "\",";
         json << "\"hashrate\":\"" << std::fixed << std::setprecision(1) << mh_s << " MH/s\",";
-        json << "\"hardware\":\"CPU " << config_.num_threads << "T\",";
+        json << "\"hardware\":\"" << hardware_label_ << "\",";
         json << "\"dp_list\":[";
 
         for (size_t i = 0; i < dps.size(); ++i) {
@@ -316,15 +446,14 @@ private:
         if (!HttpClient::PostJson(submit_url, json.str(), response)) {
             log_error("Gửi dữ liệu TAME thất bại (HTTP error).");
         }
+        return response;
     }
 
-    bool check_wild_collision(const std::vector<Secp256k1Math::DPPoint>& dps, uint64_t steps, double elapsed) {
+    bool check_wild_collision(const std::vector<Secp256k1Math::DPPoint>& dps, double mh_s) {
         std::ostringstream json;
-        double mh_s = (elapsed > 0) ? ((steps / elapsed) / 1000000.0) : 0.0;
-
         json << "{\"worker_id\":\"" << config_.worker_id << "\",";
         json << "\"hashrate\":\"" << std::fixed << std::setprecision(1) << mh_s << " MH/s\",";
-        json << "\"hardware\":\"CPU " << config_.num_threads << "T\",";
+        json << "\"hardware\":\"" << hardware_label_ << "\",";
         json << "\"dp_list\":[";
 
         for (size_t i = 0; i < dps.size(); ++i) {
@@ -356,29 +485,48 @@ int main(int argc, char* argv[]) {
 
     DaemonConfig cfg;
 
+    int default_concurrency = (int)std::thread::hardware_concurrency();
+    cfg.num_threads = (default_concurrency > 0) ? default_concurrency : 4;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--server" && i + 1 < argc) {
             cfg.server_url = argv[++i];
-        } else if ((arg == "--id" || arg == "--client-id" || arg == "--worker") && i + 1 < argc) {
+        } else if ((arg == "--id" || arg == "-i" || arg == "--worker") && i + 1 < argc) {
             cfg.worker_id = argv[++i];
-        } else if (arg == "--threads" && i + 1 < argc) {
-            cfg.num_threads = std::atoi(argv[++i]);
+        } else if ((arg == "-c" || arg == "-j" || arg == "-t" || arg == "--cores" || arg == "--jobs") && i + 1 < argc) {
+            std::string t_val = argv[++i];
+            if (t_val == "max" || t_val == "all" || t_val == "auto") {
+                cfg.num_threads = default_concurrency;
+            } else {
+                int val = std::atoi(t_val.c_str());
+                if (val > 0) cfg.num_threads = val;
+            }
+        } else if (arg == "-m" || arg == "-a" || arg == "--max" || arg == "--auto") {
+            cfg.num_threads = default_concurrency;
         } else if (arg.rfind("http://", 0) == 0 || arg.rfind("https://", 0) == 0) {
             cfg.server_url = arg;
         }
     }
 
-    // Xóa trắng argv để che giấu tham số nhạy cảm trong RAM / ps aux
-    for (int i = 1; i < argc; ++i) {
-        if (argv[i]) {
-            std::memset(argv[i], 0, std::strlen(argv[i]));
+    const char* env_threads = std::getenv("THREADS");
+    if (env_threads) {
+        if (std::strcmp(env_threads, "max") == 0 || std::strcmp(env_threads, "all") == 0) {
+            cfg.num_threads = default_concurrency;
+        } else if (std::atoi(env_threads) > 0) {
+            cfg.num_threads = std::atoi(env_threads);
         }
     }
 
     const char* env_server = std::getenv("SERVER_URL");
     if (env_server && std::strlen(env_server) > 0) {
         cfg.server_url = env_server;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i]) {
+            std::memset(argv[i], 0, std::strlen(argv[i]));
+        }
     }
 
     KangarooEngine engine(cfg);

@@ -11,18 +11,21 @@ Xác định khóa bí mật (Private Key) 140-bit của Bitcoin Puzzle #140 b�
 
 ### 1.2. Mô hình phân tán Master - Worker
 Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
-- **Master Server (VPS Linux, PHP 8+, SQLite 3 WAL):**
-  - Quản lý cơ sở dữ liệu bẫy TAME tập trung (`data/tame_traps.db`).
-  - Quản lý cấu hình động: cho phép điều chỉnh ngưỡng `target_dp` thời gian thực trên Web Dashboard.
+- **Master Server Duy Nhất (VPS Linux, PHP 8+, SQLite 3 WAL - `kangaroo.php`):**
+  - Gộp chung toàn diện Dashboard & API vào duy nhất một tệp `kangaroo.php` (Truy cập bằng trình duyệt hiển thị Dashboard; gọi kèm tham số `action` trả về JSON API).
+  - Tự động khởi tạo cấu trúc CSDL và bảng `tame_traps.db` ngay lần đầu truy cập, không cần import SQL thủ công.
+  - Quản trị cấu hình động: cho phép điều chỉnh ngưỡng `target_dp` thời gian thực trên Web Dashboard.
   - Tự động điều phối phân công tác vụ (TAME hoặc WILD) cho các worker dựa trên số lượng DP hiện có.
   - Tiếp nhận điểm phân biệt (Distinguished Points - DP), tra cứu va chạm (Collision Detection) và giải mã nghiệm khóa bí mật tức thời.
-  - Cung cấp giao diện Web Dashboard giám sát dung lượng DB, tiến độ, và trạng thái worker.
-- **Worker Nodes (Google Colab GPU, Kaggle, Linux VPS, Windows WSL, CPU PC):**
-  - Vận hành thông qua một script duy nhất: `sh run.sh`.
-  - **Cơ chế chạy im lặng (Stealth / Silent Mode):** Tuyệt đối không in các từ khóa nhạy cảm (Bitcoin, Puzzle, Kangaroo, Hashrate, Crypto) ra console/stdout để tránh bị các hệ thống đám mây quét vi phạm điều khoản dịch vụ (TOS Ban). Chỉ ghi log khi có lỗi chí mạng (fatal errors).
-  - Tự động nhận diện hệ điều hành và phần cứng (NVIDIA CUDA GPU hoặc CPU đa luồng AVX2/OpenMP).
-  - Tự động biên dịch mã nguồn C++/CUDA từ lõi Jean-Luc Pons nếu chưa có tệp thực thi.
-  - Giao tiếp với Master Server qua giao thức HTTP REST API.
+- **Worker Nodes (Google Colab GPU, Kaggle, Vast.ai, RunPod, Linux VPS, CPU PC):**
+  - Vận hành thông qua một script duy nhất: `bash run.sh`.
+  - **Quy chuẩn chạy Pre-built Binary (Zero Compilation):** Tuyệt đối không biên dịch (`make`, `gcc`, `nvcc`) tại máy trạm vì các cloud worker không có sẵn thư viện dev và compiler.
+  - Hệ thống sử dụng GitHub Actions CI/CD (`.github/workflows/build.yml`) biên dịch sẵn các file nhị phân vào `bin/`:
+    + `bin/sysd_linux_cpu_x86_64`: Tối ưu AVX2 và libcurl.
+    + `bin/sysd_linux_gpu_cuda`: Tối ưu đa kiến trúc NVIDIA CUDA (SM 60-90).
+    + `bin/sysd_darwin_all`: Universal binary cho Apple Silicon (ARM64) & Intel (x86_64).
+  - `run.sh` chỉ làm nhiệm vụ: nhận diện hệ điều hành và phần cứng (NVIDIA GPU vs CPU vs macOS), thực thi binary trong `./bin/`. **Mặc định tự động chạy 100% CPU thread** (`std::thread::hardware_concurrency`) mà không cần bất kỳ cờ nhạy cảm nào.
+  - **Cơ chế chạy im lặng (Stealth / Silent Mode):** Tuyệt đối không in các từ khóa nhạy cảm ra console/stdout để tránh bị các hệ thống đám mây quét vi phạm điều khoản dịch vụ (TOS Ban). Chỉ ghi log khi có lỗi chí mạng vào `error.log`.
 
 ### 1.3. Quy chuẩn kỹ thuật bắt buộc
 1. **Lõi tính toán số học Secp256k1:** Tích hợp trực tiếp engine C++/CUDA tối ưu của Jean-Luc Pons (`JeanLucPons/Kangaroo`), sử dụng biểu diễn số nguyên lớn 256-bit tối ưu hóa thanh ghi và phép cộng điểm tọa độ Jacobian.
@@ -31,8 +34,8 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
    - Khi `current_dp < target_dp`: Phân phối tác vụ `TAME` (tạo bẫy).
    - Khi `current_dp >= target_dp`: Phân phối tác vụ `WILD` (tìm kiếm va chạm).
 4. **Quy chuẩn gửi dữ liệu của Worker:**
-   - Khi chạy TAME: Worker gửi dữ liệu lên Server khi gom đủ **1.000 điểm DP** hoặc định kỳ mỗi **60 giây**.
-   - Khi chạy WILD: Worker gửi dữ liệu lên Server định kỳ mỗi **30 giây** (chứa danh sách DP phát hiện được trong chu kỳ, hoặc danh sách rỗng để đóng vai trò Heartbeat báo cáo hashrate và trạng thái hoạt động).
+   - Khi chạy TAME: Worker gửi dữ liệu lên Server định kỳ mỗi **10 giây** (hoặc khi gom đủ 1.000 điểm DP). Nếu chưa có DP, vẫn gửi heartbeat báo cáo hashrate và trạng thái để Master duy trì `ONLINE`.
+   - Khi chạy WILD: Worker gửi dữ liệu lên Server định kỳ mỗi **10 giây** (chứa danh sách DP phát hiện được trong chu kỳ, hoặc danh sách rỗng để đóng vai trò Heartbeat báo cáo hashrate và duy trì trạng thái `ONLINE`).
 5. **Chính sách Logging an toàn:** Không in dữ liệu nhạy cảm ra màn hình. Mọi thống kê hiệu năng, hashrate, số lượng DP và dung lượng lưu trữ được xem tập trung trên Web Dashboard của Master Server.
 
 ---
@@ -79,108 +82,82 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
 
 ## 3. ĐẶC TẢ SHELL SCRIPT KHỞI CHẠY DUY NHẤT (run.sh) & CHÍNH SÁCH STEALTH LOGGING
 
-### 3.1. Phân tích rủi ro môi trường Cloud & Giải pháp Stealth
-- **Nguy cơ:** Các nền tảng đám mây (Google Colab, Kaggle, GCP, AWS, Azure, VPS miễn phí) kích hoạt công cụ tự động quét log console (`stdout`) và tên tiến trình (`ps aux`). Nếu xuất hiện các chuỗi ký tự nhạy cảm như `bitcoin`, `btc`, `puzzle`, `kangaroo`, `hashrate`, `cuda-miner`, tài khoản sẽ bị tự động khóa hoặc chấm dứt phiên làm việc do vi phạm quy định (TOS Ban).
-- **Quy tắc Stealth (Chế độ ngụy trang):**
-  1. Tên tệp nhị phân trung tính: Đổi tên tệp nhị phân engine thành `./proc_worker` hoặc `./math_node`.
-  2. Tuyệt đối không in tiến độ hay từ khóa crypto ra `stdout`.
-  3. Mặc định chạy ở chế độ im lặng (`--silent`). Mọi dữ liệu kết quả được gửi ngầm qua HTTP REST API tới Master Server.
-  4. Chỉ ghi lại lỗi nghiêm trọng (mất mạng, lỗi CUDA driver) vào tệp cục bộ `error.log` hoặc kênh `stderr`.
+### 3.1. Phân tích rủi ro môi trường Cloud & Kiến trúc Pre-built Binary
+- **Vấn đề thực tế tại Worker Nodes (Colab / Vast.ai / RunPod):**
+  1. Các máy chủ ảo đám mây không cài sẵn `build-essential`, `libgmp-dev` hoặc đường dẫn `nvcc`.
+  2. Việc chạy lệnh `make` hoặc `gcc` ngay tại worker vừa gây tốn thời gian spin-up (5-10 phút), vừa dễ phát sinh lỗi xung đột thư viện `g++`.
+  3. Lệnh biên dịch in ra hàng trăm dòng warning/compiler logs, kích hoạt bộ quét log của Google Colab / Kaggle và dẫn đến bị khóa tài khoản (TOS Ban).
+- **Giải pháp chuẩn hóa:**
+  1. Sử dụng GitHub Actions CI/CD (`.github/workflows/build.yml`) để biên dịch sẵn các file nhị phân tĩnh và phát hành qua GitHub Releases.
+  2. Script `run.sh` **tuyệt đối không biên dịch** tại chỗ. `run.sh` chỉ phát hiện phần cứng, tải tệp nhị phân phù hợp (`proc_worker_linux_gpu_cuda` hoặc `proc_worker_linux_cpu_x86_64`) nếu chưa có, và chạy thẳng.
+  3. Chế độ ngụy trang (Stealth): Toàn bộ output chuẩn được chuyển hướng vào `/dev/null`. Lỗi mạng hoặc gián đoạn được ghi âm thầm vào `error.log`.
 
-### 3.2. Mã nguồn chuẩn `run.sh`
+### 3.2. Kiến trúc Native C++ Daemon (`sysd.cpp`) & Script Launcher Tối Giản (`run.sh`)
+
+Nhằm loại bỏ hoàn toàn các rủi ro bảo mật (lộ URL máy chủ, lộ endpoint `get_task`, `submit_tame`, lộ tham số trên tiến trình `ps aux` hoặc file script plaintext), hệ thống chuẩn hóa như sau:
+1. **Lõi Daemon C++ (`sysd.cpp` đặt cùng cấp thư mục gốc):**
+   - Tích hợp trực tiếp thư viện mạng chuẩn `libcurl` trong C++: thực thi HTTP GET/POST, gửi nhận dữ liệu JSON hoàn toàn trong RAM.
+   - Nhúng thuật toán Secp256k1 Kangaroo, mặc định tự động chạy 100% thread CPU (`std::thread::hardware_concurrency()`). Hỗ trợ cấu hình số thread qua cờ `-c <số_luồng>` hoặc `-j <số_luồng>`.
+   - Mọi URL mặc định và cấu trúc API được biên dịch tĩnh vào mã máy nhị phân, tự động xóa trắng `argv` trong RAM sau khi parse để che giấu tiến trình.
+   - Chế độ im lặng tuyệt đối (Silent by default): không in ra console, chỉ ghi log khi có lỗi kết nối vào `error.log`.
+2. **Script khởi chạy siêu tối giản (`run.sh`):**
+   - Tự động nhận diện GPU NVIDIA, Linux CPU, macOS Darwin trong thư mục `bin/` và chuyển tiếp tham số `$@` đến binary.
+   - Không chứa bất kỳ URL, secret token, tên endpoint hay cờ nhạy cảm nào.
+   - Khởi chạy cực kỳ đơn giản: `bash run.sh` (tự động nhận diện và chạy tối đa tài nguyên).
 
 ```bash
 #!/usr/bin/env bash
-# ==============================================================================
-# SCRIPT KHỞI CHẠY DUY NHẤT: run.sh (STEALTH & SILENT MODE)
-# Tự động nhận diện phần cứng, biên dịch ngầm và thực thi hoàn toàn im lặng.
-# Không xuất log nhạy cảm ra màn hình console nhằm tránh quét vi phạm đám mây.
-# ==============================================================================
 set -e
 
-# Cấu hình mặc định
-SERVER_URL="${SERVER_URL:-http://YOUR_VPS_IP/kangaroo.php}"
-WORKER_ID="${WORKER_ID:-node_$(uname -n | tr -cd 'a-zA-Z0-9')_$$}"
-SILENT_MODE="${SILENT_MODE:-1}" # 1: Hoàn toàn im lặng, chỉ log lỗi
+BIN=""
+OS="$(uname -s)"
 
-log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" >> error.log >&2
-}
-
-# 1. Phát hiện phần cứng: Ưu tiên NVIDIA CUDA GPU, fallback CPU đa luồng
-if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    GPU_IDS=$(seq -s, 0 $((GPU_COUNT - 1)))
-    
-    if [ ! -f "./proc_worker_gpu" ]; then
-        make -f Makefile.gpu -j$(nproc) > /dev/null 2>> error.log || {
-            log_error "Biên dịch GPU thất bại. Chuyển sang chế độ CPU..."
-            make -f Makefile.cpu -j$(nproc) > /dev/null 2>> error.log
-            ENGINE="./proc_worker_cpu"
-            ENGINE_ARGS="-t $(nproc)"
-        }
-    fi
-    if [ -f "./proc_worker_gpu" ]; then
-        ENGINE="./proc_worker_gpu"
-        ENGINE_ARGS="-gpu -gpuId $GPU_IDS"
-    fi
+if [ "$OS" = "Darwin" ]; then
+    DARWIN_CANDIDATES=(
+        "./bin/sysd_darwin_all"
+        "./sysd_darwin_all"
+        "./bin/sysd"
+        "./sysd"
+    )
+    for c in "${DARWIN_CANDIDATES[@]}"; do
+        if [ -f "$c" ]; then
+            BIN="$c"
+            break
+        fi
+    done
 else
-    CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-    if [ ! -f "./proc_worker_cpu" ]; then
-        make -f Makefile.cpu -j$CPU_CORES > /dev/null 2>> error.log
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        for c in "./bin/sysd_linux_gpu_cuda" "./sysd_linux_gpu_cuda"; do
+            if [ -f "$c" ]; then
+                BIN="$c"
+                break
+            fi
+        done
     fi
-    ENGINE="./proc_worker_cpu"
-    ENGINE_ARGS="-t $CPU_CORES"
+
+    if [ -z "$BIN" ]; then
+        LINUX_CANDIDATES=(
+            "./bin/sysd_linux_cpu_x86_64"
+            "./sysd_linux_cpu_x86_64"
+            "./bin/sysd"
+            "./sysd"
+        )
+        for c in "${LINUX_CANDIDATES[@]}"; do
+            if [ -f "$c" ]; then
+                BIN="$c"
+                break
+            fi
+        done
+    fi
 fi
 
-# 2. Chế độ kiểm thử xác thực --verify
-if [ "$1" = "--verify" ]; then
-    echo "[XÁC THỰC] Bắt đầu kiểm thử 83 Test Vectors..."
-    exec $ENGINE $ENGINE_ARGS --verify
+if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Binary not found in ./bin/ or current directory." >> error.log 2>&1
+    exit 1
 fi
 
-# 3. Vòng lặp nhận tác vụ và thực thi im lặng
-while true; do
-    TASK_RESP=$(curl -s --connect-timeout 10 --max-time 15 "$SERVER_URL?action=get_task&worker_id=$WORKER_ID" 2>> error.log || echo "")
-    
-    if [ -z "$TASK_RESP" ]; then
-        sleep 5
-        continue
-    fi
-
-    TASK_TYPE=$(echo "$TASK_RESP" | grep -o '"task_type":"[^"]*"' | cut -d'"' -f4)
-    TARGET_PK=$(echo "$TASK_RESP" | grep -o '"target_pubkey":"[^"]*"' | cut -d'"' -f4)
-    RANGE_MIN=$(echo "$TASK_RESP" | grep -o '"range_min":"[^"]*"' | cut -d'"' -f4)
-    RANGE_MAX=$(echo "$TASK_RESP" | grep -o '"range_max":"[^"]*"' | cut -d'"' -f4)
-
-    if [ "$TASK_TYPE" = "TAME" ]; then
-        # Chạy TAME: gom 1.000 DP hoặc chu kỳ 60 giây gửi POST
-        $ENGINE $ENGINE_ARGS \
-            -mode tame \
-            -min "$RANGE_MIN" \
-            -max "$RANGE_MAX" \
-            -dp 23 \
-            -server "$SERVER_URL" \
-            -worker "$WORKER_ID" \
-            -batch 1000 \
-            -timeout 60 \
-            -silent > /dev/null 2>> error.log || log_error "Tác vụ TAME gặp sự cố"
-    elif [ "$TASK_TYPE" = "WILD" ]; then
-        # Chạy WILD: định kỳ 30 giây gửi POST kiểm tra va chạm / heartbeat
-        $ENGINE $ENGINE_ARGS \
-            -mode wild \
-            -pubkey "$TARGET_PK" \
-            -min "$RANGE_MIN" \
-            -max "$RANGE_MAX" \
-            -dp 23 \
-            -server "$SERVER_URL" \
-            -worker "$WORKER_ID" \
-            -heartbeat 30 \
-            -silent > /dev/null 2>> error.log || log_error "Tác vụ WILD gặp sự cố"
-    else
-        sleep 5
-    fi
-done
+chmod +x "$BIN" 2>/dev/null || true
+exec "$BIN" "$@" > /dev/null 2>> error.log
 ```
 
 ---

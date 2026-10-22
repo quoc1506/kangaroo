@@ -328,19 +328,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 if ($action === 'get_task') {
     $workerId = trim($_GET['worker_id'] ?? 'unknown_worker');
+    $hardware = trim($_GET['hardware'] ?? '');
+    $threads = (int)($_GET['threads'] ?? 0);
+
     $currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
     $targetDp = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
+    $dpBits = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'dp_bits'") ?: 20);
 
+    $assignedMode = ($currDp < $targetDp) ? 'TAME' : 'WILD';
+
+    // Cập nhật ngay lập tức thông tin Worker tại get_task (tránh hiển thị N/A phần cứng)
     $stmt = $db->prepare("
-        INSERT INTO workers_status (worker_id, ip_address, last_seen) 
-        VALUES (:wid, :ip, CURRENT_TIMESTAMP)
-        ON CONFLICT(worker_id) DO UPDATE SET ip_address = :ip, last_seen = CURRENT_TIMESTAMP
+        INSERT INTO workers_status (worker_id, ip_address, hardware, mode, last_seen) 
+        VALUES (:wid, :ip, :hw, :mode, CURRENT_TIMESTAMP)
+        ON CONFLICT(worker_id) DO UPDATE SET 
+            ip_address = :ip, 
+            hardware = CASE WHEN :hw != '' THEN :hw ELSE hardware END,
+            mode = :mode,
+            last_seen = CURRENT_TIMESTAMP
     ");
     $stmt->bindValue(':wid', $workerId, SQLITE3_TEXT);
     $stmt->bindValue(':ip', $clientIp, SQLITE3_TEXT);
+    $stmt->bindValue(':hw', $hardware, SQLITE3_TEXT);
+    $stmt->bindValue(':mode', $assignedMode, SQLITE3_TEXT);
     $stmt->execute();
 
-    if ($currDp < $targetDp) {
+    if ($assignedMode === 'TAME') {
         echo json_encode([
             'status' => 'OK',
             'task_type' => 'TAME',
@@ -348,9 +361,9 @@ if ($action === 'get_task') {
             'target_dp' => $targetDp,
             'range_min' => '0x80000000000000000000000000000000000',
             'range_max' => '0xfffffffffffffffffffffffffffffffffff',
-            'dp_bits' => 23,
+            'dp_bits' => $dpBits,
             'batch_limit' => 1000,
-            'timeout_sec' => 60
+            'heartbeat_sec' => 10
         ]);
     } else {
         echo json_encode([
@@ -361,38 +374,35 @@ if ($action === 'get_task') {
             'target_pubkey' => '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640',
             'range_min' => '0x80000000000000000000000000000000000',
             'range_max' => '0xfffffffffffffffffffffffffffffffffff',
-            'dp_bits' => 23,
-            'heartbeat_sec' => 30
+            'dp_bits' => $dpBits,
+            'heartbeat_sec' => 10
         ]);
     }
     exit;
 }
 
 if ($action === 'submit_tame' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input || empty($input['dp_list'])) {
-        echo json_encode(['status' => 'EMPTY']);
-        exit;
-    }
-
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
     $workerId = $input['worker_id'] ?? 'unknown_worker';
-    $hashrate = $input['hashrate'] ?? '0 MH/s';
+    $hashrate = $input['hashrate'] ?? '';
     $hardware = $input['hardware'] ?? '';
-    $dpList = $input['dp_list'];
+    $dpList = $input['dp_list'] ?? [];
     $insertedCount = 0;
 
-    $db->exec('BEGIN TRANSACTION;');
-    $stmt = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist)");
+    if (!empty($dpList)) {
+        $db->exec('BEGIN TRANSACTION;');
+        $stmt = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist)");
 
-    foreach ($dpList as $item) {
-        if (!empty($item['x']) && !empty($item['dist'])) {
-            $stmt->bindValue(':x', strtolower(trim($item['x'])), SQLITE3_TEXT);
-            $stmt->bindValue(':dist', strtolower(trim($item['dist'])), SQLITE3_TEXT);
-            $stmt->execute();
-            if ($db->changes() > 0) $insertedCount++;
+        foreach ($dpList as $item) {
+            if (!empty($item['x']) && !empty($item['dist'])) {
+                $stmt->bindValue(':x', strtolower(trim($item['x'])), SQLITE3_TEXT);
+                $stmt->bindValue(':dist', strtolower(trim($item['dist'])), SQLITE3_TEXT);
+                $stmt->execute();
+                if ($db->changes() > 0) $insertedCount++;
+            }
         }
+        $db->exec('COMMIT;');
     }
-    $db->exec('COMMIT;');
 
     $stmtW = $db->prepare("
         INSERT INTO workers_status (worker_id, ip_address, hardware, hashrate, mode, dp_count, last_seen)
@@ -400,7 +410,7 @@ if ($action === 'submit_tame' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         ON CONFLICT(worker_id) DO UPDATE SET
             ip_address = :ip,
             hardware = CASE WHEN :hw != '' THEN :hw ELSE hardware END,
-            hashrate = :hr,
+            hashrate = CASE WHEN :hr != '' AND :hr != '0.0 MH/s' THEN :hr ELSE hashrate END,
             mode = 'TAME',
             dp_count = dp_count + :cnt,
             last_seen = CURRENT_TIMESTAMP
@@ -413,35 +423,41 @@ if ($action === 'submit_tame' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $stmtW->execute();
 
     $currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
+    $targetDp = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
+
     echo json_encode([
-        'status' => 'SAVED',
+        'status' => ($insertedCount > 0 ? 'SAVED' : 'OK'),
         'inserted' => $insertedCount,
-        'current_dp' => $currDp
+        'current_dp' => $currDp,
+        'target_dp' => $targetDp
     ]);
     exit;
 }
 
 if ($action === 'check_wild' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $input = json_decode(file_get_contents('php://input'), true);
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
     $workerId = $input['worker_id'] ?? 'unknown_worker';
-    $hashrate = $input['hashrate'] ?? '0 MH/s';
+    $hashrate = $input['hashrate'] ?? '';
     $hardware = $input['hardware'] ?? '';
     $dpList = $input['dp_list'] ?? [];
+    $submittedCount = count($dpList);
 
     $stmtW = $db->prepare("
-        INSERT INTO workers_status (worker_id, ip_address, hardware, hashrate, mode, last_seen)
-        VALUES (:wid, :ip, :hw, :hr, 'WILD', CURRENT_TIMESTAMP)
+        INSERT INTO workers_status (worker_id, ip_address, hardware, hashrate, mode, dp_count, last_seen)
+        VALUES (:wid, :ip, :hw, :hr, 'WILD', :cnt, CURRENT_TIMESTAMP)
         ON CONFLICT(worker_id) DO UPDATE SET
             ip_address = :ip,
             hardware = CASE WHEN :hw != '' THEN :hw ELSE hardware END,
-            hashrate = :hr,
+            hashrate = CASE WHEN :hr != '' AND :hr != '0.0 MH/s' THEN :hr ELSE hashrate END,
             mode = 'WILD',
+            dp_count = dp_count + :cnt,
             last_seen = CURRENT_TIMESTAMP
     ");
     $stmtW->bindValue(':wid', $workerId, SQLITE3_TEXT);
     $stmtW->bindValue(':ip', $clientIp, SQLITE3_TEXT);
     $stmtW->bindValue(':hw', $hardware, SQLITE3_TEXT);
     $stmtW->bindValue(':hr', $hashrate, SQLITE3_TEXT);
+    $stmtW->bindValue(':cnt', $submittedCount, SQLITE3_INTEGER);
     $stmtW->execute();
 
     if (!empty($dpList)) {
