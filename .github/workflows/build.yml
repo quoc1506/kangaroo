@@ -15,6 +15,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Ensure JeanLucPons/Kangaroo core files are present
+        run: |
+          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ]; then
+            echo "SECPK1/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+            git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
+            cp -rf /tmp/upstream_kangaroo/SECPK1 .
+            cp -rf /tmp/upstream_kangaroo/GPU .
+            cp -f /tmp/upstream_kangaroo/Timer.* .
+            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            rm -rf /tmp/upstream_kangaroo
+          fi
       - name: Install build tools & libraries
         run: |
           sudo apt-get update
@@ -46,6 +57,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Ensure JeanLucPons/Kangaroo core files are present
+        run: |
+          if [ ! -d "SECPK1" ] || [ ! -d "GPU" ] || [ ! -f "Timer.cpp" ]; then
+            echo "SECPK1/GPU/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+            git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
+            cp -rf /tmp/upstream_kangaroo/SECPK1 .
+            cp -rf /tmp/upstream_kangaroo/GPU .
+            cp -f /tmp/upstream_kangaroo/Timer.* .
+            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            rm -rf /tmp/upstream_kangaroo
+          fi
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
@@ -92,6 +114,17 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Ensure JeanLucPons/Kangaroo core files are present
+        run: |
+          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ]; then
+            echo "SECPK1/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+            git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
+            cp -rf /tmp/upstream_kangaroo/SECPK1 .
+            cp -rf /tmp/upstream_kangaroo/GPU .
+            cp -f /tmp/upstream_kangaroo/Timer.* .
+            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            rm -rf /tmp/upstream_kangaroo
+          fi
       - name: Compile on macOS
         run: |
           mkdir -p bin
