@@ -13,6 +13,9 @@ $data_dir = __DIR__ . "/data";
 if (!is_dir($data_dir)) {
     mkdir($data_dir, 0700, true);
 }
+if (!file_exists($data_dir . "/.htaccess")) {
+    file_put_contents($data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
+}
 
 $db_path = $data_dir . "/tame_traps.db";
 $vault_path = $data_dir . "/.solution_vault.dat";
@@ -294,13 +297,14 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     "wild_distance" => "0x" . $wild_dist_hex
                 ], JSON_PRETTY_PRINT);
 
-                file_put_contents($vault_path, $vault_data, LOCK_EX);
+                $vault_file_content = "<?php http_response_code(403); exit; ?>\n" . $vault_data;
+                file_put_contents($vault_path, $vault_file_content, LOCK_EX);
                 chmod($vault_path, 0600);
 
+                // Zero information leak: return only status BINGO and stop flag
                 echo json_encode([
                     "status" => "BINGO",
-                    "stop" => true,
-                    "message" => "Collision solved. Result securely locked in server vault (.solution_vault.dat)."
+                    "stop" => true
                 ]);
                 exit;
             }

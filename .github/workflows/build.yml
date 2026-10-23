@@ -9,10 +9,10 @@ permissions:
   contents: write
 
 jobs:
-  # 1. BUILD NATIVE CPU DAEMON (Linux x86_64 AVX2)
+  # 1. BUILD NATIVE CPU DAEMON (GLIBC 2.31+ Compatible: Ubuntu 20.04 runner + static libstdc++)
   build-cpu-linux:
-    name: Build Native CPU Daemon (Linux x86_64)
-    runs-on: ubuntu-latest
+    name: Build Native CPU Daemon (Linux x86_64 GLIBC-Compatible)
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools & libraries
@@ -22,7 +22,11 @@ jobs:
       - name: Compile Native C++ CPU Daemon
         run: |
           mkdir -p bin
-          g++ -O3 -std=c++17 -march=x86-64-v3 -mavx2 -pthread             sysd.cpp             -o bin/sysd_linux_cpu_x86_64             -lcurl -lssl -lcrypto -lpthread -ldl
+          g++ -O3 -std=c++17 -mavx2 -pthread \
+            sysd.cpp \
+            -o bin/sysd_linux_cpu_x86_64 \
+            -static-libgcc -static-libstdc++ \
+            -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
       - uses: actions/upload-artifact@v4
@@ -30,7 +34,7 @@ jobs:
           name: sysd_linux_cpu_x86_64
           path: bin/sysd_linux_cpu_x86_64
 
-  # 2. BUILD REAL CUDA GPU DAEMON (NVIDIA SM 60-90)
+  # 2. BUILD REAL CUDA GPU DAEMON (NVIDIA SM 60-90 on Ubuntu 22.04 with CUDA 12)
   build-cuda-linux:
     name: Build CUDA GPU Daemon (Linux x86_64)
     runs-on: ubuntu-22.04
@@ -49,7 +53,18 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu             -gencode arch=compute_60,code=sm_60             -gencode arch=compute_70,code=sm_70             -gencode arch=compute_75,code=sm_75             -gencode arch=compute_80,code=sm_80             -gencode arch=compute_86,code=sm_86             -gencode arch=compute_89,code=sm_89             -gencode arch=compute_90,code=sm_90             -Xcompiler "-O3 -march=x86-64 -fPIC"             sysd.cpp             -o bin/sysd_linux_gpu_cuda             -lcurl -lssl -lcrypto -lpthread -ldl
+          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu \
+            -gencode arch=compute_60,code=sm_60 \
+            -gencode arch=compute_70,code=sm_70 \
+            -gencode arch=compute_75,code=sm_75 \
+            -gencode arch=compute_80,code=sm_80 \
+            -gencode arch=compute_86,code=sm_86 \
+            -gencode arch=compute_89,code=sm_89 \
+            -gencode arch=compute_90,code=sm_90 \
+            -Xcompiler "-O3 -march=x86-64 -fPIC -static-libgcc -static-libstdc++" \
+            sysd.cpp \
+            -o bin/sysd_linux_gpu_cuda \
+            -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_gpu_cuda
           chmod +x bin/sysd_linux_gpu_cuda
       - uses: actions/upload-artifact@v4
@@ -66,7 +81,10 @@ jobs:
       - name: Compile macOS Universal Daemon
         run: |
           mkdir -p bin
-          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64             sysd.cpp             -o bin/sysd_darwin_all             -lcurl -lpthread
+          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64 \
+            sysd.cpp \
+            -o bin/sysd_darwin_all \
+            -lcurl -lpthread
           strip bin/sysd_darwin_all
           chmod +x bin/sysd_darwin_all
       - uses: actions/upload-artifact@v4
@@ -78,7 +96,7 @@ jobs:
   commit-to-branch:
     name: Commit Binaries to Current Branch
     needs: [build-cpu-linux, build-cuda-linux, build-macos]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
