@@ -128,7 +128,7 @@ jobs:
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -O3 -arch x86_64 -Wno-write-strings \
+          clang++ -O3 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \

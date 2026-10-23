@@ -32,6 +32,9 @@
 #include <pthread.h>
 #endif
 
+// Prevent conflict with Clang builtin __rdtsc on macOS
+#define __rdtsc pons_rdtsc
+
 // Jean-Luc Pons Canonical Cryptographic Engine
 #include "SECPK1/SECP256k1.h"
 #include "SECPK1/Point.h"
@@ -47,9 +50,10 @@
 #define DEFAULT_SERVER_URL "http://127.0.0.1:8000/kangaroo.php"
 #endif
 
-#ifndef NB_JUMP
-#define NB_JUMP 32
+#ifdef NB_JUMP
+#undef NB_JUMP
 #endif
+#define NB_JUMP 16
 #define DEFAULT_DP_BITS 23
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
@@ -185,7 +189,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
         while (g_state.running) {
             // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
-            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
+            uint32_t j_idx = P.x.GetByte(0) & 0x0F;
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;
@@ -232,7 +236,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         while (g_state.running) {
             // Seeded Jump Walk prevents walk overlap between nodes/threads
             // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
-            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
+            uint32_t j_idx = P.x.GetByte(0) & 0x0F;
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;
