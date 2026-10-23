@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# System Service Daemon Launcher
-# ==============================================================================
 set -e
 
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=""
 OS="$(uname -s)"
 
 if [ "$OS" = "Darwin" ]; then
-    CANDIDATES=(
-        "./bin/sysd_darwin_all"
-        "./sysd_darwin_all"
-        "./bin/sysd"
-        "./sysd"
-    )
-    for c in "${CANDIDATES[@]}"; do
+    for c in "$DIR/bin/sysd_darwin_all" "$DIR/sysd_darwin_all" "$DIR/bin/sysd" "$DIR/sysd"; do
         if [ -f "$c" ]; then
             BIN="$c"
             break
         fi
     done
-else
+elif [ "$OS" = "Linux" ]; then
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        for c in "./bin/sysd_linux_gpu_cuda" "./sysd_linux_gpu_cuda"; do
+        for c in "$DIR/bin/sysd_linux_gpu_cuda" "$DIR/sysd_linux_gpu_cuda"; do
             if [ -f "$c" ]; then
                 BIN="$c"
                 break
@@ -30,13 +22,7 @@ else
         done
     fi
     if [ -z "$BIN" ]; then
-        LINUX_CANDIDATES=(
-            "./bin/sysd_linux_cpu_x86_64"
-            "./sysd_linux_cpu_x86_64"
-            "./bin/sysd"
-            "./sysd"
-        )
-        for c in "${LINUX_CANDIDATES[@]}"; do
+        for c in "$DIR/bin/sysd_linux_cpu_x86_64" "$DIR/sysd_linux_cpu_x86_64" "$DIR/bin/sysd" "$DIR/sysd"; do
             if [ -f "$c" ]; then
                 BIN="$c"
                 break
@@ -46,9 +32,15 @@ else
 fi
 
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Daemon binary not found." >> error.log 2>&1
     exit 1
 fi
 
 chmod +x "$BIN" 2>/dev/null || true
-exec "$BIN" "$@" > /dev/null 2>> error.log
+
+for arg in "$@"; do
+    if [ "$arg" = "--verify" ]; then
+        exec "$BIN" "$@"
+    fi
+done
+
+exec "$BIN" "$@" >/dev/null 2>&1

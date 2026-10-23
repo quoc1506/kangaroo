@@ -34,8 +34,8 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
    - Khi `current_dp < target_dp`: Phân phối tác vụ `TAME` (tạo bẫy).
    - Khi `current_dp >= target_dp`: Phân phối tác vụ `WILD` (tìm kiếm va chạm).
 4. **Quy chuẩn gửi dữ liệu của Worker:**
-   - Khi chạy TAME: Worker gửi dữ liệu lên Server định kỳ mỗi **10 giây** (hoặc khi gom đủ 1.000 điểm DP). Nếu chưa có DP, vẫn gửi heartbeat báo cáo hashrate và trạng thái để Master duy trì `ONLINE`.
-   - Khi chạy WILD: Worker gửi dữ liệu lên Server định kỳ mỗi **10 giây** (chứa danh sách DP phát hiện được trong chu kỳ, hoặc danh sách rỗng để đóng vai trò Heartbeat báo cáo hashrate và duy trì trạng thái `ONLINE`).
+   - Khi chạy TAME: Worker gửi dữ liệu lên Server định kỳ mỗi **60 giây** (hoặc khi gom đủ 1.000 điểm DP). Nếu chưa có DP, vẫn gửi heartbeat báo cáo hashrate và trạng thái để Master duy trì `ONLINE`.
+   - Khi chạy WILD: Worker gửi dữ liệu lên Server định kỳ mỗi **30 giây** (chứa danh sách DP phát hiện được trong chu kỳ, hoặc danh sách rỗng để đóng vai trò Heartbeat báo cáo hashrate và duy trì trạng thái `ONLINE`).
 5. **Chính sách Logging an toàn:** Không in dữ liệu nhạy cảm ra màn hình. Mọi thống kê hiệu năng, hashrate, số lượng DP và dung lượng lưu trữ được xem tập trung trên Web Dashboard của Master Server.
 
 ---

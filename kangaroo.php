@@ -5,24 +5,25 @@
  * SQLite3 WAL | REST API | Secure Vault Storage (No Private Key Exposure)
  * ==============================================================================
  */
-$dataDir = __DIR__ . '/data';
-if (!is_dir($dataDir)) {
-    mkdir($dataDir, 0700, true);
-}
-$dbPath = $dataDir . '/tame_traps.db';
-$vaultPath = $dataDir . '/.solution_vault.dat';
 
+ = __DIR__ . '/data';
+if (!is_dir()) {
+    mkdir(, 0700, true);
+}
+
+ =  . '/tame_traps.db';
+ =  . '/.solution_vault.dat';
 define('SECP_N', '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
 
 try {
-    $db = new SQLite3($dbPath);
-    $db->busyTimeout(10000);
-    $db->exec('PRAGMA journal_mode = WAL;');
-    $db->exec('PRAGMA synchronous = NORMAL;');
-    $db->exec('PRAGMA cache_size = -64000;');
-    $db->exec('PRAGMA temp_store = MEMORY;');
+     = new SQLite3();
+    ->busyTimeout(15000);
+    ->exec('PRAGMA journal_mode = WAL;');
+    ->exec('PRAGMA synchronous = NORMAL;');
+    ->exec('PRAGMA cache_size = -64000;');
+    ->exec('PRAGMA temp_store = MEMORY;');
 
-    $db->exec("
+    ->exec("
         CREATE TABLE IF NOT EXISTS tame_traps (
             dp_x TEXT PRIMARY KEY,
             total_distance TEXT NOT NULL,
@@ -34,6 +35,7 @@ try {
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL
         );
+
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
@@ -49,95 +51,98 @@ try {
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     ");
-} catch (Exception $e) {
-    if (!empty($_GET['action']) || !empty($_POST['action'])) {
+} catch (Exception ) {
+    if (!empty(['action']) || !empty(['action'])) {
         header('Content-Type: application/json; charset=UTF-8');
-        echo json_encode(['status' => 'ERROR', 'message' => $e->getMessage()]);
+        echo json_encode(['status' => 'ERROR', 'message' => ->getMessage()]);
     } else {
         echo '<h1>Database Error</h1>';
     }
     exit;
 }
 
-$action = $_GET['action'] ?? $_POST['action'] ?? '';
-$clientIp = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+ = ['action'] ?? ['action'] ?? '';
+ = ['REMOTE_ADDR'] ?? '127.0.0.1';
 
-// Hàm tính nghiệm và mã hóa lưu an toàn vào Vault (Tuyệt đối không in ra ngoài)
-function securely_vault_solution($rangeMinHex, $tameDistHex, $wildDistHex, $wildX, $workerId, $vaultPath) {
+// Tinh toan nghiem khoa bi mat va luu an toan tuyet doi vao vault (Khong xuat ra ngoai mang/dashboard)
+function securely_vault_solution(, , , , , ) {
     if (!extension_loaded('gmp')) {
         return false;
     }
-    $n = gmp_init(SECP_N);
-    $rMin = gmp_init($rangeMinHex);
-    $dT = gmp_init($tameDistHex);
-    $dW = gmp_init($wildDistHex);
+     = gmp_init(SECP_N);
+     = gmp_init();
+     = gmp_init();
+     = gmp_init();
 
-    $k1 = gmp_mod(gmp_sub(gmp_add($rMin, $dT), $dW), $n);
-    if (gmp_sign($k1) < 0) $k1 = gmp_add($k1, $n);
+    // TH 1: P_T = P_W  => k1 = (RangeMin + D_T - D_W) mod n
+     = gmp_mod(gmp_sub(gmp_add(, ), ), );
+    if (gmp_sign() < 0)  = gmp_add(, );
 
-    $k2 = gmp_mod(gmp_add(gmp_add($rMin, $dT), $dW), $n);
-    if (gmp_sign($k2) < 0) $k2 = gmp_add($k2, $n);
+    // TH 2: P_T = -P_W => k2 = (-RangeMin - D_T - D_W) mod n = n - ((RangeMin + D_T + D_W) mod n)
+     = gmp_mod(gmp_add(gmp_add(, ), ), );
+     = gmp_mod(gmp_sub(, ), );
 
-    $payload = [
+     = [
         'timestamp' => date('Y-m-d H:i:s'),
-        'worker_id' => $workerId,
-        'dp_x' => $wildX,
-        'candidate_1' => '0x' . gmp_strval($k1, 16),
-        'candidate_2' => '0x' . gmp_strval($k2, 16)
+        'worker_id' => ,
+        'dp_x' => ,
+        'candidate_1' => '0x' . gmp_strval(, 16),
+        'candidate_2' => '0x' . gmp_strval(, 16)
     ];
 
-    file_put_contents($vaultPath, json_encode($payload, JSON_PRETTY_PRINT));
-    @chmod($vaultPath, 0600);
+    file_put_contents(, json_encode(, JSON_PRETTY_PRINT));
+    @chmod(, 0600);
     return true;
 }
 
-// 1. API: Lấy tác vụ
-if ($action === 'get_task') {
+// 1. API: Lay tac vu
+if ( === 'get_task') {
     header('Content-Type: application/json; charset=UTF-8');
-    $currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
-    $targetDp = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
-    $rangeMin = $db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_min'") ?: '0x80000000000000000000000000000000000';
-    $rangeMax = $db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_max'") ?: '0xfffffffffffffffffffffffffffffffffff';
-    $targetPk = $db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_pubkey'") ?: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640';
+     = (int)->querySingle("SELECT COUNT(*) FROM tame_traps");
+     = (int)(->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
+     = ->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_min'") ?: '0x80000000000000000000000000000000000';
+     = ->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_max'") ?: '0xfffffffffffffffffffffffffffffffffff';
+     = ->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_pubkey'") ?: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640';
 
-    $taskType = ($currDp < $targetDp) ? 'TAME' : 'WILD';
+     = ( < ) ? 'TAME' : 'WILD';
+
     echo json_encode([
         'status' => 'OK',
-        'task_type' => $taskType,
-        'range_min' => $rangeMin,
-        'range_max' => $rangeMax,
-        'target_pubkey' => $targetPk,
+        'task_type' => ,
+        'range_min' => ,
+        'range_max' => ,
+        'target_pubkey' => ,
         'dp_bits' => 23,
         'heartbeat_sec' => 10
     ]);
     exit;
 }
 
-// 2. API: Nộp bẫy TAME
-if ($action === 'submit_tame' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+// 2. API: Nop bay TAME
+if ( === 'submit_tame' && ['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=UTF-8');
-    $input = json_decode(file_get_contents('php://input'), true) ?? [];
-    $workerId = $input['worker_id'] ?? 'unknown';
-    $hashrate = $input['hashrate'] ?? '0 MH/s';
-    $hardware = $input['hardware'] ?? '';
-    $dpList = $input['dp_list'] ?? [];
-    $insertedCount = 0;
+     = json_decode(file_get_contents('php://input'), true) ?? [];
+     = ['worker_id'] ?? 'unknown';
+     = ['hashrate'] ?? '0 MH/s';
+     = ['hardware'] ?? '';
+     = ['dp_list'] ?? [];
 
-    if (!empty($dpList)) {
-        $db->exec('BEGIN TRANSACTION;');
-        $stmt = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist)");
-        foreach ($dpList as $item) {
-            if (!empty($item['x']) && !empty($item['dist'])) {
-                $stmt->bindValue(':x', strtolower(trim($item['x'])), SQLITE3_TEXT);
-                $stmt->bindValue(':dist', strtolower(trim($item['dist'])), SQLITE3_TEXT);
-                $stmt->execute();
-                if ($db->changes() > 0) $insertedCount++;
+     = 0;
+    if (!empty()) {
+        ->exec('BEGIN TRANSACTION;');
+         = ->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist)");
+        foreach ( as ) {
+            if (!empty(['x']) && !empty(['dist'])) {
+                ->bindValue(':x', strtolower(trim(['x'])), SQLITE3_TEXT);
+                ->bindValue(':dist', strtolower(trim(['dist'])), SQLITE3_TEXT);
+                ->execute();
+                if (->changes() > 0) ++;
             }
         }
-        $db->exec('COMMIT;');
+        ->exec('COMMIT;');
     }
 
-    $stmtW = $db->prepare("
+     = ->prepare("
         INSERT INTO workers_status (worker_id, ip_address, hardware, hashrate, mode, dp_count, last_seen)
         VALUES (:wid, :ip, :hw, :hr, 'TAME', :cnt, CURRENT_TIMESTAMP)
         ON CONFLICT(worker_id) DO UPDATE SET
@@ -148,41 +153,63 @@ if ($action === 'submit_tame' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             dp_count = dp_count + :cnt,
             last_seen = CURRENT_TIMESTAMP
     ");
-    $stmtW->bindValue(':wid', $workerId, SQLITE3_TEXT);
-    $stmtW->bindValue(':ip', $clientIp, SQLITE3_TEXT);
-    $stmtW->bindValue(':hw', $hardware, SQLITE3_TEXT);
-    $stmtW->bindValue(':hr', $hashrate, SQLITE3_TEXT);
-    $stmtW->bindValue(':cnt', $insertedCount, SQLITE3_INTEGER);
-    $stmtW->execute();
+    ->bindValue(':wid', , SQLITE3_TEXT);
+    ->bindValue(':ip', , SQLITE3_TEXT);
+    ->bindValue(':hw', , SQLITE3_TEXT);
+    ->bindValue(':hr', , SQLITE3_TEXT);
+    ->bindValue(':cnt', , SQLITE3_INTEGER);
+    ->execute();
 
-    $currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
-    echo json_encode(['status' => 'SAVED', 'inserted' => $insertedCount, 'current_dp' => $currDp]);
+     = (int)->querySingle("SELECT COUNT(*) FROM tame_traps");
+    echo json_encode(['status' => 'SAVED', 'inserted' => , 'current_dp' => ]);
     exit;
 }
 
-// 3. API: Kiểm tra va chạm WILD (Bảo mật: Không lộ Private Key)
-if ($action === 'check_wild' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+// 3. API: Kiem tra va cham WILD (Bao mat: Khong lo Private Key tren kenh HTTP)
+if ( === 'check_wild' && ['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=UTF-8');
-    $input = json_decode(file_get_contents('php://input'), true) ?? [];
-    $workerId = $input['worker_id'] ?? 'unknown';
-    $dpList = $input['dp_list'] ?? [];
-    $rangeMin = $db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_min'") ?: '0x80000000000000000000000000000000000';
+     = json_decode(file_get_contents('php://input'), true) ?? [];
+     = ['worker_id'] ?? 'unknown';
+     = ['dp_list'] ?? [];
+     = ['hashrate'] ?? '';
+     = ['hardware'] ?? '';
 
-    if (!empty($dpList)) {
-        $stmtSearch = $db->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1");
-        foreach ($dpList as $wildDp) {
-            $wildX = strtolower(trim($wildDp['x'] ?? ''));
-            $wildDist = strtolower(trim($wildDp['dist'] ?? ''));
-            if (!$wildX) continue;
+    // Cap nhat worker status
+     = ->prepare("
+        INSERT INTO workers_status (worker_id, ip_address, hardware, hashrate, mode, dp_count, last_seen)
+        VALUES (:wid, :ip, :hw, :hr, 'WILD', :cnt, CURRENT_TIMESTAMP)
+        ON CONFLICT(worker_id) DO UPDATE SET
+            ip_address = :ip,
+            hardware = CASE WHEN :hw != '' THEN :hw ELSE hardware END,
+            hashrate = CASE WHEN :hr != '' THEN :hr ELSE hashrate END,
+            mode = 'WILD',
+            dp_count = dp_count + :cnt,
+            last_seen = CURRENT_TIMESTAMP
+    ");
+    ->bindValue(':wid', , SQLITE3_TEXT);
+    ->bindValue(':ip', , SQLITE3_TEXT);
+    ->bindValue(':hw', , SQLITE3_TEXT);
+    ->bindValue(':hr', , SQLITE3_TEXT);
+    ->bindValue(':cnt', count(), SQLITE3_INTEGER);
+    ->execute();
 
-            $stmtSearch->bindValue(':x', $wildX, SQLITE3_TEXT);
-            $res = $stmtSearch->execute();
-            $row = $res->fetchArray(SQLITE3_ASSOC);
-            if ($row) {
-                $tameDist = $row['total_distance'];
-                securely_vault_solution($rangeMin, $tameDist, $wildDist, $wildX, $workerId, $vaultPath);
+     = ->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'range_min'") ?: '0x80000000000000000000000000000000000';
 
-                // Báo dừng cho worker, tuyệt đối không lộ Private key trong response
+    if (!empty()) {
+         = ->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1");
+        foreach ( as ) {
+             = strtolower(trim(['x'] ?? ''));
+             = strtolower(trim(['dist'] ?? ''));
+            if (!) continue;
+
+            ->bindValue(':x', , SQLITE3_TEXT);
+             = ->execute();
+             = ->fetchArray(SQLITE3_ASSOC);
+            if () {
+                 = ['total_distance'];
+                securely_vault_solution(, , , , , );
+
+                // Bao dung cho cluster, tuyet doi khong gui Private Key qua JSON
                 echo json_encode([
                     'status' => 'BINGO',
                     'stop' => true,
@@ -192,41 +219,58 @@ if ($action === 'check_wild' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     }
+
     echo json_encode(['status' => 'CONTINUE', 'stop' => false]);
     exit;
 }
 
 // 4. API: Dashboard Stats
-if ($action === 'get_stats') {
+if ( === 'get_stats') {
     header('Content-Type: application/json; charset=UTF-8');
-    $currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
-    $targetDp = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
-    $progress = $targetDp > 0 ? round(($currDp / $targetDp) * 100, 2) : 0;
-    $isSolved = file_exists($vaultPath);
+     = (int)->querySingle("SELECT COUNT(*) FROM tame_traps");
+     = (int)(->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
+     =  > 0 ? round(( / ) * 100, 2) : 0;
+     = file_exists();
 
-    $workersRes = $db->query("SELECT worker_id, hardware, hashrate, mode, dp_count, strftime('%s', 'now') - strftime('%s', last_seen) AS sec_ago FROM workers_status ORDER BY last_seen DESC LIMIT 50");
-    $workers = [];
-    while ($w = $workersRes->fetchArray(SQLITE3_ASSOC)) {
-        $workers[] = $w;
+     = ->query("SELECT worker_id, hardware, hashrate, mode, dp_count, strftime('%s', 'now') - strftime('%s', last_seen) AS sec_ago FROM workers_status ORDER BY last_seen DESC LIMIT 50");
+     = [];
+    while ( = ->fetchArray(SQLITE3_ASSOC)) {
+        [] = ;
     }
 
     echo json_encode([
-        'current_dp' => $currDp,
-        'target_dp' => $targetDp,
-        'progress' => $progress,
-        'is_solved' => $isSolved,
-        'workers' => $workers
+        'current_dp' => ,
+        'target_dp' => ,
+        'progress' => ,
+        'is_solved' => ,
+        'workers' => 
     ]);
     exit;
 }
 
+// 5. API: Cap nhat Target DP
+if ( === 'set_target_dp' && ['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json; charset=UTF-8');
+     = json_decode(file_get_contents('php://input'), true) ?? [];
+     = (int)(['target_dp'] ?? 0);
+    if ( > 0) {
+         = ->prepare("UPDATE system_settings SET setting_value = :val WHERE setting_key = 'target_dp'");
+        ->bindValue(':val', (string), SQLITE3_TEXT);
+        ->execute();
+        echo json_encode(['status' => 'UPDATED', 'target_dp' => ]);
+    } else {
+        echo json_encode(['status' => 'ERROR', 'message' => 'Invalid target']);
+    }
+    exit;
+}
+
 // =============================================================================
-// GIAO DIỆN WEB DASHBOARD (GIÁM SÁT AN TOÀN, KHÔNG HIỂN THỊ KHÓA BÍ MẬT)
+// GIAO DIEN WEB DASHBOARD (GIAM SAT AN TOAN, KHONG HIEN THI KHOA BI MAT)
 // =============================================================================
-$currDp = (int)$db->querySingle("SELECT COUNT(*) FROM tame_traps");
-$targetDp = (int)($db->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
-$progress = $targetDp > 0 ? round(($currDp / $targetDp) * 100, 2) : 0;
-$isSolved = file_exists($vaultPath);
+ = (int)->querySingle("SELECT COUNT(*) FROM tame_traps");
+ = (int)(->querySingle("SELECT setting_value FROM system_settings WHERE setting_key = 'target_dp'") ?: 50000000);
+ =  > 0 ? round(( / ) * 100, 2) : 0;
+ = file_exists();
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -241,7 +285,7 @@ $isSolved = file_exists($vaultPath);
         .badge-solved { background: #065f46; color: #34d399; }
         .badge-active { background: #1e40af; color: #93c5fd; }
         .progress-bar { background: #334155; height: 14px; border-radius: 7px; overflow: hidden; margin-top: 10px; }
-        .progress-fill { background: #38bdf8; height: 100%; width: <?= min(100, $progress) ?>%; transition: width 0.3s; }
+        .progress-fill { background: #38bdf8; height: 100%; width: <?= min(100, ) ?>%; transition: width 0.3s; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 12px; }
         th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #334155; }
         th { background: #0f172a; color: #94a3b8; }
@@ -251,41 +295,41 @@ $isSolved = file_exists($vaultPath);
     <div class="container">
         <h2>CLUSTER COORDINATION MONITOR</h2>
 
-        <?php if ($isSolved): ?>
+        <?php if (): ?>
             <div class="card" style="border-color: #10b981; background: #064e3b;">
-                <span class="badge badge-solved">TRẠNG THÁI: ĐÃ TÌM THẤY VA CHẠM &amp; ĐÃ ĐƯỢC LƯU AN TOÀN TRONG VAULT</span>
+                <span class="badge badge-solved">TRANG THAI: DA TIM THAY VA CHAM &amp; DA DUOC LUU AN TOAN TRONG VAULT</span>
                 <p style="margin: 8px 0 0; font-size: 13px; color: #a7f3d0;">
-                    Dữ liệu đã được bảo mật tại <code>data/.solution_vault.dat</code> (Chỉ quản trị viên có quyền truy cập file trên máy chủ mới xem được).
+                    Du lieu da duoc bao mat tai <code>data/.solution_vault.dat</code> (Chi quan tri vien co quyen truy cap file tren server moi doc duoc).
                 </p>
             </div>
         <?php endif; ?>
 
         <div class="card">
-            <div>Giai đoạn: <span class="badge badge-active"><?= $currDp < $targetDp ? "GIAI ĐOẠN 1: TẠO BẪY TAME" : "GIAI ĐOẠN 2: SĂN VA CHẠM WILD" ?></span></div>
-            <div style="margin-top: 12px;">Số lượng DP: <strong><?= number_format($currDp) ?> / <?= number_format($targetDp) ?> (<?= $progress ?>%)</strong></div>
+            <div>Giai doan: <span class="badge badge-active"><?=  <  ? "GIAI DOAN 1: TAO BAY TAME" : "GIAI DOAN 2: SAN VA CHAM WILD" ?></span></div>
+            <div style="margin-top: 12px;">So luong DP: <strong><?= number_format() ?> / <?= number_format() ?> (<?=  ?>%)</strong></div>
             <div class="progress-bar"><div class="progress-fill"></div></div>
         </div>
 
         <div class="card">
-            <h3 style="margin-top:0;">Danh sách máy trạm hoạt động</h3>
+            <h3 style="margin-top:0;">Danh sach may tram hoat dong</h3>
             <table>
                 <thead>
                     <tr><th>Worker ID</th><th>Hardware</th><th>Hashrate</th><th>Mode</th><th>DP</th><th>Last Seen</th></tr>
                 </thead>
                 <tbody>
                 <?php
-                $workersRes = $db->query("SELECT worker_id, hardware, hashrate, mode, dp_count, strftime('%s', 'now') - strftime('%s', last_seen) AS sec_ago FROM workers_status ORDER BY last_seen DESC LIMIT 30");
-                while ($w = $workersRes->fetchArray(SQLITE3_ASSOC)):
-                    $sec = (int)$w['sec_ago'];
-                    $color = ($sec <= 60) ? '#34d399' : '#f87171';
+                 = ->query("SELECT worker_id, hardware, hashrate, mode, dp_count, strftime('%s', 'now') - strftime('%s', last_seen) AS sec_ago FROM workers_status ORDER BY last_seen DESC LIMIT 30");
+                while ( = ->fetchArray(SQLITE3_ASSOC)):
+                     = (int)['sec_ago'];
+                     = ( <= 60) ? '#34d399' : '#f87171';
                 ?>
                     <tr>
-                        <td><?= htmlspecialchars($w['worker_id']) ?></td>
-                        <td><?= htmlspecialchars($w['hardware']) ?></td>
-                        <td><?= htmlspecialchars($w['hashrate']) ?></td>
-                        <td><?= htmlspecialchars($w['mode']) ?></td>
-                        <td><?= number_format($w['dp_count']) ?></td>
-                        <td style="color: <?= $color ?>;"><?= $sec ?>s ago</td>
+                        <td><?= htmlspecialchars(['worker_id']) ?></td>
+                        <td><?= htmlspecialchars(['hardware']) ?></td>
+                        <td><?= htmlspecialchars(['hashrate']) ?></td>
+                        <td><?= htmlspecialchars(['mode']) ?></td>
+                        <td><?= number_format(['dp_count']) ?></td>
+                        <td style="color: <?=  ?>;"><?=  ?>s ago</td>
                     </tr>
                 <?php endwhile; ?>
                 </tbody>

@@ -1,4 +1,5 @@
 name: Build System Daemon Binaries & Commit to Branch
+
 on:
   push:
     branches: [ master, main ]
@@ -21,10 +22,7 @@ jobs:
       - name: Compile Native C++ CPU Daemon
         run: |
           mkdir -p bin
-          g++ -O3 -std=c++17 -march=x86-64-v3 -mavx2 -pthread \
-            sysd.cpp \
-            -o bin/sysd_linux_cpu_x86_64 \
-            -lcurl -lssl -lcrypto -lpthread -ldl
+          g++ -O3 -std=c++17 -march=x86-64-v3 -mavx2 -pthread             sysd.cpp             -o bin/sysd_linux_cpu_x86_64             -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
       - uses: actions/upload-artifact@v4
@@ -51,18 +49,7 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu \
-            -gencode arch=compute_60,code=sm_60 \
-            -gencode arch=compute_70,code=sm_70 \
-            -gencode arch=compute_75,code=sm_75 \
-            -gencode arch=compute_80,code=sm_80 \
-            -gencode arch=compute_86,code=sm_86 \
-            -gencode arch=compute_89,code=sm_89 \
-            -gencode arch=compute_90,code=sm_90 \
-            -Xcompiler "-O3 -march=x86-64 -fPIC" \
-            sysd.cpp \
-            -o bin/sysd_linux_gpu_cuda \
-            -lcurl -lssl -lcrypto -lpthread -ldl
+          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu             -gencode arch=compute_60,code=sm_60             -gencode arch=compute_70,code=sm_70             -gencode arch=compute_75,code=sm_75             -gencode arch=compute_80,code=sm_80             -gencode arch=compute_86,code=sm_86             -gencode arch=compute_89,code=sm_89             -gencode arch=compute_90,code=sm_90             -Xcompiler "-O3 -march=x86-64 -fPIC"             sysd.cpp             -o bin/sysd_linux_gpu_cuda             -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_gpu_cuda
           chmod +x bin/sysd_linux_gpu_cuda
       - uses: actions/upload-artifact@v4
@@ -79,10 +66,7 @@ jobs:
       - name: Compile macOS Universal Daemon
         run: |
           mkdir -p bin
-          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64 \
-            sysd.cpp \
-            -o bin/sysd_darwin_all \
-            -lcurl -lpthread
+          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64             sysd.cpp             -o bin/sysd_darwin_all             -lcurl -lpthread
           strip bin/sysd_darwin_all
           chmod +x bin/sysd_darwin_all
       - uses: actions/upload-artifact@v4
