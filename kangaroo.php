@@ -132,19 +132,18 @@ function calculate_hit_probability($total_traps, $wild_steps = 0) {
     $tame_steps = (float)$total_traps * $dp_step;
 
     if ($wild_steps <= 0) {
-        // If still in TAME phase or wild just starting, calculate potential collision probability
-        // assuming balanced walks (Tame = Wild)
-        $potential_p = ($tame_steps * $tame_steps) / (2.0 * $w);
+        // Giai doan TAME: Chua co chuot Wild nao chay => Xac suat va cham thuc te = 0!
         return [
-            "mode" => "TAME_COVERAGE",
-            "prob_numeric" => $potential_p,
-            "prob_scientific" => sprintf("%.3e", $potential_p),
-            "prob_percent" => sprintf("%.12f%%", $potential_p * 100.0),
-            "odds_text" => ($potential_p > 0) ? "1 in " . sprintf("%.2e", 1.0 / $potential_p) : "N/A",
-            "tame_steps_scientific" => sprintf("%.2e", $tame_steps)
+            "mode" => "TAME_ONLY",
+            "prob_numeric" => 0.0,
+            "prob_scientific" => "0.000e+00",
+            "prob_percent" => "0.000000000000%",
+            "odds_text" => "Chưa thả Wild (Đang rải bẫy Tame)",
+            "tame_steps_scientific" => sprintf("%.2e", $tame_steps),
+            "wild_steps_scientific" => "0"
         ];
     } else {
-        // Active Wild phase collision probability: 1 - exp(- (T * W) / (2 * Space))
+        // Giai doan WILD: Co chuot Wild dang chay => Xac suat va cham thuc te P = 1 - exp(- (T * W) / (2 * Space))
         $exponent = ($tame_steps * (float)$wild_steps) / (2.0 * $w);
         $prob = 1.0 - exp(-$exponent);
         return [
@@ -498,125 +497,208 @@ $db_size_mb = round($db_size_bytes / (1024 * 1024), 2);
 $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
 $prob_info = calculate_hit_probability($total_traps, $wild_steps);
 
-$workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 30;");
+$workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
 $workers = [];
+$total_hashrate_mhs = 0.0;
+$active_workers_count = 0;
+$now_ts = time();
+
 while ($workers_res && ($w = $workers_res->fetchArray(SQLITE3_ASSOC))) {
+    $last_ts = strtotime($w["last_seen"] . " UTC");
+    $diff_sec = max(0, $now_ts - $last_ts);
+    $is_online = ($diff_sec <= 120);
+    $w["is_online"] = $is_online;
+    $w["diff_sec"] = $diff_sec;
+
+    if ($is_online) {
+        $active_workers_count++;
+        if (preg_match("/([\\d\\.]+)/", $w["hashrate"], $m)) {
+            $total_hashrate_mhs += floatval($m[1]);
+        }
+    }
     $workers[] = $w;
 }
+
+$progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2));
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kangaroo Master Coordinator</title>
+    <title>Kangaroo Master Coordinator - Bitcoin Puzzle #140</title>
     <style>
         * { box-sizing: border-box; }
-        body { background: #0b1120; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 24px; }
+        body { background: #0b1120; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; margin: 0; padding: 24px; }
         .container { max-width: 1100px; margin: 0 auto; }
         .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
         .badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; }
         .badge-green { background: #065f46; color: #34d399; }
         .badge-amber { background: #78350f; color: #fbbf24; }
         .badge-blue { background: #1e3a8a; color: #60a5fa; }
+        .badge-gray { background: #334155; color: #94a3b8; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 20px; }
-        .stat-val { font-size: 22px; font-weight: 700; color: #38bdf8; margin-top: 4px; }
+        .stat-val { font-size: 22px; font-weight: 700; color: #38bdf8; margin-top: 6px; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; font-size: 13px; }
-        th { color: #94a3b8; font-weight: 600; }
-        .prob-box { background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 6px; padding: 14px; margin-top: 10px; }
+        th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #334155; font-size: 13px; }
+        th { color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+        .prob-box { background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px; padding: 16px; margin-top: 10px; }
+        .progress-bar-bg { background: #334155; border-radius: 4px; height: 6px; margin: 8px 0; overflow: hidden; }
+        .progress-bar-fill { background: #38bdf8; height: 100%; border-radius: 4px; transition: width 0.3s; }
     </style>
+    <script>
+        // Auto refresh every 15 seconds
+        let secondsLeft = 15;
+        setInterval(function() {
+            secondsLeft--;
+            const timerEl = document.getElementById("countdown");
+            if (timerEl) timerEl.innerText = secondsLeft + "s";
+            if (secondsLeft <= 0) {
+                location.reload();
+            }
+        }, 1000);
+    </script>
 </head>
 <body>
 <div class="container">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 12px;">
         <div>
-            <h2 style="margin: 0; color: #38bdf8;">Kangaroo Master Coordinator</h2>
-            <div style="font-size: 12px; color: #64748b; margin-top: 2px;">Secp256k1 Distributed Solver | Puzzle #140 [2^139 .. 2^140 - 1]</div>
+            <h2 style="margin: 0; color: #38bdf8; font-size: 22px;">Kangaroo Master Coordinator</h2>
+            <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
+                Secp256k1 Distributed Solver • Bitcoin Puzzle #140 [2^139 .. 2^140 - 1]
+            </div>
         </div>
-        <div>
+        <div style="display: flex; align-items: center; gap: 8px;">
             <?php if ($total_traps < $target_dp): ?>
-                <span class="badge badge-amber">PHASE 1: TAME TRAPS</span>
+                <span class="badge badge-amber">GIAI ĐOẠN 1: TAME TRAPS (<?= $progress_pct ?>%)</span>
             <?php else: ?>
-                <span class="badge badge-green">PHASE 2: WILD HUNTING</span>
+                <span class="badge badge-green">GIAI ĐOẠN 2: WILD HUNTING</span>
             <?php endif; ?>
             <span class="badge badge-blue">SQLite WAL</span>
+            <span style="font-size: 11px; color: #94a3b8; margin-left: 6px;">Auto-refresh: <strong id="countdown" style="color: #38bdf8;">15s</strong></span>
         </div>
     </div>
 
-    <!-- Probability & Core Metrics -->
+    <!-- Core Metrics Grid -->
     <div class="grid">
+        <!-- Card 1: Tame Traps Progress -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8;">Total Tame Traps</div>
-            <div class="stat-val"><?= number_format($total_traps) ?></div>
-            <div style="font-size: 11px; color: #64748b; margin-top: 4px;">Target: <?= number_format($target_dp) ?> DPs</div>
+            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Bẫy Tame Tích Lũy</div>
+            <div class="stat-val"><?= number_format($total_traps) ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">DPs</span></div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" style="width: <?= $progress_pct ?>%;"></div>
+            </div>
+            <div style="font-size: 11px; color: #64748b; display: flex; justify-content: space-between;">
+                <span>Mục tiêu: <?= number_format($target_dp) ?> DPs</span>
+                <span style="color: #38bdf8; font-weight: 600;"><?= $progress_pct ?>%</span>
+            </div>
         </div>
+
+        <!-- Card 2: Total Network Hashrate -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8;">Xác Suất Trúng Giải Hiện Tại</div>
-            <div class="stat-val" style="color: #34d399;"><?= $prob_info["prob_scientific"] ?></div>
-            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">Tỷ lệ: <?= $prob_info["odds_text"] ?></div>
+            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Tổng Hashrate Mạng</div>
+            <div class="stat-val" style="color: #34d399;"><?= number_format($total_hashrate_mhs, 2) ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">MH/s</span></div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 8px; display: flex; align-items: center; gap: 6px;">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #34d399;"></span>
+                <span><?= $active_workers_count ?> Worker đang ONLINE</span>
+            </div>
         </div>
+
+        <!-- Card 3: Storage & Database -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8;">Database Disk Usage</div>
-            <div class="stat-val"><?= $db_size_mb ?> MB</div>
-            <div style="font-size: 11px; color: #34d399; margin-top: 4px;">Compact 64-Byte BLOB</div>
+            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Dung Lượng Database</div>
+            <div class="stat-val"><?= $db_size_mb ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">MB</span></div>
+            <div style="font-size: 11px; color: #34d399; margin-top: 8px;">
+                Binary BLOB 64-byte • WAL High Concurrency
+            </div>
         </div>
+
+        <!-- Card 4: Server Vault Status -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8;">Server Vault Status</div>
+            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Trạng Thái Khóa (Vault)</div>
             <div class="stat-val">
                 <?php if ($vault_exists): ?>
-                    <span style="color: #4ade80;">SOLVED (0600)</span>
+                    <span style="color: #4ade80;">BINGO: SOLVED!</span>
                 <?php else: ?>
-                    <span style="color: #94a3b8;">ARMED &amp; LISTENING</span>
+                    <span style="color: #fbbf24;">ĐANG SĂN (WAITING)</span>
                 <?php endif; ?>
             </div>
-            <div style="font-size: 11px; color: #64748b; margin-top: 4px;">Zero Key Exposure</div>
-        </div>
-    </div>
-
-    <!-- Probability Breakdown Card -->
-    <div class="card">
-        <h3 style="margin: 0 0 10px 0; font-size: 15px; color: #cbd5e1;">Phân Tích Toán Học Xác Suất Va Chạm (Birthday Paradox)</h3>
-        <div class="prob-box">
-            <div style="font-size: 13px; line-height: 1.6;">
-                <strong>Không gian khóa:</strong> W = 2<sup>139</sup> ≈ 6.968 × 10<sup>41</sup> điểm.<br>
-                <strong>Tame Traps tích lũy:</strong> <?= number_format($total_traps) ?> DPs (≈ <?= $prob_info["tame_steps_scientific"] ?> bước đi thực tế).<br>
-                <strong>Xác suất va chạm hiện thời:</strong> <span style="color: #38bdf8; font-weight: 700;"><?= $prob_info["prob_percent"] ?></span> (<?= $prob_info["prob_scientific"] ?>).<br>
-                <strong>Tỷ lệ cược kỳ vọng:</strong> <?= $prob_info["odds_text"] ?>.
+            <div style="font-size: 11px; color: #64748b; margin-top: 8px;">
+                Chế độ an toàn 0600 • Zero Key Exposure
             </div>
         </div>
     </div>
 
-    <!-- Active Compute Nodes -->
+    <!-- Single Probability & Math Breakdown Card (Clean, Non-Duplicated) -->
     <div class="card">
-        <h3 style="margin: 0 0 10px 0; font-size: 15px; color: #cbd5e1;">Active Compute Nodes (Workers)</h3>
+        <h3 style="margin: 0 0 12px 0; font-size: 15px; color: #cbd5e1; display: flex; align-items: center; justify-content: space-between;">
+            <span>Phân Tích Toán Học Xác Suất Va Chạm (Birthday Paradox)</span>
+            <span style="font-size: 12px; color: #38bdf8; font-weight: normal;">Công thức Poisson/Birthday</span>
+        </h3>
+        <div class="prob-box">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; font-size: 13px; line-height: 1.7;">
+                <div>
+                    <div><strong>Không gian khóa:</strong> W = 2<sup>139</sup> ≈ 6.968 × 10<sup>41</sup> điểm</div>
+                    <div><strong>Bẫy Tame tích lũy:</strong> <?= number_format($total_traps) ?> DPs (≈ <?= $prob_info["tame_steps_scientific"] ?> bước đi)</div>
+                    <div><strong>Bước Wild thực tế:</strong> <?= $prob_info["wild_steps_scientific"] ?> bước</div>
+                </div>
+                <div>
+                    <div><strong>Xác suất va chạm hiện thời:</strong> <span style="color: #38bdf8; font-weight: 700;"><?= $prob_info["prob_percent"] ?></span> (<?= $prob_info["prob_scientific"] ?>)</div>
+                    <div><strong>Tỷ lệ cược kỳ vọng:</strong> <span style="color: #34d399; font-weight: 700;"><?= $prob_info["odds_text"] ?></span></div>
+                    <div><strong>Chế độ phân bổ:</strong> <span style="color: #fbbf24; font-weight: 600;"><?= ($total_traps < $target_dp) ? "Rải bẫy TAME (Đan lưới Birthday)" : "Săn va chạm WILD (Tìm nghiệm)" ?></span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Active Compute Nodes (Workers) -->
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0; font-size: 15px; color: #cbd5e1;">
+            Danh Sách Compute Nodes (Workers)
+        </h3>
         <?php if (empty($workers)): ?>
-            <div style="color: #64748b; font-size: 13px;">Chưa có worker nào kết nối. Khởi chạy node với: <code>bash run.sh</code></div>
+            <div style="color: #64748b; font-size: 13px; padding: 12px 0;">
+                Chưa có worker nào kết nối. Khởi chạy node với: <code>bash run.sh</code>
+            </div>
         <?php else: ?>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Worker ID</th>
-                        <th>Hardware</th>
-                        <th>Hashrate</th>
-                        <th>Mode</th>
-                        <th>DPs Sent</th>
-                        <th>Last Ping</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($workers as $w): ?>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
                         <tr>
-                            <td style="color: #38bdf8; font-weight: 600;"><?= htmlspecialchars($w["worker_id"]) ?></td>
-                            <td><?= htmlspecialchars($w["hardware"]) ?></td>
-                            <td style="color: #34d399; font-weight: 600;"><?= htmlspecialchars($w["hashrate"]) ?></td>
-                            <td><span class="badge <?= ($w["mode"] === 'WILD') ? 'badge-green' : 'badge-amber' ?>"><?= htmlspecialchars($w["mode"]) ?></span></td>
-                            <td><?= number_format($w["total_dps"]) ?></td>
-                            <td style="color: #94a3b8;"><?= htmlspecialchars($w["last_seen"]) ?></td>
+                            <th>Worker ID</th>
+                            <th>Phần Cứng</th>
+                            <th>Hashrate</th>
+                            <th>Chế Độ</th>
+                            <th>DPs Đã Gửi</th>
+                            <th>Ping Cuối</th>
+                            <th>Trạng Thái</th>
                         </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($workers as $w): ?>
+                            <tr>
+                                <td style="color: #38bdf8; font-weight: 600; font-family: monospace;"><?= htmlspecialchars($w["worker_id"]) ?></td>
+                                <td><?= htmlspecialchars($w["hardware"]) ?></td>
+                                <td style="color: #34d399; font-weight: 600;"><?= htmlspecialchars($w["hashrate"]) ?></td>
+                                <td>
+                                    <span class="badge <?= ($w["mode"] === "WILD") ? "badge-green" : "badge-amber" ?>">
+                                        <?= htmlspecialchars($w["mode"]) ?>
+                                    </span>
+                                </td>
+                                <td><?= number_format($w["total_dps"]) ?></td>
+                                <td style="color: #94a3b8; font-size: 12px;"><?= htmlspecialchars($w["last_seen"]) ?></td>
+                                <td>
+                                    <?php if ($w["is_online"]): ?>
+                                        <span class="badge badge-green" style="font-size: 11px;">ONLINE</span>
+                                    <?php else: ?>
+                                        <span class="badge badge-gray" style="font-size: 11px;">OFFLINE</span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
         <?php endif; ?>
     </div>
 </div>
