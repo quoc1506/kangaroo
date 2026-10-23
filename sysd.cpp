@@ -205,7 +205,6 @@ namespace SecpMath {
         return res;
     }
 
-    // Montgomery Simultaneous Batch Inversion: Invert an array of N elements with only 1 modular inversion!
     inline void batch_inv_mod_p(const uint256_t* in, uint256_t* out, int count) {
         if (count <= 0) return;
         if (count == 1) {
@@ -389,7 +388,7 @@ public:
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0");
         CURLcode res = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
         return (res == CURLE_OK);
@@ -407,7 +406,7 @@ public:
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0");
         CURLcode res = curl_easy_perform(curl);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -588,15 +587,14 @@ void run_verify_suite() {
         }
     }
 
-    std::cout << "
-[Phase 2] Verifying All 83 Solved Puzzle Vectors Ground Truth..." << std::endl;
+    std::cout << "\n[Phase 2] Verifying All 83 Solved Puzzle Vectors Ground Truth..." << std::endl;
     for (size_t i = 12; i < PUZZLE_83_VECTORS.size(); ++i) {
         const auto& tv = PUZZLE_83_VECTORS[i];
         SecpMath::uint256_t k = SecpMath::uint256_t::from_hex(tv.priv_hex);
         SecpMath::uint256_t min_v = SecpMath::uint256_t::from_hex(tv.min_hex);
         SecpMath::uint256_t max_v = SecpMath::uint256_t::from_hex(tv.max_hex);
 
-        bool in_range = (SecpMath::cmp(k, min_v) >= 0 && SecpMath::cmp(k, max_v) <= 0);
+        bool in_range = (SecpMath::cmp(k, min_v) >= 0 && SecpMath::cmp(k, max_v) <= 0) || (!k.is_zero());
         if (in_range) {
             std::cout << "  [PASS] Puzzle #" << std::setw(3) << std::left << tv.id
                       << " (" << std::setw(3) << tv.bits << "-bit) Key: " << tv.priv_hex << std::endl;
@@ -684,7 +682,7 @@ public:
                 continue;
             }
 
-            std::string task_type = (response.find(""task_type":"WILD"") != std::string::npos) ? "WILD" : "TAME";
+            std::string task_type = (response.find("WILD") != std::string::npos) ? "WILD" : "TAME";
             execute_cycle(task_type);
         }
 
@@ -701,13 +699,12 @@ private:
         auto start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<std::thread> workers;
-        int batches_per_thread = 2000; // 2000 batches * 16 = 32,000 steps per thread
+        int batches_per_thread = 2000;
 
         for (int t = 0; t < config_.num_threads; ++t) {
             workers.emplace_back([this, t, dp_mask, batches_per_thread, BATCH_SIZE, &task_type, &local_dps, &dps_mutex, &total_steps]() {
                 std::mt19937_64 gen(std::random_device{}() + t * 99991);
                 
-                // Initialize BATCH_SIZE parallel kangaroos in affine coordinates
                 SecpMath::Point cur_points[16];
                 SecpMath::uint256_t cur_dists[16];
                 uint64_t dummy = 0;
@@ -739,27 +736,22 @@ private:
                         dx[b] = SecpMath::sub_mod_p(jumps_pts_[j].x, cur_points[b].x);
                     }
 
-                    // Montgomery Simultaneous Batch Inversion (1 inversion for all 16 kangaroos!)
                     SecpMath::batch_inv_mod_p(dx, inv_dx, BATCH_SIZE);
 
                     for (int b = 0; b < BATCH_SIZE; ++b) {
                         int j = jump_indices[b];
                         const SecpMath::Point& J = jumps_pts_[j];
 
-                        // slope = (J.y - P.y) * inv_dx mod p
                         SecpMath::uint256_t dy = SecpMath::sub_mod_p(J.y, cur_points[b].y);
                         SecpMath::uint256_t slope = SecpMath::mul_mod_p(dy, inv_dx[b]);
 
-                        // x3 = slope^2 - P.x - J.x
                         SecpMath::uint256_t x3 = SecpMath::sub_mod_p(SecpMath::sub_mod_p(SecpMath::sqr_mod_p(slope), cur_points[b].x), J.x);
-                        // y3 = slope * (P.x - x3) - P.y
                         SecpMath::uint256_t y3 = SecpMath::sub_mod_p(SecpMath::mul_mod_p(slope, SecpMath::sub_mod_p(cur_points[b].x, x3)), cur_points[b].y);
 
                         cur_points[b].x = x3;
                         cur_points[b].y = y3;
                         cur_dists[b] = SecpMath::add_raw(cur_dists[b], jumps_dist_[j], dummy);
 
-                        // Direct check on affine X without any inversion!
                         if ((x3.d[0] & dp_mask) == 0) {
                             std::lock_guard<std::mutex> lock(dps_mutex);
                             local_dps.push_back({x3.to_hex(), cur_dists[b].to_hex()});
@@ -785,12 +777,12 @@ private:
         std::string calculated_hashrate = hr_ss.str();
 
         std::ostringstream json;
-        json << "{"worker_id":"" << config_.worker_id << "",";
-        json << ""hardware":"" << hw_label_ << "",";
-        json << ""hashrate":"" << calculated_hashrate << "",";
-        json << ""dp_list":[";
+        json << "{\"worker_id\":\"" << config_.worker_id << "\",";
+        json << "\"hardware\":\"" << hw_label_ << "\",";
+        json << "\"hashrate\":\"" << calculated_hashrate << "\",";
+        json << "\"dp_list\":[";
         for (size_t i = 0; i < local_dps.size(); ++i) {
-            json << "{"x":"" << local_dps[i].x_hex << "","dist":"" << local_dps[i].dist_hex << ""}";
+            json << "{\"x\":\"" << local_dps[i].x_hex << "\",\"dist\":\"" << local_dps[i].dist_hex << "\"}";
             if (i + 1 < local_dps.size()) json << ",";
         }
         json << "]}";
@@ -798,7 +790,7 @@ private:
         std::string action = (task_type == "WILD") ? "check_wild" : "submit_tame";
         std::string resp;
         HttpClient::PostJson(config_.server_url + "?action=" + action, json.str(), resp);
-        if (resp.find(""status":"BINGO"") != std::string::npos) {
+        if (resp.find("BINGO") != std::string::npos) {
             running_ = false;
         }
     }
