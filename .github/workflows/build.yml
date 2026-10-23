@@ -33,7 +33,7 @@ jobs:
       - name: Compile CPU Daemon (Canonical JeanLucPons Assembly/AVX2)
         run: |
           mkdir -p bin
-          g++ -O3 -mavx2 -mbmi2 \
+          g++ -O3 -mavx2 -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -81,7 +81,7 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -O3 -DUSE_CUDA \
+          nvcc -O3 -DUSE_CUDA -Xcompiler -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -128,7 +128,7 @@ jobs:
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -O3 \
+          clang++ -O3 -arch x86_64 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \

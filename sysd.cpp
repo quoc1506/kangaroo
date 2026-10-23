@@ -47,7 +47,9 @@
 #define DEFAULT_SERVER_URL "http://127.0.0.1:8000/kangaroo.php"
 #endif
 
-#define NB_JUMP 16
+#ifndef NB_JUMP
+#define NB_JUMP 32
+#endif
 #define DEFAULT_DP_BITS 23
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
@@ -182,7 +184,8 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         uint64_t local_steps = 0;
 
         while (g_state.running) {
-            uint32_t j_idx = (P.x.GetByte(0) ^ (seed & 0xFF)) & 0x0F;
+            // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
+            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;
@@ -215,12 +218,21 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         Point P = target_pub;
         Int dist;
         dist.SetInt32(0);
+        // Branching initial steps per worker thread so wild workers explore distinct trajectories
+        if (thread_id > 0) {
+            for (int s = 0; s < thread_id * 7; ++s) {
+                int init_j = (s * 5 + 3) & 0x0F;
+                P = secp->AddDirect(P, jt->J[init_j]);
+                dist.ModAddK1order(&jt->d[init_j]);
+            }
+        }
 
         uint64_t local_steps = 0;
 
         while (g_state.running) {
             // Seeded Jump Walk prevents walk overlap between nodes/threads
-            uint32_t j_idx = (P.x.GetByte(0) ^ (worker_seed & 0xFF)) & 0x0F;
+            // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
+            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;
