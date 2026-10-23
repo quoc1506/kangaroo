@@ -1,4 +1,4 @@
-name: Build System Daemon Binaries & Commit to Branch
+name: Build System Daemon Binaries
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  # 1. BUILD NATIVE CPU DAEMON (GLIBC 2.31+ Compatible: Ubuntu 20.04 runner + static libstdc++)
+  # 1. BUILD CPU DAEMON (Ubuntu 20.04 with GLIBC 2.31+ compatibility & AVX2/BMI2)
   build-cpu-linux:
-    name: Build Native CPU Daemon (Linux x86_64 GLIBC-Compatible)
+    name: Build CPU Daemon (Linux x86_64 - JeanLucPons Core)
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v4
@@ -19,24 +19,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
-      - name: Compile Native C++ CPU Daemon
+      - name: Compile CPU Daemon (Canonical JeanLucPons Assembly/AVX2)
         run: |
           mkdir -p bin
-          g++ -O3 -std=c++17 -mavx2 -pthread \
+          g++ -O3 -mavx2 -mbmi2 \
             sysd.cpp \
+            SECPK1/SECP256K1.cpp \
+            SECPK1/Point.cpp \
+            SECPK1/Int.cpp \
+            SECPK1/IntGroup.cpp \
+            SECPK1/IntMod.cpp \
+            SECPK1/Random.cpp \
+            Timer.cpp \
             -o bin/sysd_linux_cpu_x86_64 \
-            -static-libgcc -static-libstdc++ \
-            -lcurl -lssl -lcrypto -lpthread -ldl
-          strip --strip-all bin/sysd_linux_cpu_x86_64
+            -lcurl -lpthread -static-libgcc -static-libstdc++
+          strip bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
           path: bin/sysd_linux_cpu_x86_64
 
-  # 2. BUILD REAL CUDA GPU DAEMON (NVIDIA SM 60-90 on Ubuntu 22.04 with CUDA 12)
+  # 2. BUILD NVIDIA CUDA GPU DAEMON (SM 60-90)
   build-cuda-linux:
-    name: Build CUDA GPU Daemon (Linux x86_64)
+    name: Build CUDA GPU Daemon (NVIDIA SM 60-90 - JeanLucPons GPUEngine)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -53,19 +59,27 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu \
+          nvcc -O3 -DUSE_CUDA \
+            sysd.cpp \
+            SECPK1/SECP256K1.cpp \
+            SECPK1/Point.cpp \
+            SECPK1/Int.cpp \
+            SECPK1/IntGroup.cpp \
+            SECPK1/IntMod.cpp \
+            SECPK1/Random.cpp \
+            Timer.cpp \
+            GPU/GPUEngine.cu \
+            GPU/GPUGenerate.cpp \
+            -o bin/sysd_linux_gpu_cuda \
+            -lcurl -lpthread \
             -gencode arch=compute_60,code=sm_60 \
             -gencode arch=compute_70,code=sm_70 \
             -gencode arch=compute_75,code=sm_75 \
             -gencode arch=compute_80,code=sm_80 \
             -gencode arch=compute_86,code=sm_86 \
             -gencode arch=compute_89,code=sm_89 \
-            -gencode arch=compute_90,code=sm_90 \
-            -Xcompiler "-O3 -march=x86-64 -fPIC -static-libgcc -static-libstdc++" \
-            sysd.cpp \
-            -o bin/sysd_linux_gpu_cuda \
-            -lcurl -lssl -lcrypto -lpthread -ldl
-          strip --strip-all bin/sysd_linux_gpu_cuda
+            -gencode arch=compute_90,code=sm_90
+          strip bin/sysd_linux_gpu_cuda
           chmod +x bin/sysd_linux_gpu_cuda
       - uses: actions/upload-artifact@v4
         with:
@@ -78,11 +92,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile macOS Universal Daemon
+      - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -O3 -std=c++17 -arch arm64 -arch x86_64 \
+          clang++ -O3 \
             sysd.cpp \
+            SECPK1/SECP256K1.cpp \
+            SECPK1/Point.cpp \
+            SECPK1/Int.cpp \
+            SECPK1/IntGroup.cpp \
+            SECPK1/IntMod.cpp \
+            SECPK1/Random.cpp \
+            Timer.cpp \
             -o bin/sysd_darwin_all \
             -lcurl -lpthread
           strip bin/sysd_darwin_all
@@ -92,16 +113,13 @@ jobs:
           name: sysd_darwin_all
           path: bin/sysd_darwin_all
 
-  # 4. COMMIT PREBUILT BINARIES DIRECTLY TO BRANCH
+  # 4. COMMIT PREBUILT BINARIES TO BRANCH
   commit-to-branch:
     name: Commit Binaries to Current Branch
     needs: [build-cpu-linux, build-cuda-linux, build-macos]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
@@ -120,5 +138,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
-          git commit -m "auto: update compiled binaries [skip ci]" || echo "No changes to commit"
+          git commit -m "build: compile sysd binaries [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }}

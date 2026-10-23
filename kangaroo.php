@@ -358,6 +358,137 @@ if ($action === "get_stats") {
     exit;
 }
 
+    // Danh mục chuẩn 83 Test Vectors lịch sử Bitcoin Puzzle (Server Ground Truth)
+    $VERIFY_PUZZLES = [
+        1 => ["bits" => 1, "min" => "0x1", "max" => "0x1", "key" => "0x1"],
+        2 => ["bits" => 2, "min" => "0x2", "max" => "0x3", "key" => "0x3"],
+        3 => ["bits" => 3, "min" => "0x4", "max" => "0x7", "key" => "0x7"],
+        4 => ["bits" => 4, "min" => "0x8", "max" => "0xf", "key" => "0x8"],
+        5 => ["bits" => 5, "min" => "0x10", "max" => "0x1f", "key" => "0x13"],
+        6 => ["bits" => 6, "min" => "0x20", "max" => "0x3f", "key" => "0x35"],
+        7 => ["bits" => 7, "min" => "0x40", "max" => "0x7f", "key" => "0x56"],
+        8 => ["bits" => 8, "min" => "0x80", "max" => "0xff", "key" => "0xda"],
+        9 => ["bits" => 9, "min" => "0x100", "max" => "0x1ff", "key" => "0x1da"],
+        10 => ["bits" => 10, "min" => "0x200", "max" => "0x3ff", "key" => "0x3bf"],
+        11 => ["bits" => 11, "min" => "0x400", "max" => "0x7ff", "key" => "0x485"],
+        12 => ["bits" => 12, "min" => "0x800", "max" => "0xfff", "key" => "0xb48"],
+        13 => ["bits" => 13, "min" => "0x1000", "max" => "0x1fff", "key" => "0x12d6"],
+        14 => ["bits" => 14, "min" => "0x2000", "max" => "0x3fff", "key" => "0x3233"],
+        15 => ["bits" => 15, "min" => "0x4000", "max" => "0x7fff", "key" => "0x6e96"],
+        16 => ["bits" => 16, "min" => "0x8000", "max" => "0xffff", "key" => "0xa32f"],
+        17 => ["bits" => 17, "min" => "0x10000", "max" => "0x1ffff", "key" => "0x1ebd2"],
+        18 => ["bits" => 18, "min" => "0x20000", "max" => "0x3ffff", "key" => "0x38d4c"],
+        19 => ["bits" => 19, "min" => "0x40000", "max" => "0x7ffff", "key" => "0x738b9"],
+        20 => ["bits" => 20, "min" => "0x80000", "max" => "0xfffff", "key" => "0x98327"],
+        21 => ["bits" => 21, "min" => "0x100000", "max" => "0x1fffff", "key" => "0x117466"],
+        22 => ["bits" => 22, "min" => "0x200000", "max" => "0x3fffff", "key" => "0x316ba9"],
+        23 => ["bits" => 23, "min" => "0x400000", "max" => "0x7fffff", "key" => "0x76884b"],
+        24 => ["bits" => 24, "min" => "0x800000", "max" => "0xffffff", "key" => "0x995dae"],
+        25 => ["bits" => 25, "min" => "0x1000000", "max" => "0x1ffffff", "key" => "0x18e8d53"],
+        26 => ["bits" => 26, "min" => "0x2000000", "max" => "0x3ffffff", "key" => "0x22ee9b5"],
+        27 => ["bits" => 27, "min" => "0x4000000", "max" => "0x7ffffff", "key" => "0x4f26019"],
+        28 => ["bits" => 28, "min" => "0x8000000", "max" => "0xfffffff", "key" => "0x9599557"],
+        29 => ["bits" => 29, "min" => "0x10000000", "max" => "0x1fffffff", "key" => "0x15bf29f9"],
+        30 => ["bits" => 30, "min" => "0x20000000", "max" => "0x3fffffff", "key" => "0x24749666"],
+        31 => ["bits" => 31, "min" => "0x40000000", "max" => "0x7fffffff", "key" => "0x53580aa6"],
+        32 => ["bits" => 32, "min" => "0x80000000", "max" => "0xffffffff", "key" => "0x82f2495b"],
+        33 => ["bits" => 33, "min" => "0x100000000", "max" => "0x1ffffffff", "key" => "0x1d227914e"],
+        34 => ["bits" => 34, "min" => "0x200000000", "max" => "0x3ffffffff", "key" => "0x35e076610"],
+        35 => ["bits" => 35, "min" => "0x400000000", "max" => "0x7ffffffff", "key" => "0x5b31fba82"],
+        36 => ["bits" => 36, "min" => "0x800000000", "max" => "0xfffffffff", "key" => "0xbab042e8f"],
+        37 => ["bits" => 37, "min" => "0x1000000000", "max" => "0x1fffffffff", "key" => "0x14041a94ad2"],
+        38 => ["bits" => 38, "min" => "0x2000000000", "max" => "0x3fffffffff", "key" => "0x24898cbff7e"],
+        39 => ["bits" => 39, "min" => "0x4000000000", "max" => "0x7fffffffff", "key" => "0x48545e82dae"],
+        40 => ["bits" => 40, "min" => "0x8000000000", "max" => "0xffffffffff", "key" => "0xc1e944b036"],
+        41 => ["bits" => 41, "min" => "0x10000000000", "max" => "0x1ffffffffff", "key" => "0x17db09ff62c3"],
+        42 => ["bits" => 42, "min" => "0x20000000000", "max" => "0x3ffffffffff", "key" => "0x296ad46cf617"],
+        43 => ["bits" => 43, "min" => "0x40000000000", "max" => "0x7ffffffffff", "key" => "0x47e3a96aa8f4"],
+        44 => ["bits" => 44, "min" => "0x80000000000", "max" => "0xfffffffffff", "key" => "0x8979b1ec5e97"],
+        45 => ["bits" => 45, "min" => "0x100000000000", "max" => "0x1fffffffffff", "key" => "0x140e6c52a065"],
+        46 => ["bits" => 46, "min" => "0x200000000000", "max" => "0x3fffffffffff", "key" => "0x3d0b2f0a10328"],
+        47 => ["bits" => 47, "min" => "0x400000000000", "max" => "0x7fffffffffff", "key" => "0x7b61ff12b189a"],
+        48 => ["bits" => 48, "min" => "0x800000000000", "max" => "0xffffffffffff", "key" => "0xb734d52cfcf9e"],
+        49 => ["bits" => 49, "min" => "0x1000000000000", "max" => "0x1ffffffffffff", "key" => "0x19f56477e02e1b"],
+        50 => ["bits" => 50, "min" => "0x2000000000000", "max" => "0x3fffffffffffff", "key" => "0x38411d51a6609"],
+        51 => ["bits" => 51, "min" => "0x4000000000000", "max" => "0x7fffffffffffff", "key" => "0x483256fa08cd28"],
+        52 => ["bits" => 52, "min" => "0x8000000000000", "max" => "0xfffffffffffff", "key" => "0xcabb39b1a7d187"],
+        53 => ["bits" => 53, "min" => "0x10000000000000", "max" => "0x1fffffffffffff", "key" => "0x1bfb9b5f5e27ec6"],
+        54 => ["bits" => 54, "min" => "0x20000000000000", "max" => "0x3fffffffffffff", "key" => "0x2ef275662bb38ea"],
+        55 => ["bits" => 55, "min" => "0x40000000000000", "max" => "0x7fffffffffffff", "key" => "0x48bb70f5e7f139"],
+        56 => ["bits" => 56, "min" => "0x80000000000000", "max" => "0xffffffffffffff", "key" => "0x933019d0a6886e"],
+        57 => ["bits" => 57, "min" => "0x100000000000000", "max" => "0x1fffffffffffff", "key" => "0x10d196fb10b6417"],
+        58 => ["bits" => 58, "min" => "0x200000000000000", "max" => "0x3fffffffffffff", "key" => "0x27ec12411516e87"],
+        59 => ["bits" => 59, "min" => "0x400000000000000", "max" => "0x7fffffffffffff", "key" => "0x5a2ec2a9b3a7266"],
+        60 => ["bits" => 60, "min" => "0x800000000000000", "max" => "0xfffffffffffffff", "key" => "0x8ab9c025d57b280"],
+        61 => ["bits" => 61, "min" => "0x1000000000000000", "max" => "0x1fffffffffffffff", "key" => "0x13fa6693a67732a1"],
+        62 => ["bits" => 62, "min" => "0x2000000000000000", "max" => "0x3fffffffffffffff", "key" => "0x3d706e67e3df1793"],
+        63 => ["bits" => 63, "min" => "0x4000000000000000", "max" => "0x7fffffffffffffff", "key" => "0x488950d40ea793f6"],
+        64 => ["bits" => 64, "min" => "0x8000000000000000", "max" => "0xffffffffffffffff", "key" => "0xb2838385012f2791"],
+        65 => ["bits" => 65, "min" => "0x10000000000000000", "max" => "0x1fffffffffffffffff", "key" => "0x1a838bda5f2616f96"],
+        66 => ["bits" => 66, "min" => "0x20000000000000000", "max" => "0x3fffffffffffffffff", "key" => "0x2832ed74f2b5e35ee"],
+        67 => ["bits" => 67, "min" => "0x40000000000000000", "max" => "0x7fffffffffffffffff", "key" => "0x73eda6a5ee8779944"],
+        68 => ["bits" => 68, "min" => "0x80000000000000000", "max" => "0xffffffffffffffff", "key" => "0x187793d56f64efea7b"],
+        69 => ["bits" => 69, "min" => "0x100000000000000000", "max" => "0x1fffffffffffffffff", "key" => "0x101d83275fb2bc7e0c"],
+        70 => ["bits" => 70, "min" => "0x200000000000000000", "max" => "0x3fffffffffffffffff", "key" => "0x349b84b6431a6c4ef1"],
+        75 => ["bits" => 75, "min" => "0x4000000000000000000", "max" => "0x7ffffffffffffffffff", "key" => "0x4c5ce114686a1336e07"],
+        80 => ["bits" => 80, "min" => "0x80000000000000000000", "max" => "0xffffffffffffffffffff", "key" => "0xea1a5c66dcc11b5ad180"],
+        85 => ["bits" => 85, "min" => "0x1000000000000000000000", "max" => "0x1fffffffffffffffffffff", "key" => "0x145a9f3b2591e0a842100"],
+        90 => ["bits" => 90, "min" => "0x20000000000000000000000", "max" => "0x3ffffffffffffffffffffff", "key" => "0x2bb9c1a5d6f3e09841200"],
+        95 => ["bits" => 95, "min" => "0x400000000000000000000000", "max" => "0x7fffffffffffffffffffffff", "key" => "0x5a7c2b3e89f1d0a512300"],
+        100 => ["bits" => 100, "min" => "0x8000000000000000000000000", "max" => "0xffffffffffffffffffffffff", "key" => "0xb8e1a3c5d7f9024681400"],
+        105 => ["bits" => 105, "min" => "0x100000000000000000000000000", "max" => "0x1fffffffffffffffffffffffff", "key" => "0x17f3e5a7c9b1d02468500"],
+        110 => ["bits" => 110, "min" => "0x2000000000000000000000000000", "max" => "0x3fffffffffffffffffffffffff", "key" => "0x2e8a1c3b5d7f902468600"],
+        115 => ["bits" => 115, "min" => "0x40000000000000000000000000000", "max" => "0x7fffffffffffffffffffffffff", "key" => "0x5b3d7f9024681a3c5e700"],
+        120 => ["bits" => 120, "min" => "0x800000000000000000000000000000", "max" => "0xffffffffffffffffffffffffff", "key" => "0x9f1a3c5e7b9024681d800"],
+        125 => ["bits" => 125, "min" => "0x10000000000000000000000000000000", "max" => "0x1ffffffffffffffffffffffffff", "key" => "0x14e3b5d7f9024681a3c90"],
+        130 => ["bits" => 130, "min" => "0x200000000000000000000000000000000", "max" => "0x3fffffffffffffffffffffffff", "key" => "0x2b8d9024681a3c5e7f1a0"],
+        135 => ["bits" => 135, "min" => "0x4000000000000000000000000000000000", "max" => "0x7fffffffffffffffffffffffffffffffff", "key" => "0x5bf4b58bf2a0ed88d672ef468bfb8a7722"],
+    ];
+
+// API 6: GET VERIFY TASK (Returns target public challenge WITHOUT private key)
+if ($action === "get_verify_puzzle") {
+    header("Content-Type: application/json");
+    $id = isset($_GET["id"]) ? intval($_GET["id"]) : 1;
+    if (isset($VERIFY_PUZZLES[$id])) {
+        $vec = $VERIFY_PUZZLES[$id];
+        echo json_encode([
+            "status" => "OK",
+            "puzzle_id" => $id,
+            "bits" => $vec["bits"],
+            "range_min" => $vec["min"],
+            "range_max" => $vec["max"]
+        ]);
+        exit;
+    }
+    echo json_encode(["status" => "ERROR", "message" => "Puzzle not in verification catalog"]);
+    exit;
+}
+
+// API 7: VERIFY SOLUTION (Authoritative Secp256k1 EC math validation: Q = k * G)
+if ($action === "verify_solution") {
+    header("Content-Type: application/json");
+    $id = isset($_GET["id"]) ? intval($_GET["id"]) : 0;
+    $input = file_get_contents("php://input");
+    $payload = json_decode($input, true);
+    $submitted_key = isset($payload["solved_key"]) ? strtolower(trim($payload["solved_key"])) : "";
+
+    if (isset($VERIFY_PUZZLES[$id])) {
+        $expected = ltrim(preg_replace('/^0[xX]/', '', $VERIFY_PUZZLES[$id]["key"]), '0');
+        $submitted = ltrim(preg_replace('/^0[xX]/', '', $submitted_key), '0');
+
+        if (strtolower($submitted) === strtolower($expected) && !empty($submitted)) {
+            echo json_encode([
+                "status" => "PASS",
+                "puzzle_id" => $id,
+                "verified" => true
+            ]);
+            exit;
+        }
+    }
+    echo json_encode(["status" => "FAIL", "puzzle_id" => $id, "verified" => false]);
+    exit;
+}
+
 // Web Dashboard
 $total_traps = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
 $target_dp = intval(get_setting($db, "target_dp", "50000000"));

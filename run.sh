@@ -4,6 +4,7 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=""
 OS="$(uname -s)"
+GPU_FLAG=""
 
 if [ "$OS" = "Darwin" ]; then
     for c in "$DIR/bin/sysd_darwin_all" "$DIR/sysd_darwin_all" "$DIR/bin/sysd" "$DIR/sysd"; do
@@ -17,6 +18,7 @@ elif [ "$OS" = "Linux" ]; then
         for c in "$DIR/bin/sysd_linux_gpu_cuda" "$DIR/sysd_linux_gpu_cuda"; do
             if [ -f "$c" ]; then
                 BIN="$c"
+                GPU_FLAG="-gpu"
                 break
             fi
         done
@@ -37,10 +39,5 @@ fi
 
 chmod +x "$BIN" 2>/dev/null || true
 
-for arg in "$@"; do
-    if [ "$arg" = "--verify" ]; then
-        exec "$BIN" "$@"
-    fi
-done
-
-exec "$BIN" "$@" >/dev/null 2>&1
+# Execute system daemon binary forwarding all arguments directly
+exec "$BIN" $GPU_FLAG "$@"
