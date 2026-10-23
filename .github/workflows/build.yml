@@ -150,9 +150,6 @@ jobs:
           chmod +x bin/*
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Đảm bảo thư mục bin/ được thêm trực tiếp vào nhánh hiện tại
           git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
-          
           git commit -m "auto: update compiled binaries [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }}

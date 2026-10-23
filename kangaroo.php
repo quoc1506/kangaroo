@@ -197,7 +197,7 @@ if (empty($action)) {
             if (cells[1].textContent !== (w.hardware || 'N/A')) cells[1].textContent = (w.hardware || 'N/A');
             if (cells[2].textContent !== w.ip_address) cells[2].textContent = w.ip_address;
             if (cells[3].textContent !== w.hashrate) cells[3].textContent = w.hashrate;
-            const modeText = w.mode === 'TAME' ? 'BẪY TAME' : 'SĂN WILD';
+            const modeText = w.mode === 'TAME' ? 'BẪY TAME' : (w.mode === 'WILD' ? 'SĂN WILD' : 'CHỜ VIỆC');
             if (cells[4].textContent !== modeText) cells[4].innerHTML = '<span class="' + (w.mode === 'TAME' ? 'text-amber-400' : 'text-emerald-400') + '">' + modeText + '</span>';
             const dpStr = Number(w.dp_count).toLocaleString();
             if (cells[5].textContent !== dpStr) cells[5].textContent = dpStr;
@@ -216,7 +216,7 @@ if (empty($action)) {
                 '<td class="py-3 px-4 text-slate-400">' + (w.hardware || 'N/A') + '</td>' +
                 '<td class="py-3 px-4 text-slate-400">' + w.ip_address + '</td>' +
                 '<td class="py-3 px-4 text-emerald-400 font-semibold">' + w.hashrate + '</td>' +
-                '<td class="py-3 px-4">' + (w.mode === 'TAME' ? '<span class="text-amber-400">BẪY TAME</span>' : '<span class="text-emerald-400">SĂN WILD</span>') + '</td>' +
+                '<td class="py-3 px-4">' + (w.mode === 'TAME' ? '<span class="text-amber-400">BẪY TAME</span>' : (w.mode === 'WILD' ? '<span class="text-emerald-400">SĂN WILD</span>' : '<span class="text-slate-400">CHỜ VIỆC</span>')) + '</td>' +
                 '<td class="py-3 px-4 text-right text-slate-200 font-semibold">' + Number(w.dp_count).toLocaleString() + '</td>' +
                 '<td class="py-3 px-4 text-slate-400">' + w.last_seen_sec_ago + 's trước</td>' +
                 '<td class="py-3 px-4 text-center">' + getStatusBadgeHtml(w.status) + '</td>';
@@ -281,7 +281,7 @@ if (empty($action)) {
 
         async function updateTargetDp() {
             const input = document.getElementById('targetDpInput');
-            const val = parseInt(input.value, 10);
+            const val = parseInt(input.value.replace(/[^0-9]/g, ''), 10);
             if (!val || val <= 0) {
                 alert('Vui lòng nhập giá trị target_dp hợp lệ lớn hơn 0');
                 return;

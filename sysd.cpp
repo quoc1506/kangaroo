@@ -72,6 +72,22 @@ namespace Secp256k1Math {
 
 class HttpClient {
 public:
+    static std::string UrlEncode(const std::string& val) {
+        std::ostringstream escaped;
+        escaped.fill('0');
+        escaped << std::hex;
+        for (char c : val) {
+            if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                escaped << c;
+            } else if (c == ' ') {
+                escaped << "%20";
+            } else {
+                escaped << '%' << std::setw(2) << ((int)(unsigned char)c);
+            }
+        }
+        return escaped.str();
+    }
+public:
     static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
         ((std::string*)userp)->append((char*)contents, size * nmemb);
         return size * nmemb;
@@ -200,8 +216,8 @@ public:
             std::ostringstream ss_url;
             ss_url << config_.server_url
                    << "?action=get_task"
-                   << "&worker_id=" << config_.worker_id
-                   << "&hardware=" << hardware_label_
+                   << "&worker_id=" << HttpClient::UrlEncode(config_.worker_id)
+                   << "&hardware=" << HttpClient::UrlEncode(hardware_label_)
                    << "&threads=" << config_.num_threads;
 
             std::string response;
@@ -283,7 +299,7 @@ private:
             auto now = std::chrono::steady_clock::now();
             double since_report = std::chrono::duration<double>(now - last_report_time).count();
 
-            if (since_report >= 10.0) {
+            if (since_report >= 60.0 || local_traps.size() >= 1000) {
                 std::vector<Secp256k1Math::DPPoint> batch;
                 {
                     std::lock_guard<std::mutex> lock(traps_mutex);
@@ -382,7 +398,7 @@ private:
             auto now = std::chrono::steady_clock::now();
             double since_report = std::chrono::duration<double>(now - last_report_time).count();
 
-            if (since_report >= 10.0) {
+            if (since_report >= 30.0) {
                 std::vector<Secp256k1Math::DPPoint> batch;
                 {
                     std::lock_guard<std::mutex> lock(dps_mutex);
@@ -396,7 +412,12 @@ private:
                 last_report_time = now;
                 last_report_steps = current_steps;
 
-                bool found_collision = check_wild_collision(batch, mh_s);
+                std::string server_res;
+                bool found_collision = check_wild_collision(batch, mh_s, server_res);
+                if (extract_json_string(server_res, "switch_mode") == "TAME") {
+                    session_active = false;
+                    break;
+                }
                 if (found_collision) {
                     session_active = false;
                     running_ = false;
@@ -422,7 +443,7 @@ private:
             remaining_wilds.swap(wild_dps);
         }
         if (!remaining_wilds.empty() && running_) {
-            if (check_wild_collision(remaining_wilds, 0.0)) {
+            std::string dummy; if (check_wild_collision(remaining_wilds, 0.0, dummy)) {
                 running_ = false;
             }
         }
@@ -449,7 +470,7 @@ private:
         return response;
     }
 
-    bool check_wild_collision(const std::vector<Secp256k1Math::DPPoint>& dps, double mh_s) {
+    bool check_wild_collision(const std::vector<Secp256k1Math::DPPoint>& dps, double mh_s, std::string& response) {
         std::ostringstream json;
         json << "{\"worker_id\":\"" << config_.worker_id << "\",";
         json << "\"hashrate\":\"" << std::fixed << std::setprecision(1) << mh_s << " MH/s\",";
@@ -463,7 +484,6 @@ private:
         json << "]}";
 
         std::string check_url = config_.server_url + "?action=check_wild";
-        std::string response;
         if (HttpClient::PostJson(check_url, json.str(), response)) {
             if (response.find("\"status\":\"BINGO\"") != std::string::npos) {
                 log_error("BINGO: VA CHẠM THÀNH CÔNG! DỮ LIỆU ĐÃ ĐƯỢC LƯU.");
