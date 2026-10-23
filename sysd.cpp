@@ -425,7 +425,7 @@ void run_verify_suite() {
         }
 
         if (solved || SecpMath::point_mul(k) == Q) {
-            std::cout << "[OK] Test " << std::setw(2) << std::setfill('0') << tv.id << ": PASS" << std::endl;
+            std::cout << "[OK]  Test " << std::setw(2) << std::setfill('0') << tv.id << ": PASS" << std::endl;
             pass_count++;
         }
     }
