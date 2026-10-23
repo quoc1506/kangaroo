@@ -226,8 +226,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
         foreach ($dp_list as $dp) {
             if (empty($dp["x"]) || empty($dp["dist"])) continue;
-            $x_clean = str_pad(ltrim(trim($dp["x"]), "0x"), 64, "0", STR_PAD_LEFT);
-            $dist_clean = str_pad(ltrim(trim($dp["dist"]), "0x"), 64, "0", STR_PAD_LEFT);
+            $x_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["x"])), 64, "0", STR_PAD_LEFT);
+            $dist_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
             $bin_x = hex2bin($x_clean);
             $bin_dist = hex2bin($dist_clean);
 
@@ -267,7 +267,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
         foreach ($dp_list as $dp) {
             if (empty($dp["x"]) || empty($dp["dist"])) continue;
-            $x_clean = str_pad(ltrim(trim($dp["x"]), "0x"), 64, "0", STR_PAD_LEFT);
+            $x_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["x"])), 64, "0", STR_PAD_LEFT);
             $bin_x = hex2bin($x_clean);
             if ($bin_x === false) continue;
 
@@ -278,7 +278,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
             if ($row) {
                 // COLLISION DETECTED!
                 $tame_dist_hex = bin2hex($row["total_distance"]);
-                $wild_dist_hex = str_pad(ltrim(trim($dp["dist"]), "0x"), 64, "0", STR_PAD_LEFT);
+                $wild_dist_hex = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
                 $cands = solve_candidate_keys($range_min, $tame_dist_hex, $wild_dist_hex);
 
                 // Write to secure server vault (permissions 0600, never exposed in JSON response or UI)

@@ -696,10 +696,11 @@ private:
         auto start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<std::thread> workers;
-        int batches_per_thread = 2000;
+        const int target_duration_sec = (task_type == "WILD") ? 30 : 60;
+        std::atomic<bool> cycle_done{false};
 
         for (int t = 0; t < config_.num_threads; ++t) {
-            workers.emplace_back([this, t, dp_mask, batches_per_thread, BATCH_SIZE, &task_type, &local_dps, &dps_mutex, &total_steps]() {
+            workers.emplace_back([this, t, dp_mask, target_duration_sec, BATCH_SIZE, &task_type, &local_dps, &dps_mutex, &total_steps, &cycle_done, &start_time]() {
                 SecpMath::Point cur_points[16];
                 SecpMath::uint256_t cur_dists[16];
                 uint64_t dummy = 0;
@@ -729,7 +730,7 @@ private:
                 SecpMath::uint256_t inv_dx[16];
                 int jump_indices[16];
 
-                for (int iter = 0; iter < batches_per_thread && running_; ++iter) {
+                for (int iter = 0; !cycle_done && running_; ++iter) {
                     for (int b = 0; b < BATCH_SIZE; ++b) {
                         int j = (cur_points[b].x.d[0] ^ (thread_seed + b)) & 0x0F;
                         jump_indices[b] = j;
@@ -755,9 +756,21 @@ private:
                         if ((x3.d[0] & dp_mask) == 0) {
                             std::lock_guard<std::mutex> lock(dps_mutex);
                             local_dps.push_back({x3.to_hex(), cur_dists[b].to_hex()});
+                            if (local_dps.size() >= 1000) {
+                                cycle_done = true;
+                            }
                         }
                     }
                     thread_steps += BATCH_SIZE;
+
+                    // Periodic check every 1024 batches to minimize time query overhead
+                    if ((iter & 0x3FF) == 0) {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        double sec = std::chrono::duration<double>(now - start_time).count();
+                        if (sec >= target_duration_sec) {
+                            cycle_done = true;
+                        }
+                    }
                 }
                 total_steps += thread_steps;
             });
