@@ -68,8 +68,8 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
   - `RangeMax = 2^140 - 1 = 0xfffffffffffffffffffffffffffffffffff`
   - Chiều rộng không gian khóa: `W = RangeMax - RangeMin + 1 = 2^139 ≈ 6.96 * 10^41`
 
-### 2.3. Bảng bước nhảy Kangaroo (Jump Table 16 lũy thừa - L1 Cache Tối Ưu)
-- Kích thước bảng: 16 bước nhảy (`NB_JUMP = 16`).
+### 2.3. Bảng bước nhảy Kangaroo (Jump Table 32 lũy thừa - L1 Cache Tối Ưu)
+- Kích thước bảng: 32 bước nhảy (`NB_JUMP = 32`).
 - Giá trị bước nhảy vô hướng: `d[i] = 2^(i + 62)` với `i` từ 0 đến 15. Bước nhảy trung bình `d_avg ≈ 2^69.5` (khớp hoàn hảo với căn bậc hai của không gian khóa W = 2^139, căn bậc hai xấp xỉ 2^69.5).
 - Bảng điểm nhảy nạp vào bộ nhớ GPU Constant / CPU L1 Cache:
   `J[i] = d[i] * G  (i = 0, 1, ..., 15)`

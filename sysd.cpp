@@ -32,8 +32,13 @@
 #include <pthread.h>
 #endif
 
-// Prevent conflict with Clang builtin __rdtsc on macOS
+// Compatibility fixes for macOS Clang without touching SECPK1 library
+#if defined(__clang__) || defined(__APPLE__)
 #define __rdtsc pons_rdtsc
+#ifndef __builtin_ia32_sbb_u64
+#define __builtin_ia32_sbb_u64 __builtin_ia32_subborrow_u64
+#endif
+#endif
 
 // Jean-Luc Pons Canonical Cryptographic Engine
 #include "SECPK1/SECP256k1.h"
@@ -53,7 +58,7 @@
 #ifdef NB_JUMP
 #undef NB_JUMP
 #endif
-#define NB_JUMP 16
+#define NB_JUMP 32
 #define DEFAULT_DP_BITS 23
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
@@ -189,7 +194,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
         while (g_state.running) {
             // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
-            uint32_t j_idx = P.x.GetByte(0) & 0x0F;
+            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;
@@ -225,7 +230,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         // Branching initial steps per worker thread so wild workers explore distinct trajectories
         if (thread_id > 0) {
             for (int s = 0; s < thread_id * 7; ++s) {
-                int init_j = (s * 5 + 3) & 0x0F;
+                int init_j = (s * 5 + 3) & (NB_JUMP - 1);
                 P = secp->AddDirect(P, jt->J[init_j]);
                 dist.ModAddK1order(&jt->d[init_j]);
             }
@@ -236,7 +241,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         while (g_state.running) {
             // Seeded Jump Walk prevents walk overlap between nodes/threads
             // Deterministic jump index based strictly on point coordinate (identical for TAME & WILD)
-            uint32_t j_idx = P.x.GetByte(0) & 0x0F;
+            uint32_t j_idx = P.x.GetByte(0) & (NB_JUMP - 1);
             P = secp->AddDirect(P, jt->J[j_idx]);
             dist.ModAddK1order(&jt->d[j_idx]);
             local_steps++;

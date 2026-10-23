@@ -91,7 +91,6 @@ jobs:
             SECPK1/Random.cpp \
             Timer.cpp \
             GPU/GPUEngine.cu \
-            GPU/GPUGenerate.cpp \
             -o bin/sysd_linux_gpu_cuda \
             -lcurl -lpthread \
             -gencode arch=compute_60,code=sm_60 \
@@ -128,7 +127,7 @@ jobs:
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -O3 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc \
+          clang++ -O3 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
