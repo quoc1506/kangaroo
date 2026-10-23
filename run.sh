@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# System Service Daemon Launcher
+# ==============================================================================
 set -e
 
 BIN=""
 OS="$(uname -s)"
 
 if [ "$OS" = "Darwin" ]; then
-    DARWIN_CANDIDATES=(
+    CANDIDATES=(
         "./bin/sysd_darwin_all"
         "./sysd_darwin_all"
-        "./bin/sysd_darwin"
-        "./sysd_darwin"
-        "./bin/sysd_darwin_arm64"
-        "./sysd_darwin_arm64"
-        "./bin/sysd_darwin_x86_64"
-        "./sysd_darwin_x86_64"
         "./bin/sysd"
         "./sysd"
     )
-    for c in "${DARWIN_CANDIDATES[@]}"; do
+    for c in "${CANDIDATES[@]}"; do
         if [ -f "$c" ]; then
             BIN="$c"
             break
@@ -32,7 +29,6 @@ else
             fi
         done
     fi
-
     if [ -z "$BIN" ]; then
         LINUX_CANDIDATES=(
             "./bin/sysd_linux_cpu_x86_64"
@@ -50,7 +46,7 @@ else
 fi
 
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Binary not found in ./bin/ or current directory." >> error.log 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Daemon binary not found in ./bin/ or current directory." >> error.log 2>&1
     exit 1
 fi
 

@@ -1,29 +1,23 @@
 name: Build System Daemon Binaries & Commit to Branch
-
 on:
   push:
-    branches: [ main, master ]
+    branches: [ master, main ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  # ============================================================================
-  # 1. BUILD CPU DAEMON (Linux x86_64 - Native C++ & libcurl, AVX2)
-  # ============================================================================
+  # 1. BUILD NATIVE CPU DAEMON (Linux x86_64 AVX2)
   build-cpu-linux:
     name: Build Native CPU Daemon (Linux x86_64)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Install build tools & libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
-
       - name: Compile Native C++ CPU Daemon
         run: |
           mkdir -p bin
@@ -33,40 +27,31 @@ jobs:
             -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
-
-      - name: Upload CPU artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
           path: bin/sysd_linux_cpu_x86_64
 
-  # ============================================================================
-  # 2. BUILD CUDA GPU DAEMON (Linux x86_64 - Multi-Arch SM 60-90)
-  # ============================================================================
+  # 2. BUILD REAL CUDA GPU DAEMON (NVIDIA SM 60-90)
   build-cuda-linux:
     name: Build CUDA GPU Daemon (Linux x86_64)
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: '12.4.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart-dev", "driver-dev"]'
-
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
-
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -V
-          nvcc -O3 -std=c++17 \
+          nvcc -O3 -std=c++17 -DUSE_CUDA -x cu \
             -gencode arch=compute_60,code=sm_60 \
             -gencode arch=compute_70,code=sm_70 \
             -gencode arch=compute_75,code=sm_75 \
@@ -80,23 +65,17 @@ jobs:
             -lcurl -lssl -lcrypto -lpthread -ldl
           strip --strip-all bin/sysd_linux_gpu_cuda
           chmod +x bin/sysd_linux_gpu_cuda
-
-      - name: Upload CUDA artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sysd_linux_gpu_cuda
           path: bin/sysd_linux_gpu_cuda
 
-  # ============================================================================
-  # 3. BUILD MACOS UNIVERSAL DAEMON (Apple Silicon ARM64 & Intel x86_64)
-  # ============================================================================
+  # 3. BUILD MACOS UNIVERSAL DAEMON
   build-macos:
-    name: Build macOS Universal Daemon (Apple Silicon & Intel)
+    name: Build macOS Universal Daemon
     runs-on: macos-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Compile macOS Universal Daemon
         run: |
           mkdir -p bin
@@ -106,45 +85,33 @@ jobs:
             -lcurl -lpthread
           strip bin/sysd_darwin_all
           chmod +x bin/sysd_darwin_all
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sysd_darwin_all
           path: bin/sysd_darwin_all
 
-  # ============================================================================
-  # 4. COMMIT BINARIES DIRECTLY TO CURRENT BRANCH
-  # ============================================================================
+  # 4. COMMIT PREBUILT BINARIES DIRECTLY TO BRANCH
   commit-to-branch:
     name: Commit Binaries to Current Branch
     needs: [build-cpu-linux, build-cuda-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
-
-      - name: Download CPU artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
           path: bin/
-
-      - name: Download CUDA artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_gpu_cuda
           path: bin/
-
-      - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: sysd_darwin_all
           path: bin/
-
       - name: Commit and push binaries to branch
         run: |
           chmod +x bin/*
