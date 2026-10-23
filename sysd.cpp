@@ -165,8 +165,8 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     range_width.Set(&range_max);
     range_width.Sub(&range_min);
 
-    Random rnd;
-    rnd.Init();
+    // Seed random generator per thread using high-resolution entropy
+    rseed(Timer::getSeed32() + (uint32_t)thread_id * 7919);
 
     while (g_state.running) {
         // Uniform random starting scalar in [RangeMin, RangeMax]
