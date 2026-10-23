@@ -29,7 +29,10 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
 
 ### 1.3. Quy chuẩn kỹ thuật bắt buộc
 1. **Lõi tính toán số học Secp256k1:** Tích hợp trực tiếp engine C++/CUDA tối ưu của Jean-Luc Pons (`JeanLucPons/Kangaroo`), sử dụng biểu diễn số nguyên lớn 256-bit tối ưu hóa thanh ghi và phép cộng điểm tọa độ Jacobian.
-2. **Cơ chế duyệt ngẫu nhiên toàn dải (Pure Random Walk):** Mỗi worker thread (cả TAME và WILD) tự khởi tạo điểm bắt đầu ngẫu nhiên đồng đều trong toàn bộ không gian dải tìm kiếm [RangeMin, RangeMax]. Việc phân bố ngẫu nhiên độc lập tối đa hóa xác suất giao cắt giữa vết bước nhảy của Wild Kangaroo và lưới bẫy Tame Kangaroo theo nguyên lý Birthday Paradox.
+2. **Cơ chế duyệt ngẫu nhiên chuẩn toán học & Chống trùng đa luồng:**
+   - **TAME:** Các luồng khởi tạo điểm xuất phát ngẫu nhiên đồng đều trong dải [RangeMin, RangeMax] để đan lưới bẫy phân tán đều khắp không gian theo Birthday Paradox.
+   - **WILD:** Xuất phát từ khóa công khai mục tiêu Target_PubKey Q kết hợp phân nhánh hạt giống (Seed / Jump Perturbation) hoặc phân đoạn an toàn [from - to] có chặn trên, bảo đảm 100% không bị vọt lố (overshoot) ra ngoài tầm bao phủ của bẫy Tame.
+   - **Phối hợp đa luồng trên 1 máy trạm:** Mọi CPU thread hoặc CUDA core trên cùng một máy dồn toàn lực phối hợp tính toán bước nhảy với tốc độ tối đa, không cần bảng đệm Ring Buffer 250.000 phần tử cục bộ trong RAM, tiết kiệm bộ nhớ và triệt tiêu độ trễ đồng bộ.
 3. **Cơ chế phân phối tác vụ qua ngưỡng động (target_dp):** Master Server tự động quyết định loại tác vụ phân bổ cho worker dựa trên so sánh giữa số lượng DP hiện có (`current_dp`) và ngưỡng mục tiêu (`target_dp`):
    - Khi `current_dp < target_dp`: Phân phối tác vụ `TAME` (tạo bẫy).
    - Khi `current_dp >= target_dp`: Phân phối tác vụ `WILD` (tìm kiếm va chạm).
@@ -65,12 +68,13 @@ Hệ thống vận hành theo mô hình Master - Worker phân tán tập trung:
   - `RangeMax = 2^140 - 1 = 0xfffffffffffffffffffffffffffffffffff`
   - Chiều rộng không gian khóa: `W = RangeMax - RangeMin + 1 = 2^139 ≈ 6.96 * 10^41`
 
-### 2.3. Bảng bước nhảy Kangaroo (Jump Table)
-- Kích thước bảng: 32 bước nhảy (`NB_JUMP = 32`).
-- Giá trị bước nhảy vô hướng: `d[i] = 2^(i + 50)` với `i` từ 0 đến 31. Bước nhảy trung bình `d_avg ≈ 2^66`.
+### 2.3. Bảng bước nhảy Kangaroo (Jump Table 16 lũy thừa - L1 Cache Tối Ưu)
+- Kích thước bảng: 16 bước nhảy (`NB_JUMP = 16`).
+- Giá trị bước nhảy vô hướng: `d[i] = 2^(i + 62)` với `i` từ 0 đến 15. Bước nhảy trung bình `d_avg ≈ 2^69.5` (khớp hoàn hảo với căn bậc hai của không gian khóa W = 2^139, căn bậc hai xấp xỉ 2^69.5).
 - Bảng điểm nhảy nạp vào bộ nhớ GPU Constant / CPU L1 Cache:
-  `J[i] = d[i] * G  (i = 0, 1, ..., 31)`
-- Hàm băm xác định bước nhảy: `i = (Current_Point.X) mod 32` (sử dụng 5 bit thấp của tọa độ X).
+  `J[i] = d[i] * G  (i = 0, 1, ..., 15)`
+- Kích thước bộ nhớ đệm: 16 điểm Affine/Jacobian chỉ chiếm đúng 16 * 64B = 1.024 Bytes (1 KB). Kích thước này vừa khít hoàn toàn trong bộ nhớ nhanh CPU L1 Data Cache (32KB/Core) và NVIDIA Constant Cache (64KB), triệt tiêu hoàn toàn hiện tượng Cache Thrashing và Warp Divergence trên GPU.
+- Hàm băm xác định bước nhảy: `i = (Current_Point.X) & 0x0F` (sử dụng 4 bit thấp nhất của tọa độ X, thực hiện bằng 1 chu kỳ xung nhịp AND bitwise).
 
 ### 2.4. Cấu hình Điểm Phân Biệt (Distinguished Point - DP)
 - Số bit 0 kiểm tra: 23 bit (`k = 23`).
@@ -173,14 +177,18 @@ PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -64000; -- 64MB RAM cache
 PRAGMA temp_store = MEMORY;
 
--- Bảng 1: Lưu trữ bẫy Distinguished Points của Kangaroo TAME
+-- Bảng 1: Lưu trữ bẫy Distinguished Points của Kangaroo TAME (Tối Giản 64-Byte Nhị Phân)
+-- Loại bỏ hoàn toàn trường created_at để tiết kiệm dung lượng đĩa và RAM.
+-- Sử dụng WITHOUT ROWID để lưu trữ trực tiếp B-Tree trên dp_x, loại bỏ chỉ mục phụ và bảng rowid ẩn.
 CREATE TABLE IF NOT EXISTS tame_traps (
-    dp_x TEXT PRIMARY KEY,               -- 64 ký tự Hex của tọa độ X (đạt chuẩn DP)
-    total_distance TEXT NOT NULL,        -- Quãng đường tích lũy vô hướng (Hex BigInt)
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+    dp_x BLOB PRIMARY KEY,               -- 32 bytes raw nhị phân (tọa độ X 256-bit)
+    total_distance BLOB NOT NULL        -- 32 bytes raw nhị phân (quãng đường tích lũy 256-bit)
+) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_tame_dp_x ON tame_traps(dp_x);
+-- Cơ chế Ghi & Kiểm soát WAL Định kỳ:
+-- 1. Batch Insert: Ghi nạp theo từng lô 1.000 DP trong một transaction (BEGIN IMMEDIATE ... COMMIT).
+-- 2. Checkpoint: Thực thi PRAGMA wal_checkpoint(PASSIVE); định kỳ sau mỗi 100.000 DP để dọn dẹp WAL.
+-- 3. Dung lượng lý tưởng: Đúng 64 bytes / 1 điểm bẫy (1 triệu DP chỉ tốn ~64 MB đĩa, 50 triệu DP chỉ tốn ~3.2 GB).
 
 -- Bảng 2: Cấu hình hệ thống động (cho phép Dashboard sửa target_dp)
 CREATE TABLE IF NOT EXISTS system_settings (
@@ -239,6 +247,21 @@ Câu hỏi kỹ thuật cốt lõi: **"Vì sao chuột WILD có cả công thứ
      - Tính `k1 * G`. Nếu tọa độ bằng đúng `Target_PubKey`, thì `k1` là Private Key.
      - Tính `k2 * G`. Nếu tọa độ bằng đúng `Target_PubKey`, thì `k2` là Private Key.
    - Quá trình kiểm tra này diễn ra trong 0.001 giây, bảo đảm tính chính xác tuyệt đối 100%.
+
+5. **Phân tích & Triệt tiêu Lỗi Vọt Lố Không Gian Khóa (Overshoot Bug Prevention):**
+   - **Bản chất lỗi toán học khi random offset lớn:**
+     Nếu gán cho chuột Wild một khoảng offset ngẫu nhiên lớn với `MAX_WILD_OFFSET` xấp xỉ `W = 2^139`, giả sử nghiệm thực `k` nằm ở nửa sau dải tìm kiếm (ví dụ `k = RangeMin + 0.8 * W`), thì tọa độ vô hướng thực tế của chuột Wild sẽ là `k + offset = RangeMin + 1.8 * W > RangeMax`. Khi đó chuột Wild lập tức bị văng ra khỏi dải tìm kiếm mà bẫy Tame giăng sẵn, dẫn tới việc hai con chuột chạy ở hai dải vô hướng khác nhau và xác suất va chạm bằng 0.
+   - **Hai giải pháp chuẩn mực để Wild random tự do nhưng không trùng lặp và không bao giờ vọt lố:**
+     - **Giải pháp 1 (Chuẩn Jean-Luc Pons - Phân nhánh Hạt giống / Seeded Jump Walk):**
+       Tất cả các máy / luồng khởi động chuột Wild trực tiếp từ `Target_PubKey Q` (tức offset ban đầu = 0). Để mỗi luồng hoặc mỗi máy trạm đi một con đường ngẫu nhiên hoàn toàn khác nhau mà không bao giờ giẫm chân lên nhau, ta đưa vào một hạt giống hoán vị (worker seed):
+       `jump_index = (Current_Point.X XOR worker_seed) & 0x0F`
+       Ngay từ bước nhảy đầu tiên, hai worker với hạt giống khác nhau sẽ rẽ sang hai nhánh độc lập hoàn toàn. Xác suất để hai đường đi độc lập này trùng lặp lại trên không gian 139-bit là xấp xỉ 0. Phương pháp này hoàn toàn không sinh offset bậy bạ, bảo đảm tọa độ chuột Wild luôn nằm gọn trong dải bẫy Tame, triệt tiêu 100% bug overshoot.
+     - **Giải pháp 2 (Cơ chế Phân đoạn Khoảng [from - to] với Tame Pre-Extension):**
+       Nếu muốn gán offset ngẫu nhiên cho chuột Wild, dải offset tối đa `MAX_WILD_OFFSET` bắt buộc phải bị giới hạn cực nhỏ: `MAX_WILD_OFFSET <= 2^64` (nhỏ hơn hàng triệu lần so với `W = 2^139`). Đồng thời lưới bẫy Tame bắt buộc phải được thiết lập chạy vượt thêm đúng một quãng đệm an toàn: `TameLength = W + MAX_WILD_OFFSET` để bao phủ trọn vẹn toàn bộ dải rơi của Wild. Master Server quản lý các khoảng `[from, to]` đã cấp phát (dưới dạng danh sách interval hoặc bitmap nhị phân nén) để bảo đảm không cấp trùng giữa các worker.
+
+6. **Thiết kế Đa Luồng Tối Ưu Trên Từng Máy Trạm (Single-Node Multi-Threading):**
+   - Trên một máy trạm đơn lẻ (1 máy tính chứa nhiều CPU Core hoặc GPU NVIDIA nhiều SM), tất cả các luồng dồn toàn lực tính toán song song để tối đa hóa hashrate.
+   - Loại bỏ hoàn toàn cấu trúc Ring Buffer 250.000 phần tử cục bộ trong RAM worker: Mỗi luồng trên máy trạm chạy với seed riêng (`thread_id ^ node_seed`), đẩy trực tiếp các điểm phân biệt DP tìm được vào hàng đợi mạng (Queue) của `sysd.cpp` để gửi lên Master Server. Điều này giúp giải phóng 100% tài nguyên RAM máy trạm, đơn giản hóa mã nguồn và triệt tiêu hoàn toàn hiện tượng khóa đồng bộ (lock contention).
 
 ### 4.4. Đặc tả Giao diện Web Dashboard Quản trị & Giám sát (`dashboard.php`)
 Toàn bộ thông tin vận hành được hiển thị trực quan trên giao diện Web Dashboard của Master Server:

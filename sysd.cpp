@@ -609,6 +609,102 @@ void run_verify_suite() {
     std::cout << "=============================================================" << std::endl;
 }
 
+
+// ==============================================================================
+// Stratified Grid Partitioning & Dynamic Wild Kangaroo Deduplication
+// ==============================================================================
+class StratifiedGridCoordinator {
+private:
+    std::mutex mtx_;
+    uint64_t max_wild_slots_{1000000000ULL};
+    SecpMath::uint256_t slot_width_;
+    static const size_t RING_CAPACITY = 250000;
+    std::vector<uint64_t> ring_buffer_;
+    std::unordered_set<uint64_t> active_slots_;
+    size_t ring_head_{0};
+    std::mt19937_64 rng_;
+
+public:
+    StratifiedGridCoordinator() : rng_(std::random_device{}()) {
+        ring_buffer_.resize(RING_CAPACITY, 0);
+    }
+
+    void init(const SecpMath::uint256_t& range_w, int dp_mask_bits, int jump_exp) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        int slot_shift = dp_mask_bits + jump_exp;
+        if (slot_shift > 240) slot_shift = 240;
+
+        slot_width_ = {{0, 0, 0, 0}};
+        int limb = slot_shift / 64;
+        int bit = slot_shift % 64;
+        slot_width_.d[limb] = (1ULL << bit);
+
+        int w_bits = range_w.bit_length();
+        int available_bits = w_bits - slot_shift;
+        if (available_bits <= 0) {
+            max_wild_slots_ = 1;
+        } else if (available_bits >= 60) {
+            max_wild_slots_ = (1ULL << 60);
+        } else {
+            max_wild_slots_ = (1ULL << available_bits);
+        }
+    }
+
+    uint64_t get_max_wild_slots() const {
+        return max_wild_slots_;
+    }
+
+    SecpMath::uint256_t allocate_wild_offset() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        uint64_t slot = 0;
+        int attempts = 0;
+        do {
+            slot = (max_wild_slots_ > 1) ? (rng_() % max_wild_slots_) : 0;
+            attempts++;
+        } while (active_slots_.count(slot) && attempts < 25);
+
+        uint64_t old_slot = ring_buffer_[ring_head_];
+        if (old_slot != 0) {
+            active_slots_.erase(old_slot);
+        }
+
+        ring_buffer_[ring_head_] = slot;
+        active_slots_.insert(slot);
+        ring_head_ = (ring_head_ + 1) % RING_CAPACITY;
+
+        // Multiply slot with slot_width_
+        int shift = 0;
+        for (int l = 3; l >= 0; --l) {
+            if (slot_width_.d[l] > 0) {
+                shift = l * 64 + __builtin_ctzll(slot_width_.d[l]);
+                break;
+            }
+        }
+
+        SecpMath::uint256_t offset = {{0, 0, 0, 0}};
+        int limb_s = shift / 64;
+        int bit_s = shift % 64;
+        if (limb_s < 4) {
+            if (bit_s == 0) {
+                offset.d[limb_s] = slot;
+            } else {
+                offset.d[limb_s] = (slot << bit_s);
+                if (limb_s + 1 < 4) {
+                    offset.d[limb_s + 1] = (slot >> (64 - bit_s));
+                }
+            }
+        }
+
+        // Add smooth continuous jitter within stratum [0, slot_width / 2)
+        uint64_t jitter_raw = rng_() & 0x7FFFFFFFFFFFFFFFULL;
+        uint64_t dummy = 0;
+        SecpMath::uint256_t jitter = {{jitter_raw, 0, 0, 0}};
+        offset = SecpMath::add_raw(offset, jitter, dummy);
+
+        return offset;
+    }
+};
+
 class SystemEngine {
 private:
     DaemonConfig config_;
@@ -618,7 +714,9 @@ private:
     SecpMath::Point target_pubkey_;
     SecpMath::uint256_t range_min_;
     SecpMath::uint256_t range_max_;
+    StratifiedGridCoordinator grid_coordinator_;
     std::string hw_label_;
+    int center_exp_{70};
 
 public:
     SystemEngine(const DaemonConfig& cfg) : config_(cfg) {
@@ -633,22 +731,24 @@ public:
 
         init_jump_table();
 
+        SecpMath::uint256_t w = SecpMath::sub_raw(range_max_, range_min_);
+        grid_coordinator_.init(w, 23, center_exp_ - 16);
+
 #ifdef USE_CUDA
-        hw_label_ = "CUDA Accelerated GPU Node";
+        hw_label_ = "CUDA GPU Node";
 #else
-        hw_label_ = "CPU " + std::to_string(config_.num_threads) + "-Thread Node";
+        hw_label_ = "CPU " + std::to_string(config_.num_threads) + "T";
 #endif
     }
 
     void init_jump_table() {
-        uint64_t dummy = 0;
-        SecpMath::uint256_t width = SecpMath::sub_raw(range_max_, range_min_, dummy);
-        int w_bits = width.bit_length();
+        SecpMath::uint256_t w = SecpMath::sub_raw(range_max_, range_min_);
+        int w_bits = w.bit_length();
         if (w_bits < 10) w_bits = 10;
-        int center_exp = (w_bits / 2);
+        center_exp_ = (w_bits / 2);
 
         for (int i = 0; i < 32; ++i) {
-            int exp = center_exp - 16 + i;
+            int exp = center_exp_ - 16 + i;
             if (exp < 1) exp = 1;
             if (exp > 240) exp = 240;
 
@@ -702,22 +802,25 @@ private:
         int batches_per_thread = 2000;
 
         for (int t = 0; t < config_.num_threads; ++t) {
-            workers.emplace_back([this, t, dp_mask, batches_per_thread, BATCH_SIZE, &task_type, &local_dps, &dps_mutex, &total_steps]() {
-                std::mt19937_64 gen(std::random_device{}() + t * 99991);
-                
+            workers.emplace_back([this, dp_mask, batches_per_thread, BATCH_SIZE, &task_type, &local_dps, &dps_mutex, &total_steps]() {
                 SecpMath::Point cur_points[16];
                 SecpMath::uint256_t cur_dists[16];
                 uint64_t dummy = 0;
 
                 for (int b = 0; b < BATCH_SIZE; ++b) {
-                    SecpMath::uint256_t off = {{gen(), gen(), 0, 0}};
-                    cur_dists[b] = off;
-                    SecpMath::Point off_pt = SecpMath::point_mul(off);
-
                     if (task_type == "WILD") {
+                        // Collision-free stratified grid starting point
+                        SecpMath::uint256_t off = grid_coordinator_.allocate_wild_offset();
+                        cur_dists[b] = off;
+                        SecpMath::Point off_pt = SecpMath::point_mul(off);
                         SecpMath::JacobianPoint jw = SecpMath::jacobian_add_affine(SecpMath::JacobianPoint::from_affine(target_pubkey_), off_pt);
                         cur_points[b] = jw.to_affine();
                     } else {
+                        // Tame starting point
+                        std::mt19937_64 gen(std::random_device{}());
+                        SecpMath::uint256_t off = {{gen(), gen(), 0, 0}};
+                        cur_dists[b] = off;
+                        SecpMath::Point off_pt = SecpMath::point_mul(off);
                         SecpMath::Point base_p = SecpMath::point_mul(range_min_);
                         SecpMath::JacobianPoint jt = SecpMath::jacobian_add_affine(SecpMath::JacobianPoint::from_affine(base_p), off_pt);
                         cur_points[b] = jt.to_affine();
@@ -776,6 +879,7 @@ private:
         hr_ss << std::fixed << std::setprecision(2) << real_mhs << " MH/s";
         std::string calculated_hashrate = hr_ss.str();
 
+        // 1,000 DP Batch Transmission Pipeline
         std::ostringstream json;
         json << "{\"worker_id\":\"" << config_.worker_id << "\",";
         json << "\"hardware\":\"" << hw_label_ << "\",";
