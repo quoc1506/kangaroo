@@ -46,7 +46,7 @@ else
 fi
 
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Daemon binary not found in ./bin/ or current directory." >> error.log 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERR] Daemon binary not found." >> error.log 2>&1
     exit 1
 fi
 
