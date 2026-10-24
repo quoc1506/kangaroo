@@ -459,8 +459,8 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         jump_P[i] = secp->ComputePublicKey(&jump_d[i]);
     }
 
-    int max_tame_steps = (int)(sqrt_w * 6.0) + 128;
-    if (max_tame_steps > 3500000) max_tame_steps = 3500000;
+    int max_tame_steps = (int)(sqrt_w * 2.0) + 128;
+    if (max_tame_steps > 1800000) max_tame_steps = 1800000;
 
     // Use fast 64-bit key map for maximum lookup speed (avoids heavy std::string hex conversions)
     std::unordered_map<uint64_t, Int> tame_traps;
@@ -479,8 +479,8 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     }
 
     // 2. WILD KANGAROO: starts at target_Q, distance = 0
-    int max_wild_steps = (int)((w_est / mu) + sqrt_w * 8.0) + 256;
-    if (max_wild_steps > 7000000) max_wild_steps = 7000000;
+    int max_wild_steps = (int)((w_est / mu) + sqrt_w * 3.5) + 256;
+    if (max_wild_steps > 3600000) max_wild_steps = 3600000;
 
     // Up to 2 independent trajectories to guarantee collision even with rare random fluctuations
     for (int traj = 0; traj < 2; ++traj) {
