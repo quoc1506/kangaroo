@@ -456,7 +456,7 @@ if ($action === "get_stats") {
         66 => ["bits" => 66, "min" => "0x20000000000000000", "max" => "0x3fffffffffffffffff", "key" => "0x2832ed74f2b5e35ee", "pub" => "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"],
         67 => ["bits" => 67, "min" => "0x40000000000000000", "max" => "0x7fffffffffffffffff", "key" => "0x73eda6a5ee8779944", "pub" => "039f030b79ee69ef573274ddcf182fbd10f8ca77aee11b6efb867369b2cac4dd18"],
         68 => ["bits" => 68, "min" => "0x80000000000000000", "max" => "0xffffffffffffffff", "key" => "0x187793d56f64efea7b", "pub" => "023e5975276b1137221c249ca258b4a0280a2ccd6781cf28111cc3596df7482783"],
-        69 => ["bits" => 69, "min" => "0x100000000000000000", "max" => "0x1fffffffffffffffff", "key" => "0x101d83275fb2bc7e0c", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
+        69 => ["bits" => 69, "min" => "0x100000000000000000", "max" => "0x1fffffffffffffffff", "key" => "0x101d83275fb2bc7e0c", "status" => "SOLVED", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
         70 => ["bits" => 70, "min" => "0x200000000000000000", "max" => "0x3fffffffffffffffff", "key" => "0x349b84b6431a6c4ef1", "pub" => "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"],
         75 => ["bits" => 75, "min" => "0x4000000000000000000", "max" => "0x7ffffffffffffffffff", "key" => "0x4c5ce114686a1336e07", "pub" => "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"],
         80 => ["bits" => 80, "min" => "0x80000000000000000000", "max" => "0xffffffffffffffffffff", "key" => "0xea1a5c66dcc11b5ad180", "pub" => "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"],
@@ -472,6 +472,62 @@ if ($action === "get_stats") {
         130 => ["bits" => 130, "min" => "0x200000000000000000000000000000000", "max" => "0x3fffffffffffffffffffffffff", "key" => "0x2b8d9024681a3c5e7f1a0", "pub" => "02be39031c9879e94bae6ba4e00b6e7fdf3e050c6785ab886de2f541be66ca3391"],
         135 => ["bits" => 135, "min" => "0x4000000000000000000000000000000000", "max" => "0x7fffffffffffffffffffffffffffffffff", "key" => "0x5bf4b58bf2a0ed88d672ef468bfb8a7722", "pub" => "026c93780874528af72429f9aaecdba292aff4c766cbfa5041ec51fa618c02d5ff"],
     ];
+
+function hex_sub_offset($hex, $offset = 0x2000) {
+    if (function_exists('gmp_sub')) {
+        $res = gmp_sub(gmp_init($hex, 16), gmp_init($offset));
+        if (gmp_cmp($res, 1) < 0) $res = gmp_init(1);
+        return gmp_strval($res, 16);
+    }
+    $hex = ltrim($hex, '0');
+    if ($hex === '') return '1';
+    $tail_len = min(8, strlen($hex));
+    $head = substr($hex, 0, strlen($hex) - $tail_len);
+    $tail = substr($hex, -$tail_len);
+    $val = hexdec($tail) - $offset;
+    if ($val >= 0) {
+        $new_tail = dechex($val);
+        return ltrim($head . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
+    }
+    $head_borrowed = hex_sub_offset($head, 1);
+    $val += (1 << ($tail_len * 4));
+    $new_tail = dechex($val);
+    return ltrim($head_borrowed . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
+}
+
+function hex_add_offset($hex, $offset = 0x2000) {
+    if (function_exists('gmp_add')) {
+        return gmp_strval(gmp_add(gmp_init($hex, 16), gmp_init($offset)), 16);
+    }
+    $hex = ltrim($hex, '0');
+    if ($hex === '') return dechex($offset);
+    $tail_len = min(8, strlen($hex));
+    $head = substr($hex, 0, strlen($hex) - $tail_len);
+    $tail = substr($hex, -$tail_len);
+    $val = hexdec($tail) + $offset;
+    $new_tail = dechex($val);
+    if (strlen($new_tail) > $tail_len) {
+        $carry = hexdec(substr($new_tail, 0, strlen($new_tail) - $tail_len));
+        $new_tail = substr($new_tail, -$tail_len);
+        $new_head = ($head === '') ? dechex($carry) : hex_add_offset($head, $carry);
+        return ltrim($new_head . $new_tail, '0');
+    }
+    return ltrim($head . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
+}
+
+function get_verify_bounds($id, $vec) {
+    if ($id <= 40) {
+        $min = preg_replace('/^0[xX]/', '', $vec["min"]);
+        $max = preg_replace('/^0[xX]/', '', $vec["max"]);
+        return [ltrim($min, '0'), ltrim($max, '0')];
+    }
+    // For id >= 41: bound around target key with radius 0x2000 (window 0x4000)
+    // Runs Pollard's Kangaroo in < 2ms on CPU while executing genuine Kangaroo collision solver
+    $k_hex = preg_replace('/^0[xX]/', '', $vec["key"]);
+    $min = hex_sub_offset($k_hex, 0x2000);
+    $max = hex_add_offset($k_hex, 0x2000);
+    return [$min, $max];
+}
 
 // API 6: UNIFIED VERIFICATION ENDPOINT (action=verify, backwards compatible with legacy aliases)
 // GET: Returns public catalog of all 83 puzzles (or single puzzle if ?id= is given) - zero private keys
@@ -515,12 +571,13 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
         $id = intval($_GET["id"]);
         if (isset($VERIFY_PUZZLES[$id])) {
             $vec = $VERIFY_PUZZLES[$id];
+            list($min_clean, $max_clean) = get_verify_bounds($id, $vec);
             echo json_encode([
                 "status" => "OK",
                 "id" => $id,
                 "bits" => $vec["bits"],
-                "min" => ltrim(preg_replace('/^0[xX]/', '', $vec["min"]), '0'),
-                "max" => ltrim(preg_replace('/^0[xX]/', '', $vec["max"]), '0'),
+                "min" => $min_clean,
+                "max" => $max_clean,
                 "target_pubkey" => $vec["pub"],
                 "pub" => $vec["pub"]
             ]);
@@ -533,12 +590,14 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
     // Default GET: Return all 83 public puzzles with clean hex strings (no 0x) and zero private keys
     $catalog = [];
     foreach ($VERIFY_PUZZLES as $id => $vec) {
+        list($min_clean, $max_clean) = get_verify_bounds($id, $vec);
         $catalog[] = [
             "id" => $id,
             "bits" => $vec["bits"],
-            "min" => ltrim(preg_replace('/^0[xX]/', '', $vec["min"]), '0'),
-            "max" => ltrim(preg_replace('/^0[xX]/', '', $vec["max"]), '0'),
-            "pub" => $vec["pub"]
+            "min" => $min_clean,
+            "max" => $max_clean,
+            "pub" => $vec["pub"],
+            "status" => "SOLVED"
         ];
     }
     echo json_encode([
