@@ -323,11 +323,22 @@ static void RunVerification(Secp256K1 *secp) {
     Int privTwo;
     privTwo.SetInt32(2);
     Point p2 = secp->ComputePublicKey(&privTwo);
-    Point p2_add = secp->AddDirect(p1, p1);
-    if (p2.equals(p2_add)) {
-        std::cout << "[+] Group doubling P+P = 2P verification: [PASS]\n";
+    Point p2_double = secp->DoubleDirect(p1);
+    if (p2.equals(p2_double)) {
+        std::cout << "[+] Group doubling 2*G verification: [PASS]\n";
     } else {
         std::cerr << "[-] Group doubling verification: [FAIL]\n";
+        return;
+    }
+
+    Int privThree;
+    privThree.SetInt32(3);
+    Point p3 = secp->ComputePublicKey(&privThree);
+    Point p3_add = secp->AddDirect(p2, p1);
+    if (p3.equals(p3_add)) {
+        std::cout << "[+] Group addition 2G+G = 3G verification: [PASS]\n";
+    } else {
+        std::cerr << "[-] Group addition verification: [FAIL]\n";
         return;
     }
 
