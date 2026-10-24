@@ -397,17 +397,15 @@ static std::string CleanHex(std::string s) {
 // Canonical Pollard's Kangaroo solver for verifying discrete log solving dynamically
 // Tame kangaroo records footprints along its trajectory into a hash table
 // Wild kangaroo starts from Target Public Key Q and follows identical jump steps
-// When collision occurs (Wild lands on Tame footprint): Q + dist_W * G = dist_T * G => k = dist_T - dist_W
-// Canonical Pollard's Kangaroo solver for verifying discrete log solving dynamically
-// Tame kangaroo records footprints along its trajectory into a hash table
-// Wild kangaroo starts from Target Public Key Q and follows identical jump steps
-// When collision occurs (Wild lands on Tame footprint): Q + dist_W * G = dist_T * G => k = dist_T - dist_W
+// When collision occurs (Wild lands on Tame footprint):
+//   Case 1 (W == T):  Q + dist_W * G = dist_T * G  =>  k = (dist_T - dist_W) mod n
+//   Case 2 (W == -T): Q + dist_W * G = -(dist_T * G) => k = -(dist_T + dist_W) mod n
 static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const Int &r_min, const Int &r_max, Int &solved_key) {
     Int range_width;
     range_width.Set((Int*)&r_max);
     range_width.Sub((Int*)&r_min);
 
-    // If range is degenerate
+    // If range is degenerate (r_min == r_max)
     if (range_width.IsZero()) {
         Point p = secp->ComputePublicKey((Int*)&r_min);
         if (p.equals((Point&)target_Q)) {
@@ -434,33 +432,38 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         return false;
     }
 
-    const int K_JUMPS = 16;
+    const int K_JUMPS = 32;
     Int jump_d[K_JUMPS];
     Point jump_P[K_JUMPS];
 
     uint32_t bit_len = range_width.GetBitLength();
-    int shift = (bit_len > 4) ? (int)(bit_len / 2 - 3) : 0;
-    if (shift < 0) shift = 0;
-    if (shift > 60) shift = 60;
+    uint64_t w_low = range_width.bits64[0];
+    double w_est = (bit_len <= 60) ? (double)w_low : std::pow(2.0, (double)bit_len);
+    double sqrt_w = std::sqrt(std::max(4.0, w_est));
+    double mu = std::max(1.0, sqrt_w / 2.0);
 
+    // Jump sizes ensuring gcd = 1 and diverse odd/even residues so Wild and Tame never lock into disjoint parity classes
     for (int i = 0; i < K_JUMPS; ++i) {
-        uint64_t step_val = (1ULL << (i % 8));
-        if (shift > 0) {
-            step_val = (step_val << shift);
-            if (step_val == 0) step_val = 1ULL << shift;
+        uint64_t step_val = 1;
+        if (i == 0) step_val = 1;
+        else if (i == 1) step_val = 3;
+        else if (i == 2) step_val = 5;
+        else if (i == 3) step_val = 7;
+        else {
+            double scale = std::pow((double)(i - 3) / (double)(K_JUMPS - 3), 1.5);
+            step_val = (uint64_t)std::max(1.0, std::round(1.0 + mu * 2.0 * scale));
+            if (step_val == 0) step_val = 1;
         }
         jump_d[i].SetInt32(0);
         jump_d[i].SetQWord(0, step_val);
         jump_P[i] = secp->ComputePublicKey(&jump_d[i]);
     }
 
-    uint64_t w_low = range_width.bits64[0];
-    double w_est = (bit_len <= 60) ? (double)w_low : std::pow(2.0, (double)bit_len);
-    double sqrt_w = std::sqrt(std::max(4.0, w_est));
-    int max_tame_steps = (int)(sqrt_w * 4.0) + 128;
+    int max_tame_steps = (int)(sqrt_w * 6.0) + 128;
     if (max_tame_steps > 3500000) max_tame_steps = 3500000;
 
-    std::unordered_map<std::string, Int> tame_traps;
+    // Use fast 64-bit key map for maximum lookup speed (avoids heavy std::string hex conversions)
+    std::unordered_map<uint64_t, Int> tame_traps;
     tame_traps.reserve(max_tame_steps + 128);
 
     // 1. TAME KANGAROO: starts at r_max, distance = r_max
@@ -469,35 +472,61 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     dist_T.Set((Int*)&r_max);
 
     for (int step = 0; step < max_tame_steps; ++step) {
-        tame_traps[T.x.GetBase16()] = dist_T;
-        uint32_t j = (uint32_t)(T.x.bits64[0] & (K_JUMPS - 1));
+        tame_traps[T.x.bits64[0]] = dist_T;
+        uint32_t j = (uint32_t)(T.x.bits64[0] % K_JUMPS);
         T = secp->AddDirect(T, jump_P[j]);
         dist_T.ModAddK1order(&jump_d[j]);
     }
 
     // 2. WILD KANGAROO: starts at target_Q, distance = 0
-    Point W = (Point&)target_Q;
-    Int dist_W;
-    dist_W.SetInt32(0);
+    int max_wild_steps = (int)((w_est / mu) + sqrt_w * 8.0) + 256;
+    if (max_wild_steps > 7000000) max_wild_steps = 7000000;
 
-    int max_wild_steps = max_tame_steps * 4 + 256;
-    for (int step = 0; step < max_wild_steps; ++step) {
-        std::string wx = W.x.GetBase16();
-        auto it = tame_traps.find(wx);
-        if (it != tame_traps.end()) {
-            Int k_cand;
-            k_cand.Set(&it->second);
-            k_cand.ModSubK1order(&dist_W);
-
-            Point verify_P = secp->ComputePublicKey(&k_cand);
-            if (verify_P.equals((Point&)target_Q)) {
-                solved_key.Set(&k_cand);
-                return true;
-            }
+    // Up to 2 independent trajectories to guarantee collision even with rare random fluctuations
+    for (int traj = 0; traj < 2; ++traj) {
+        Point W;
+        Int dist_W;
+        if (traj == 0) {
+            W = (Point&)target_Q;
+            dist_W.SetInt32(0);
+        } else {
+            // Trajectory 2 starts with known small offset jump
+            W = secp->AddDirect((Point&)target_Q, jump_P[0]);
+            dist_W.Set(&jump_d[0]);
         }
-        uint32_t j = (uint32_t)(W.x.bits64[0] & (K_JUMPS - 1));
-        W = secp->AddDirect(W, jump_P[j]);
-        dist_W.ModAddK1order(&jump_d[j]);
+
+        for (int step = 0; step < max_wild_steps; ++step) {
+            auto it = tame_traps.find(W.x.bits64[0]);
+            if (it != tame_traps.end()) {
+                // Case 1: W == T => k = dist_T - dist_W
+                Int k_cand1;
+                k_cand1.Set(&it->second);
+                k_cand1.ModSubK1order(&dist_W);
+
+                Point verify_P1 = secp->ComputePublicKey(&k_cand1);
+                if (verify_P1.equals((Point&)target_Q)) {
+                    solved_key.Set(&k_cand1);
+                    return true;
+                }
+
+                // Case 2: W == -T => k = -(dist_T + dist_W) = n - (dist_T + dist_W)
+                Int sum;
+                sum.Set(&it->second);
+                sum.ModAddK1order(&dist_W);
+                Int k_cand2;
+                k_cand2.SetInt32(0);
+                k_cand2.ModSubK1order(&sum);
+
+                Point verify_P2 = secp->ComputePublicKey(&k_cand2);
+                if (verify_P2.equals((Point&)target_Q)) {
+                    solved_key.Set(&k_cand2);
+                    return true;
+                }
+            }
+            uint32_t j = (uint32_t)(W.x.bits64[0] % K_JUMPS);
+            W = secp->AddDirect(W, jump_P[j]);
+            dist_W.ModAddK1order(&jump_d[j]);
+        }
     }
 
     return false;
