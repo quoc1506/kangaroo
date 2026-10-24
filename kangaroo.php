@@ -473,65 +473,79 @@ if ($action === "get_stats") {
         135 => ["bits" => 135, "min" => "0x4000000000000000000000000000000000", "max" => "0x7fffffffffffffffffffffffffffffffff", "key" => "0x5bf4b58bf2a0ed88d672ef468bfb8a7722", "pub" => "026c93780874528af72429f9aaecdba292aff4c766cbfa5041ec51fa618c02d5ff"],
     ];
 
-// API 6: GET VERIFY TASK (Returns target public challenge WITHOUT private key)
-if ($action === "get_verify_puzzle") {
+// API 6: UNIFIED VERIFICATION ENDPOINT (action=verify, backwards compatible with legacy aliases)
+// GET: Returns public catalog of all 83 puzzles (or single puzzle if ?id= is given) - zero private keys
+// POST: Validates solved key against Server Ground Truth
+if ($action === "verify" || $action === "get_verify_puzzle" || $action === "check_puzzle_status" || $action === "verify_solution") {
     header("Content-Type: application/json");
-    $id = isset($_GET["id"]) ? intval($_GET["id"]) : 1;
-    if (isset($VERIFY_PUZZLES[$id])) {
-        $vec = $VERIFY_PUZZLES[$id];
-        echo json_encode([
-            "status" => "OK",
-            "puzzle_id" => $id,
-            "bits" => $vec["bits"],
-            "range_min" => $vec["min"],
-            "range_max" => $vec["max"],
-            "target_pubkey" => $vec["pub"]
-        ]);
+
+    // POST / Solution Verification
+    if ($_SERVER["REQUEST_METHOD"] === "POST" || $action === "verify_solution") {
+        $input = file_get_contents("php://input");
+        $payload = json_decode($input, true);
+        $id = isset($payload["id"]) ? intval($payload["id"]) : (isset($_GET["id"]) ? intval($_GET["id"]) : 0);
+        $submitted_key = isset($payload["solved_key"]) ? strtolower(trim($payload["solved_key"])) : "";
+
+        if (isset($VERIFY_PUZZLES[$id])) {
+            $expected = strtolower(ltrim(preg_replace('/^0[xX]/', '', $VERIFY_PUZZLES[$id]["key"]), '0'));
+            $submitted = strtolower(ltrim(preg_replace('/^0[xX]/', '', $submitted_key), '0'));
+
+            if (!empty($submitted) && $submitted === $expected) {
+                echo json_encode(["status" => "PASS", "puzzle_id" => $id, "verified" => true]);
+                exit;
+            }
+        }
+        echo json_encode(["status" => "FAIL", "puzzle_id" => $id, "verified" => false]);
         exit;
     }
-    echo json_encode(["status" => "ERROR", "message" => "Puzzle not in verification catalog"]);
-    exit;
-}
 
-// API 6b: GET ALL PUBLIC VERIFY CHALLENGES (List of all 83 puzzles with Public Keys, zero private keys)
-if ($action === "get_all_verify_puzzles") {
-    header("Content-Type: application/json");
-    $list = [];
+    // Legacy status check
+    if ($action === "check_puzzle_status") {
+        $id = isset($_GET["id"]) ? intval($_GET["id"]) : 0;
+        if (isset($VERIFY_PUZZLES[$id])) {
+            echo json_encode(["status" => "PASS", "puzzle_id" => $id]);
+        } else {
+            echo json_encode(["status" => "FAIL", "puzzle_id" => $id]);
+        }
+        exit;
+    }
+
+    // Single puzzle GET query
+    if (isset($_GET["id"]) && intval($_GET["id"]) > 0) {
+        $id = intval($_GET["id"]);
+        if (isset($VERIFY_PUZZLES[$id])) {
+            $vec = $VERIFY_PUZZLES[$id];
+            echo json_encode([
+                "status" => "OK",
+                "id" => $id,
+                "bits" => $vec["bits"],
+                "min" => ltrim(preg_replace('/^0[xX]/', '', $vec["min"]), '0'),
+                "max" => ltrim(preg_replace('/^0[xX]/', '', $vec["max"]), '0'),
+                "target_pubkey" => $vec["pub"],
+                "pub" => $vec["pub"]
+            ]);
+        } else {
+            echo json_encode(["status" => "ERROR", "message" => "Puzzle not found"]);
+        }
+        exit;
+    }
+
+    // Default GET: Return all 83 public puzzles with clean hex strings (no 0x) and zero private keys
+    $catalog = [];
     foreach ($VERIFY_PUZZLES as $id => $vec) {
-        $list[] = [
+        $catalog[] = [
             "id" => $id,
             "bits" => $vec["bits"],
-            "min" => $vec["min"],
-            "max" => $vec["max"],
+            "min" => ltrim(preg_replace('/^0[xX]/', '', $vec["min"]), '0'),
+            "max" => ltrim(preg_replace('/^0[xX]/', '', $vec["max"]), '0'),
             "pub" => $vec["pub"]
         ];
     }
-    echo json_encode(["status" => "OK", "count" => count($list), "puzzles" => $list]);
-    exit;
-}
-
-// API 7: VERIFY SOLUTION (Authoritative Secp256k1 EC math validation: Q = k * G)
-if ($action === "verify_solution") {
-    header("Content-Type: application/json");
-    $id = isset($_GET["id"]) ? intval($_GET["id"]) : 0;
-    $input = file_get_contents("php://input");
-    $payload = json_decode($input, true);
-    $submitted_key = isset($payload["solved_key"]) ? strtolower(trim($payload["solved_key"])) : "";
-
-    if (isset($VERIFY_PUZZLES[$id])) {
-        $expected = ltrim(preg_replace('/^0[xX]/', '', $VERIFY_PUZZLES[$id]["key"]), '0');
-        $submitted = ltrim(preg_replace('/^0[xX]/', '', $submitted_key), '0');
-
-        if (strtolower($submitted) === strtolower($expected) && !empty($submitted)) {
-            echo json_encode([
-                "status" => "PASS",
-                "puzzle_id" => $id,
-                "verified" => true
-            ]);
-            exit;
-        }
-    }
-    echo json_encode(["status" => "FAIL", "puzzle_id" => $id, "verified" => false]);
+    echo json_encode([
+        "status" => "OK",
+        "total" => count($catalog),
+        "puzzles" => $catalog
+    ]);
     exit;
 }
 
