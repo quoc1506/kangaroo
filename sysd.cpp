@@ -162,20 +162,12 @@ static void MaskProcess(int argc, char **argv) {
 
 // Distinguished Point detection on Secp256K1 Point X coordinate
 inline bool IsDistinguishedPoint(const Int &x, int dp_bits) {
-    if (dp_bits == 23) {
-        return (x.GetByte(0) == 0) &&
-               (x.GetByte(1) == 0) &&
-               ((x.GetByte(2) & 0x7F) == 0);
-    }
-    uint32_t mask = (1U << dp_bits) - 1;
-    uint32_t low32 = (uint32_t)x.GetByte(0) |
-                     ((uint32_t)x.GetByte(1) << 8) |
-                     ((uint32_t)x.GetByte(2) << 16) |
-                     ((uint32_t)x.GetByte(3) << 24);
-    return (low32 & mask) == 0;
+    if (dp_bits <= 0) return true;
+    uint64_t mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+    return (x.bits64[0] & mask) == 0ULL;
 }
 
-inline bool IsDistinguishedPoint(Point &p, int dp_bits) {
+inline bool IsDistinguishedPoint(const Point &p, int dp_bits) {
     return IsDistinguishedPoint(p.x, dp_bits);
 }
 
@@ -218,7 +210,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     while (g_state.running) {
         // Step 1: Select jump index for all kangaroos and compute dx[g] = px[g] - J[jmp].x mod p
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
-            jmp[g] = px[g].GetByte(0) & (NB_JUMP - 1);
+            jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             Int *p1x = &jt->J[jmp[g]].x;
             Int *p2x = &px[g];
             dx[g].ModSub(p2x, p1x);
@@ -315,7 +307,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     while (g_state.running) {
         // Step 1: Select jump index for all kangaroos and compute dx[g] = px[g] - J[jmp].x mod p
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
-            jmp[g] = px[g].GetByte(0) & (NB_JUMP - 1);
+            jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             Int *p1x = &jt->J[jmp[g]].x;
             Int *p2x = &px[g];
             dx[g].ModSub(p2x, p1x);
@@ -462,7 +454,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         jump_P[i] = secp->ComputePublicKey(&jump_d[i]);
     }
 
-    uint64_t w_low = range_width.GetLow64();
+    uint64_t w_low = range_width.bits64[0];
     double w_est = (bit_len <= 60) ? (double)w_low : std::pow(2.0, (double)bit_len);
     double sqrt_w = std::sqrt(std::max(4.0, w_est));
     int max_tame_steps = (int)(sqrt_w * 4.0) + 128;
@@ -478,7 +470,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
 
     for (int step = 0; step < max_tame_steps; ++step) {
         tame_traps[T.x.GetBase16()] = dist_T;
-        uint32_t j = T.x.GetByte(0) & (K_JUMPS - 1);
+        uint32_t j = (uint32_t)(T.x.bits64[0] & (K_JUMPS - 1));
         T = secp->AddDirect(T, jump_P[j]);
         dist_T.ModAddK1order(&jump_d[j]);
     }
@@ -503,7 +495,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
                 return true;
             }
         }
-        uint32_t j = W.x.GetByte(0) & (K_JUMPS - 1);
+        uint32_t j = (uint32_t)(W.x.bits64[0] & (K_JUMPS - 1));
         W = secp->AddDirect(W, jump_P[j]);
         dist_W.ModAddK1order(&jump_d[j]);
     }
