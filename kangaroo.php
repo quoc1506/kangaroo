@@ -579,77 +579,83 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
         </div>
     </div>
 
-    <!-- Core Metrics Grid -->
+    <!-- Core Metrics Grid (4 Distinct, Non-overlapping Cards) -->
     <div class="grid">
-        <!-- Card 1: Tame Traps Progress -->
+        <!-- Card 1: Collection Progress -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Bẫy Tame Tích Lũy</div>
-            <div class="stat-val"><?= number_format($total_traps) ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">DPs</span></div>
+            <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Tiến Độ Bẫy Tame</div>
+            <div class="stat-val"><?= number_format($total_traps) ?> <span style="font-size: 13px; font-weight: normal; color: #64748b;">/ <?= number_format($target_dp) ?> DPs</span></div>
             <div class="progress-bar-bg">
                 <div class="progress-bar-fill" style="width: <?= $progress_pct ?>%;"></div>
             </div>
             <div style="font-size: 11px; color: #64748b; display: flex; justify-content: space-between;">
-                <span>Mục tiêu: <?= number_format($target_dp) ?> DPs</span>
+                <span>Pha: <strong style="color: <?= ($total_traps >= $target_dp) ? '#34d399' : '#fbbf24' ?>;"><?= ($total_traps >= $target_dp) ? 'WILD HUNT' : 'TAME GENERATION' ?></strong></span>
                 <span style="color: #38bdf8; font-weight: 600;"><?= $progress_pct ?>%</span>
             </div>
         </div>
 
-        <!-- Card 2: Total Network Hashrate -->
+        <!-- Card 2: Cluster Performance -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Tổng Hashrate Mạng</div>
-            <div class="stat-val" style="color: #34d399;"><?= number_format($total_hashrate_mhs, 2) ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">MH/s</span></div>
-            <div style="font-size: 11px; color: #94a3b8; margin-top: 8px; display: flex; align-items: center; gap: 6px;">
-                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #34d399;"></span>
-                <span><?= $active_workers_count ?> Worker đang ONLINE</span>
+            <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Hashrate Cụm Máy Trạm</div>
+            <div class="stat-val" style="color: #34d399;"><?= number_format($total_hashrate_mhs, 2) ?> <span style="font-size: 13px; font-weight: normal; color: #64748b;">MH/s</span></div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 10px; display: flex; align-items: center; justify-content: space-between;">
+                <span style="display: flex; align-items: center; gap: 6px;">
+                    <span style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #34d399;"></span>
+                    <span><?= $active_workers_count ?> Online (<?= count($workers) ?> tổng)</span>
+                </span>
+                <span style="color: #64748b;">Heartbeat 30-60s</span>
             </div>
         </div>
 
-        <!-- Card 3: Storage & Database -->
+        <!-- Card 3: Real Collision Probability -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Dung Lượng Database</div>
-            <div class="stat-val"><?= $db_size_mb ?> <span style="font-size: 14px; font-weight: normal; color: #94a3b8;">MB</span></div>
-            <div style="font-size: 11px; color: #34d399; margin-top: 8px;">
-                Binary BLOB 64-byte • WAL High Concurrency
+            <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Xác Suất Trúng Giải Hiện Thời</div>
+            <div class="stat-val" style="color: #38bdf8;"><?= $prob_info["prob_percent"] ?></div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 10px; display: flex; justify-content: space-between;">
+                <span>Kỳ vọng: <strong style="color: #34d399;"><?= $prob_info["odds_text"] ?></strong></span>
+                <span style="color: #64748b;"><?= $prob_info["prob_scientific"] ?></span>
             </div>
         </div>
 
-        <!-- Card 4: Server Vault Status -->
+        <!-- Card 4: Database Storage & Vault -->
         <div class="card">
-            <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600;">Trạng Thái Khóa (Vault)</div>
-            <div class="stat-val">
+            <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Cơ Sở Dữ Liệu & Vault</div>
+            <div class="stat-val"><?= $db_size_mb ?> <span style="font-size: 13px; font-weight: normal; color: #64748b;">MB</span></div>
+            <div style="font-size: 11px; margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+                <span style="color: #64748b;">SQLite WAL BLOB</span>
                 <?php if ($vault_exists): ?>
-                    <span style="color: #4ade80;">BINGO: SOLVED!</span>
+                    <span class="badge badge-green" style="font-size: 11px;">BINGO SOLVED</span>
                 <?php else: ?>
-                    <span style="color: #fbbf24;">ĐANG SĂN (WAITING)</span>
+                    <span class="badge badge-amber" style="font-size: 11px;">ĐANG SĂN</span>
                 <?php endif; ?>
             </div>
-            <div style="font-size: 11px; color: #64748b; margin-top: 8px;">
-                Chế độ an toàn 0600 • Zero Key Exposure
-            </div>
         </div>
     </div>
 
-    <!-- Single Probability & Math Breakdown Card (Clean, Non-Duplicated) -->
-    <div class="card">
-        <h3 style="margin: 0 0 12px 0; font-size: 15px; color: #cbd5e1; display: flex; align-items: center; justify-content: space-between;">
-            <span>Phân Tích Toán Học Xác Suất Va Chạm (Birthday Paradox)</span>
-            <span style="font-size: 12px; color: #38bdf8; font-weight: normal;">Công thức Poisson/Birthday</span>
-        </h3>
-        <div class="prob-box">
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; font-size: 13px; line-height: 1.7;">
-                <div>
-                    <div><strong>Không gian khóa:</strong> W = 2<sup>139</sup> ≈ 6.968 × 10<sup>41</sup> điểm</div>
-                    <div><strong>Bẫy Tame tích lũy:</strong> <?= number_format($total_traps) ?> DPs (≈ <?= $prob_info["tame_steps_scientific"] ?> bước đi)</div>
-                    <div><strong>Bước Wild thực tế:</strong> <?= $prob_info["wild_steps_scientific"] ?> bước</div>
-                </div>
-                <div>
-                    <div><strong>Xác suất va chạm hiện thời:</strong> <span style="color: #38bdf8; font-weight: 700;"><?= $prob_info["prob_percent"] ?></span> (<?= $prob_info["prob_scientific"] ?>)</div>
-                    <div><strong>Tỷ lệ cược kỳ vọng:</strong> <span style="color: #34d399; font-weight: 700;"><?= $prob_info["odds_text"] ?></span></div>
-                    <div><strong>Chế độ phân bổ:</strong> <span style="color: #fbbf24; font-weight: 600;"><?= ($total_traps < $target_dp) ? "Rải bẫy TAME (Đan lưới Birthday)" : "Săn va chạm WILD (Tìm nghiệm)" ?></span></div>
-                </div>
+    <!-- Configuration & Target Controller -->
+    <div class="card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+        <div>
+            <div style="font-weight: 600; font-size: 14px; color: #cbd5e1;">Cấu Hình Ngưỡng Tame (Target DP)</div>
+            <div style="font-size: 11px; color: #64748b; margin-top: 3px;">
+                Tự động chuyển từ giai đoạn TAME sang WILD khi số điểm bẫy đạt ngưỡng này.
             </div>
         </div>
+        <form method="POST" action="?action=set_target_dp" onsubmit="event.preventDefault(); updateTargetDP();" style="display: flex; gap: 8px;">
+            <input type="number" id="target_dp_input" value="<?= $target_dp ?>" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 160px;" />
+            <button type="submit" style="background: #0284c7; hover:background: #0369a1; border: none; color: #fff; padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;">Cập nhật</button>
+        </form>
     </div>
+
+    <script>
+        function updateTargetDP() {
+            const val = document.getElementById('target_dp_input').value;
+            fetch('?action=set_target_dp', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({target_dp: parseInt(val)})
+            }).then(() => location.reload());
+        }
+    </script>
 
     <!-- Active Compute Nodes (Workers) -->
     <div class="card">
