@@ -205,8 +205,11 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     std::vector<Int> dx(CPU_GRP_SIZE);
     std::vector<uint32_t> jmp(CPU_GRP_SIZE);
 
-    // Initialize herd
-    for (int g = 0; g < CPU_GRP_SIZE; ++g) {
+    std::vector<uint32_t> tame_dp_count(CPU_GRP_SIZE, 0);
+    std::vector<uint64_t> tame_step_count(CPU_GRP_SIZE, 0);
+
+    // Spawn / Respawn a tame kangaroo at a fresh uniform random position in [RangeMin, RangeMax]
+    auto spawn_tame_kangaroo = [&](int g) {
         Int k_start;
         k_start.Rand(&range_width);
         k_start.Add(&range_min);
@@ -215,6 +218,13 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         px[g].Set(&P.x);
         py[g].Set(&P.y);
         distance[g].Set(&k_start);
+        tame_dp_count[g] = 0;
+        tame_step_count[g] = 0;
+    };
+
+    // Initialize herd
+    for (int g = 0; g < CPU_GRP_SIZE; ++g) {
+        spawn_tame_kangaroo(g);
     }
 
     Int dy;
@@ -256,12 +266,19 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
+            tame_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
                 local_dp_buffer.push_back(rec);
+                tame_dp_count[g]++;
+            }
+
+            // Logic khai tử TAME: Sau khi tạo đủ 2 DP (hoặc đạt 16M bước) thì khai tử để hồi sinh ở tọa độ ngẫu nhiên mới
+            if (tame_dp_count[g] >= 2 || tame_step_count[g] >= 16777216ULL) {
+                spawn_tame_kangaroo(g);
             }
         }
 
@@ -303,6 +320,9 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     half_width.Set(&range_width);
     half_width.ShiftR(1); // Exact 138-bit half-width!
 
+    std::vector<uint32_t> wild_dp_count(CPU_GRP_SIZE, 0);
+    std::vector<uint64_t> wild_step_count(CPU_GRP_SIZE, 0);
+
     // Spawn a wild kangaroo with a centered 138-bit offset in [-W/2, +W/2]
     auto spawn_wild_kangaroo = [&](int g) {
         Int r_scalar;
@@ -315,6 +335,8 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         px[g].Set(&P.x);
         py[g].Set(&P.y);
         distance[g].Set(&r_scalar);
+        wild_dp_count[g] = 0;
+        wild_step_count[g] = 0;
     };
 
     // Initialize herd
@@ -358,12 +380,19 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
+            wild_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
                 local_dp_buffer.push_back(rec);
+                wild_dp_count[g]++;
+            }
+
+            // Logic khai tử WILD: Khai tử khi sinh đủ 2 DP mà chưa va chạm hoặc đi quá 16M bước để chống vọt lố (overshoot) và vòng lặp
+            if (wild_dp_count[g] >= 2 || wild_step_count[g] >= 16777216ULL) {
+                spawn_wild_kangaroo(g);
             }
         }
 
@@ -821,6 +850,14 @@ int main(int argc, char **argv) {
             std::string action = is_wild_mode ? "check_wild" : "submit_tame";
             std::string submit_url = g_state.server_url + "?action=" + action;
             std::string post_resp = HttpPostJson(submit_url, ss.str());
+
+            // Network retry safeguard: If server unreachable or error, put DP batch back to avoid data loss
+            if (post_resp.empty() || post_resp.find("\"status\"") == std::string::npos) {
+                if (!batch.empty()) {
+                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                    g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+                }
+            }
 
             if (is_wild_mode && post_resp.find("\"BINGO\"") != std::string::npos) {
                 g_state.running = false;

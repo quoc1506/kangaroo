@@ -87,10 +87,11 @@ function set_setting($db, $key, $value) {
  * k1 = (RangeMin + D_T - D_W) mod n
  * k2 = (RangeMin + D_T + D_W) mod n
  */
-function solve_candidate_keys($range_min_hex, $tame_dist_hex, $wild_dist_hex) {
+function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex) {
     if (extension_loaded("gmp")) {
         $n = gmp_init(SECP_N, 16);
         $min = gmp_init($range_min_hex, 16);
+        $max = gmp_init($range_max_hex, 16);
         $dt = gmp_init($tame_dist_hex, 16);
         $dw = gmp_init($wild_dist_hex, 16);
 
@@ -108,14 +109,25 @@ function solve_candidate_keys($range_min_hex, $tame_dist_hex, $wild_dist_hex) {
             $k2 = gmp_add($k2, $n);
         }
 
+        $c1_hex = "0x" . str_pad(gmp_strval($k1, 16), 64, "0", STR_PAD_LEFT);
+        $c2_hex = "0x" . str_pad(gmp_strval($k2, 16), 64, "0", STR_PAD_LEFT);
+        $c1_in_range = (gmp_cmp($k1, $min) >= 0 && gmp_cmp($k1, $max) <= 0);
+        $c2_in_range = (gmp_cmp($k2, $min) >= 0 && gmp_cmp($k2, $max) <= 0);
+
         return [
-            "cand1" => "0x" . str_pad(gmp_strval($k1, 16), 64, "0", STR_PAD_LEFT),
-            "cand2" => "0x" . str_pad(gmp_strval($k2, 16), 64, "0", STR_PAD_LEFT)
+            "cand1" => $c1_hex,
+            "cand2" => $c2_hex,
+            "cand1_in_range" => $c1_in_range,
+            "cand2_in_range" => $c2_in_range,
+            "verified_key" => $c1_in_range ? $c1_hex : ($c2_in_range ? $c2_hex : $c1_hex)
         ];
     } else {
         return [
             "cand1" => "0xRECORDED_CHECK_SECURE_VAULT",
-            "cand2" => "0xRECORDED_CHECK_SECURE_VAULT"
+            "cand2" => "0xRECORDED_CHECK_SECURE_VAULT",
+            "cand1_in_range" => false,
+            "cand2_in_range" => false,
+            "verified_key" => "0xRECORDED_CHECK_SECURE_VAULT"
         ];
     }
 }
@@ -264,6 +276,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
         $chk = $db->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
         $range_min = get_setting($db, "range_min");
+        $range_max = get_setting($db, "range_max");
 
         foreach ($dp_list as $dp) {
             if (empty($dp["x"]) || empty($dp["dist"])) continue;
@@ -279,7 +292,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 // COLLISION DETECTED!
                 $tame_dist_hex = bin2hex($row["total_distance"]);
                 $wild_dist_hex = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
-                $cands = solve_candidate_keys($range_min, $tame_dist_hex, $wild_dist_hex);
+                $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex);
 
                 // Write to secure server vault (permissions 0600, never exposed in JSON response or UI)
                 $vault_data = json_encode([
@@ -290,6 +303,9 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     "collision_dp_x" => "0x" . bin2hex($bin_x),
                     "candidate_1" => $cands["cand1"],
                     "candidate_2" => $cands["cand2"],
+                    "candidate_1_in_range" => $cands["cand1_in_range"],
+                    "candidate_2_in_range" => $cands["cand2_in_range"],
+                    "verified_key" => $cands["verified_key"],
                     "tame_distance" => "0x" . $tame_dist_hex,
                     "wild_distance" => "0x" . $wild_dist_hex
                 ], JSON_PRETTY_PRINT);
