@@ -640,7 +640,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         for (uint64_t s = 0; s < max_wild_steps; ++s) {
             uint64_t x_key = wild_pt.x.bits64[0];
             auto it = trap_table.find(x_key);
-            if (it != trap_table.end() && it->second.full_x.equals(&wild_pt.x)) {
+            if (it != trap_table.end() && it->second.full_x.IsEqual((Int*)&wild_pt.x)) {
                 Int dt = it->second.dist;
                 Int dw = wild_dist;
 
