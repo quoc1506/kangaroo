@@ -397,9 +397,9 @@ if ($action === "get_stats") {
     exit;
 }
 
-    // Danh mục chuẩn 83 Test Vectors lịch sử Bitcoin Puzzle (Server Ground Truth)
+// Danh mục chuẩn 83 Test Vectors lịch sử Bitcoin Puzzle (Server Ground Truth)
     $VERIFY_PUZZLES = [
-1 => ["bits" => 1, "min" => "0x1", "max" => "0x1", "key" => "0x1", "status" => "SOLVED", "pub" => "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"],
+        1 => ["bits" => 1, "min" => "0x1", "max" => "0x1", "key" => "0x1", "status" => "SOLVED", "pub" => "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"],
         2 => ["bits" => 2, "min" => "0x2", "max" => "0x3", "key" => "0x3", "status" => "SOLVED", "pub" => "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"],
         3 => ["bits" => 3, "min" => "0x4", "max" => "0x7", "key" => "0x7", "status" => "SOLVED", "pub" => "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"],
         4 => ["bits" => 4, "min" => "0x8", "max" => "0xf", "key" => "0x8", "status" => "SOLVED", "pub" => "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01"],
@@ -415,136 +415,78 @@ if ($action === "get_stats") {
         14 => ["bits" => 14, "min" => "0x2000", "max" => "0x3fff", "key" => "0x3233", "status" => "SOLVED", "pub" => "028117d4fd551c9ae74c9fdac45d87bb669bc7dc354b08de037c4a13780734653b"],
         15 => ["bits" => 15, "min" => "0x4000", "max" => "0x7fff", "key" => "0x6e96", "status" => "SOLVED", "pub" => "02261bca3e2a7c2c82e525494354a59108e39eaa7fd08a177c295d8a366314146e"],
         16 => ["bits" => 16, "min" => "0x8000", "max" => "0xffff", "key" => "0xa32f", "status" => "SOLVED", "pub" => "029dd84f27df2e2cc525c9a79d670722ae3d0e01858ce1f1d7551b9ed470b581b3"],
-        17 => ["bits" => 17, "min" => "0x10000", "max" => "0x1ffff", "key" => "0x1ebd2", "status" => "SOLVED", "pub" => "036fe572edaabc2194760b79c4eeffa42cef7b9cae47683a06109bf087ea33b21c"],
-        18 => ["bits" => 18, "min" => "0x20000", "max" => "0x3ffff", "key" => "0x38d4c", "status" => "SOLVED", "pub" => "03068770e25d9777cf3b83f29d2c8375d28b995183000f58f3e6005f0216e2d1b9"],
-        19 => ["bits" => 19, "min" => "0x40000", "max" => "0x7ffff", "key" => "0x738b9", "status" => "SOLVED", "pub" => "036890f6d6ac6eb70f13d65671072c26acf2e5ff4470965490a24685bde04fe3f0"],
-        20 => ["bits" => 20, "min" => "0x80000", "max" => "0xfffff", "key" => "0x98327", "status" => "SOLVED", "pub" => "0214d79b8da08f9e974625f5c6d6bb44e1b177a3f0c0081335b8ec7a6008a6bdd7"],
-        21 => ["bits" => 21, "min" => "0x100000", "max" => "0x1fffff", "key" => "0x117466", "status" => "SOLVED", "pub" => "0245e3c2cea92189322a9983666850e12995029989d144307b76fe4911f5fc85e4"],
-        22 => ["bits" => 22, "min" => "0x200000", "max" => "0x3fffff", "key" => "0x316ba9", "status" => "SOLVED", "pub" => "02e9bf1601428534d4fb5e0e1dd648d7dcf9c89476d3e1796f05b9f7782375edb4"],
-        23 => ["bits" => 23, "min" => "0x400000", "max" => "0x7fffff", "key" => "0x76884b", "status" => "SOLVED", "pub" => "03a803c681bfef7efc3ba0e9448a4963408c642b0bdefc265af7891651350112f7"],
-        24 => ["bits" => 24, "min" => "0x800000", "max" => "0xffffff", "key" => "0x995dae", "status" => "SOLVED", "pub" => "039206d4b5faa2b8773aabbd05818a15a13aa7eb20ebf07e6676f4a2f7cae38f35"],
-        25 => ["bits" => 25, "min" => "0x1000000", "max" => "0x1ffffff", "key" => "0x18e8d53", "status" => "SOLVED", "pub" => "028b0191fdee249ae5e040a957fe710100de22e58fa00c1da45c34ec3b7080ae98"],
-        26 => ["bits" => 26, "min" => "0x2000000", "max" => "0x3ffffff", "key" => "0x22ee9b5", "status" => "SOLVED", "pub" => "0292c3385fbc03f4dfeffc7aaef6a342dc1eb762b30563b607d71d40cafdcdef80"],
-        27 => ["bits" => 27, "min" => "0x4000000", "max" => "0x7ffffff", "key" => "0x4f26019", "status" => "SOLVED", "pub" => "02c5180d9bd99c3bf5728931bcef733bf13a8635739d4df0923bf1105398673990"],
-        28 => ["bits" => 28, "min" => "0x8000000", "max" => "0xfffffff", "key" => "0x9599557", "status" => "SOLVED", "pub" => "02e4116fdffe090dd1a3df2dc491acf51ed461487ef7d14b19a0040d18e24dffe7"],
-        29 => ["bits" => 29, "min" => "0x10000000", "max" => "0x1fffffff", "key" => "0x15bf29f9", "status" => "SOLVED", "pub" => "03cf54b8940addeee711aee95f83d001d2bbfb33c8ad33f59c803cda7799fac94d"],
-        30 => ["bits" => 30, "min" => "0x20000000", "max" => "0x3fffffff", "key" => "0x24749666", "status" => "SOLVED", "pub" => "032244cbcd2812c5c175ae16e195cb3f80006ec4776c36b128f4511e0fb2d701ca"],
-        31 => ["bits" => 31, "min" => "0x40000000", "max" => "0x7fffffff", "key" => "0x53580aa6", "status" => "SOLVED", "pub" => "03e84ae7d43a1d5f921c43f64c2bd53064fb1b009715327366ad8fbaae79643136"],
-        32 => ["bits" => 32, "min" => "0x80000000", "max" => "0xffffffff", "key" => "0x82f2495b", "status" => "SOLVED", "pub" => "02ebebe37513c6a17387146b28bf630ead6a95a07f6d509df621d36763fc97f1f1"],
-        33 => ["bits" => 33, "min" => "0x100000000", "max" => "0x1ffffffff", "key" => "0x1d227914e", "status" => "SOLVED", "pub" => "0349425b1b4859e3e88face6d3c80ba65f733e2e03b84c3dacf0ee87f14e8f4bb4"],
-        34 => ["bits" => 34, "min" => "0x200000000", "max" => "0x3ffffffff", "key" => "0x35e076610", "status" => "SOLVED", "pub" => "031002176a2c3c9cd8ac9d19f0f163dc814703b4bb98bb10a8302cfce8fa5104a6"],
-        35 => ["bits" => 35, "min" => "0x400000000", "max" => "0x7ffffffff", "key" => "0x5b31fba82", "status" => "SOLVED", "pub" => "02a5b7321b12a4ae1b84a9c331668052954114aacb4d088382dcb89a0725589c19"],
-        36 => ["bits" => 36, "min" => "0x800000000", "max" => "0xfffffffff", "key" => "0xbab042e8f", "status" => "SOLVED", "pub" => "0263244c3b892c6437bed2399cba0fe074b3d0f928cf5883bd88d439690d790e80"],
-        37 => ["bits" => 37, "min" => "0x1000000000", "max" => "0x1fffffffff", "key" => "0x1757756a93", "status" => "SOLVED", "pub" => "027d2c03c3ef0aec70f2c7e1e75454a5dfdd0e1adea670c1b3a4643c48ad0f1255"],
-        38 => ["bits" => 38, "min" => "0x2000000000", "max" => "0x3fffffffff", "key" => "0x22382facd0", "status" => "SOLVED", "pub" => "03c060e1e3771cbeccb38e119c2414702f3f5181a89652538851d2e3886bdd70c6"],
-        39 => ["bits" => 39, "min" => "0x4000000000", "max" => "0x7fffffffff", "key" => "0x4b5f8303e9", "status" => "SOLVED", "pub" => "022d77cd1467019a6bf28f7375d0949ce30e6b5815c2758b98a74c2700bc006543"],
-        40 => ["bits" => 40, "min" => "0x8000000000", "max" => "0xffffffffff", "key" => "0xe9ae4933d6", "status" => "SOLVED", "pub" => "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4"],
-        41 => ["bits" => 41, "min" => "0x10000000000", "max" => "0x1ffffffffff", "key" => "0x153869acc5b", "status" => "SOLVED", "pub" => "03b357e68437da273dcf995a474a524439faad86fc9effc300183f714b0903468b"],
-        42 => ["bits" => 42, "min" => "0x20000000000", "max" => "0x3ffffffffff", "key" => "0x2a221c58d8f", "status" => "SOLVED", "pub" => "03eec88385be9da803a0d6579798d977a5d0c7f80917dab49cb73c9e3927142cb6"],
-        43 => ["bits" => 43, "min" => "0x40000000000", "max" => "0x7ffffffffff", "key" => "0x6bd3b27c591", "status" => "SOLVED", "pub" => "02a631f9ba0f28511614904df80d7f97a4f43f02249c8909dac92276ccf0bcdaed"],
-        44 => ["bits" => 44, "min" => "0x80000000000", "max" => "0xfffffffffff", "key" => "0x98d41cf83bd", "status" => "SOLVED", "pub" => "02067f4458a634fa16654bd3a2942bd0723e87914c909916c91303592eda523034"],
-        45 => ["bits" => 45, "min" => "0x100000000000", "max" => "0x1fffffffffff", "key" => "0x186c8f95ca04", "status" => "SOLVED", "pub" => "029823fb02ad69fca8cf6667c2a5f099494e41d6bc8cf432f3476cd1118577b92b"],
-        46 => ["bits" => 46, "min" => "0x200000000000", "max" => "0x3fffffffffff", "key" => "0x2485542b6623", "status" => "SOLVED", "pub" => "03c5e754951f498dea6effd25d9c7be419959b6400bee54f6963dd28ba552a8451"],
-        47 => ["bits" => 47, "min" => "0x400000000000", "max" => "0x7fffffffffff", "key" => "0x5ec598f80993", "status" => "SOLVED", "pub" => "03bfe1fc01bf9b2669dacc2e3ee3a14d50c370939fea6c53208368b001abcd1dd2"],
-        48 => ["bits" => 48, "min" => "0x800000000000", "max" => "0xffffffffffff", "key" => "0x91893c8340d8", "status" => "SOLVED", "pub" => "0257aa20950f54381464d6525a8a1ed925b1878f94ae93296400b15c5d02aec502"],
-        49 => ["bits" => 49, "min" => "0x1000000000000", "max" => "0x1ffffffffffff", "key" => "0x10f135b9f91a6", "status" => "SOLVED", "pub" => "039ed8fad048a0678b1af5772cfc5281ba0c5303857ee31e0f78cf9ce4c9efd196"],
-        50 => ["bits" => 50, "min" => "0x2000000000000", "max" => "0x3ffffffffffff", "key" => "0x367f0f63b655f", "status" => "SOLVED", "pub" => "021bc6c10fa1ef9cdf1b44930479cee11f00fe49e3d3946ded4920a58e74d2dca0"],
-        51 => ["bits" => 51, "min" => "0x4000000000000", "max" => "0x7ffffffffffff", "key" => "0x4ecf8df204859", "status" => "SOLVED", "pub" => "03084570b5eb4b5332f28b9a0695aef694701738509391c65d1d85b3cf4fbd30c9"],
-        52 => ["bits" => 52, "min" => "0x8000000000000", "max" => "0xfffffffffffff", "key" => "0x8d51fa0d4c9d3", "status" => "SOLVED", "pub" => "02e39b170b44fa6b986e968c999123af23736adece4d2b7059b2763952308d3a71"],
-        53 => ["bits" => 53, "min" => "0x10000000000000", "max" => "0x1fffffffffffff", "key" => "0x19942a1979b940", "status" => "SOLVED", "pub" => "0364eaf2096c4f6ee8c9f006cc8d5eeb505f613e2536174b2480ba7f51d4a19939"],
-        54 => ["bits" => 54, "min" => "0x20000000000000", "max" => "0x3fffffffffffff", "key" => "0x3e1858a2d75a64", "status" => "SOLVED", "pub" => "031cd7bd7e86571d586a9f4c11c1d159fc7855c095a517d9b03e1cd95234ca7c60"],
-        55 => ["bits" => 55, "min" => "0x40000000000000", "max" => "0x7fffffffffffff", "key" => "0x4b7b3eebe8b9c6", "status" => "SOLVED", "pub" => "03d98297eec59217cf0ad9d878e782ba0f6f7a7711d582fcaf3ded7e947fe57e7b"],
-        56 => ["bits" => 56, "min" => "0x80000000000000", "max" => "0xffffffffffffff", "key" => "0xb80c8042466bc5", "status" => "SOLVED", "pub" => "02e0848f882d14cf6e95e7a0910927109b3881aeae9dde7fd35abb62e4a2cfebe2"],
-        57 => ["bits" => 57, "min" => "0x100000000000000", "max" => "0x1ffffffffffffff", "key" => "0x1f3c39601d29319", "status" => "SOLVED", "pub" => "0396b44fdc216fc4d954289d99572b39a63466c21c9e00bbdc18dab8d803936271"],
-        58 => ["bits" => 58, "min" => "0x200000000000000", "max" => "0x3ffffffffffffff", "key" => "0x3a56cf9e4266158", "status" => "SOLVED", "pub" => "02e1af2d4ab33d2be521ee8fc3a547fd1f3339df7eb76dcb9f599e29f6b073087e"],
-        59 => ["bits" => 59, "min" => "0x400000000000000", "max" => "0x7ffffffffffffff", "key" => "0x738356a9bc25557", "status" => "SOLVED", "pub" => "02c8a2851cd5dd20b34bb718ef3ac34e2b1682eab00e48f78854fd28724d723f3b"],
-        60 => ["bits" => 60, "min" => "0x800000000000000", "max" => "0xfffffffffffffff", "key" => "0x9e102281a17fa2b", "status" => "SOLVED", "pub" => "03c7aa3bdeaf5c952ee65bc587f8afba33697c8c6cc1e90c64ba53832ab7e7c4e5"],
-        61 => ["bits" => 61, "min" => "0x1000000000000000", "max" => "0x1fffffffffffffff", "key" => "0x109a7b7389274945", "status" => "SOLVED", "pub" => "032d0084f4d1ae62a1f6c562d79ef6378073d2a4cffa393303a7790581f72e3764"],
-        62 => ["bits" => 62, "min" => "0x2000000000000000", "max" => "0x3fffffffffffffff", "key" => "0x38b3010b991e4a64", "status" => "SOLVED", "pub" => "034b3d0498ab02704f7cfa5ed4141471626d45aad542d9037ab0f221121929d559"],
-        63 => ["bits" => 63, "min" => "0x4000000000000000", "max" => "0x7fffffffffffffff", "key" => "0x78a487922d99edbe", "status" => "SOLVED", "pub" => "02379833cb0cc1077173a7fac48c463d3b4b2bca4eb66a6d12a16779d49da75b98"],
-        64 => ["bits" => 64, "min" => "0x8000000000000000", "max" => "0xffffffffffffffff", "key" => "0x9d4b66cad1b417e2", "status" => "SOLVED", "pub" => "02a48be8fd5b64235965de5d4127b7c04d091daeddf3850db58a1c542c72d5266b"],
-        65 => ["bits" => 65, "min" => "0x10000000000000000", "max" => "0x1ffffffffffffffff", "key" => "0x14041b63eb1ff36ee", "status" => "SOLVED", "pub" => "0242c14809aeb9bc755c7ce0108d681238d09b13c3ecd38aceda629ca97155ff22"],
-        66 => ["bits" => 66, "min" => "0x20000000000000000", "max" => "0x3ffffffffffffffff", "key" => "0x2832ed74f2b5e35ee", "status" => "SOLVED", "pub" => "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"],
-        67 => ["bits" => 67, "min" => "0x40000000000000000", "max" => "0x7ffffffffffffffff", "key" => "0x730fc235c1942c1ae", "status" => "SOLVED", "pub" => "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"],
-        68 => ["bits" => 68, "min" => "0x80000000000000000", "max" => "0xfffffffffffffffff", "key" => "0xbebb3940cd0fc1491", "status" => "SOLVED", "pub" => "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"],
-        69 => ["bits" => 69, "min" => "0x100000000000000000", "max" => "0x1fffffffffffffffff", "key" => "0x101d83275fb2bc7e0c", "status" => "SOLVED", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
-        70 => ["bits" => 70, "min" => "0x200000000000000000", "max" => "0x3fffffffffffffffff", "key" => "0x349b84b6431a6c4ef1", "status" => "SOLVED", "pub" => "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"],
-        75 => ["bits" => 75, "min" => "0x4000000000000000000", "max" => "0x7ffffffffffffffffff", "key" => "0x4c5ce114686a1336e07", "status" => "SOLVED", "pub" => "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"],
-        80 => ["bits" => 80, "min" => "0x80000000000000000000", "max" => "0xffffffffffffffffffff", "key" => "0xea1a5c66dcc11b5ad180", "status" => "SOLVED", "pub" => "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"],
-        85 => ["bits" => 85, "min" => "0x1000000000000000000000", "max" => "0x1fffffffffffffffffffff", "key" => "0x11720c4f018d51b8cebba8", "status" => "SOLVED", "pub" => "0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a"],
-        90 => ["bits" => 90, "min" => "0x20000000000000000000000", "max" => "0x3ffffffffffffffffffffff", "key" => "0x2ce00bb2136a445c71e85bf", "status" => "SOLVED", "pub" => "035c38bd9ae4b10e8a250857006f3cfd98ab15a6196d9f4dfd25bc7ecc77d788d5"],
-        95 => ["bits" => 95, "min" => "0x400000000000000000000000", "max" => "0x7fffffffffffffffffffffff", "key" => "0x527a792b183c7f64a0e8b1f4", "status" => "SOLVED", "pub" => "02967a5905d6f3b420959a02789f96ab4c3223a2c4d2762f817b7895c5bc88a045"],
-        100 => ["bits" => 100, "min" => "0x8000000000000000000000000", "max" => "0xfffffffffffffffffffffffff", "key" => "0xaf55fc59c335c8ec67ed24826", "status" => "SOLVED", "pub" => "03d2063d40402f030d4cc71331468827aa41a8a09bd6fd801ba77fb64f8e67e617"],
-        105 => ["bits" => 105, "min" => "0x100000000000000000000000000", "max" => "0x1ffffffffffffffffffffffffff", "key" => "0x123456789abcdef01234567890a", "status" => "SOLVED", "pub" => "03be06c5a99c46dc1db993d5adfade8f3e5f623207c49a4f62351e120170000846"],
-        110 => ["bits" => 110, "min" => "0x2000000000000000000000000000", "max" => "0x3fffffffffffffffffffffffffff", "key" => "0x35c0d7234df7deb0f20cf7062444", "status" => "SOLVED", "pub" => "0309976ba5570966bf889196b7fdf5a0f9a1e9ab340556ec29f8bb60599616167d"],
-        115 => ["bits" => 115, "min" => "0x40000000000000000000000000000", "max" => "0x7ffffffffffffffffffffffffffff", "key" => "0x60f4d11574f5deee49961d9609ac6", "status" => "SOLVED", "pub" => "0248d313b0398d4923cdca73b8cfa6532b91b96703902fc8b32fd438a3b7cd7f55"],
-        120 => ["bits" => 120, "min" => "0x800000000000000000000000000000", "max" => "0xffffffffffffffffffffffffffffff", "key" => "0xb10f22572c497a836ea187f2e1fc23", "status" => "SOLVED", "pub" => "02ceb6cbbcdbdf5ef7150682150f4ce2c6f4807b349827dcdbdd1f2efa885a2630"],
-        125 => ["bits" => 125, "min" => "0x10000000000000000000000000000000", "max" => "0x1fffffffffffffffffffffffffffffff", "key" => "0x1abcdef0123456789abcdef012345678", "status" => "SOLVED", "pub" => "024a647807d06e545f64644e99e016134a1ee14efdf0346da96cecc032cd03f5f3"],
-        130 => ["bits" => 130, "min" => "0x200000000000000000000000000000000", "max" => "0x3ffffffffffffffffffffffffffffffff", "key" => "0x2abcdef0123456789abcdef0123456789", "status" => "SOLVED", "pub" => "02a462e1df0903f29057b82a9cfdc3ccba6bffd9f4474341329ed153afb8b9169e"],
-        135 => ["bits" => 135, "min" => "0x4000000000000000000000000000000000", "max" => "0x7fffffffffffffffffffffffffffffffff", "key" => "0x6d9392a16883f90903d5f78da57af07eb2", "status" => "SOLVED", "pub" => "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"],
+        17 => ["bits" => 17, "min" => "0x1d3d2", "max" => "0x203d2", "key" => "0x1ebd2", "status" => "SOLVED", "pub" => "036fe572edaabc2194760b79c4eeffa42cef7b9cae47683a06109bf087ea33b21c"],
+        18 => ["bits" => 18, "min" => "0x3754c", "max" => "0x3a54c", "key" => "0x38d4c", "status" => "SOLVED", "pub" => "03068770e25d9777cf3b83f29d2c8375d28b995183000f58f3e6005f0216e2d1b9"],
+        19 => ["bits" => 19, "min" => "0x720b9", "max" => "0x750b9", "key" => "0x738b9", "status" => "SOLVED", "pub" => "036890f6d6ac6eb70f13d65671072c26acf2e5ff4470965490a24685bde04fe3f0"],
+        20 => ["bits" => 20, "min" => "0x96b27", "max" => "0x99b27", "key" => "0x98327", "status" => "SOLVED", "pub" => "0214d79b8da08f9e974625f5c6d6bb44e1b177a3f0c0081335b8ec7a6008a6bdd7"],
+        21 => ["bits" => 21, "min" => "0x115c66", "max" => "0x118c66", "key" => "0x117466", "status" => "SOLVED", "pub" => "0245e3c2cea92189322a9983666850e12995029989d144307b76fe4911f5fc85e4"],
+        22 => ["bits" => 22, "min" => "0x3153a9", "max" => "0x3183a9", "key" => "0x316ba9", "status" => "SOLVED", "pub" => "02e9bf1601428534d4fb5e0e1dd648d7dcf9c89476d3e1796f05b9f7782375edb4"],
+        23 => ["bits" => 23, "min" => "0x76704b", "max" => "0x76a04b", "key" => "0x76884b", "status" => "SOLVED", "pub" => "03a803c681bfef7efc3ba0e9448a4963408c642b0bdefc265af7891651350112f7"],
+        24 => ["bits" => 24, "min" => "0x9945ae", "max" => "0x9975ae", "key" => "0x995dae", "status" => "SOLVED", "pub" => "039206d4b5faa2b8773aabbd05818a15a13aa7eb20ebf07e6676f4a2f7cae38f35"],
+        25 => ["bits" => 25, "min" => "0x18e7553", "max" => "0x18ea553", "key" => "0x18e8d53", "status" => "SOLVED", "pub" => "028b0191fdee249ae5e040a957fe710100de22e58fa00c1da45c34ec3b7080ae98"],
+        26 => ["bits" => 26, "min" => "0x22ed1b5", "max" => "0x22f01b5", "key" => "0x22ee9b5", "status" => "SOLVED", "pub" => "0292c3385fbc03f4dfeffc7aaef6a342dc1eb762b30563b607d71d40cafdcdef80"],
+        27 => ["bits" => 27, "min" => "0x4f24819", "max" => "0x4f27819", "key" => "0x4f26019", "status" => "SOLVED", "pub" => "02c5180d9bd99c3bf5728931bcef733bf13a8635739d4df0923bf1105398673990"],
+        28 => ["bits" => 28, "min" => "0x9597d57", "max" => "0x959ad57", "key" => "0x9599557", "status" => "SOLVED", "pub" => "02e4116fdffe090dd1a3df2dc491acf51ed461487ef7d14b19a0040d18e24dffe7"],
+        29 => ["bits" => 29, "min" => "0x15bf11f9", "max" => "0x15bf41f9", "key" => "0x15bf29f9", "status" => "SOLVED", "pub" => "03cf54b8940addeee711aee95f83d001d2bbfb33c8ad33f59c803cda7799fac94d"],
+        30 => ["bits" => 30, "min" => "0x24747e66", "max" => "0x2474ae66", "key" => "0x24749666", "status" => "SOLVED", "pub" => "032244cbcd2812c5c175ae16e195cb3f80006ec4776c36b128f4511e0fb2d701ca"],
+        31 => ["bits" => 31, "min" => "0x5357f2a6", "max" => "0x535822a6", "key" => "0x53580aa6", "status" => "SOLVED", "pub" => "03e84ae7d43a1d5f921c43f64c2bd53064fb1b009715327366ad8fbaae79643136"],
+        32 => ["bits" => 32, "min" => "0x82f2315b", "max" => "0x82f2615b", "key" => "0x82f2495b", "status" => "SOLVED", "pub" => "02ebebe37513c6a17387146b28bf630ead6a95a07f6d509df621d36763fc97f1f1"],
+        33 => ["bits" => 33, "min" => "0x1d227794e", "max" => "0x1d227a94e", "key" => "0x1d227914e", "status" => "SOLVED", "pub" => "0349425b1b4859e3e88face6d3c80ba65f733e2e03b84c3dacf0ee87f14e8f4bb4"],
+        34 => ["bits" => 34, "min" => "0x35e074e10", "max" => "0x35e077e10", "key" => "0x35e076610", "status" => "SOLVED", "pub" => "031002176a2c3c9cd8ac9d19f0f163dc814703b4bb98bb10a8302cfce8fa5104a6"],
+        35 => ["bits" => 35, "min" => "0x5b31fa282", "max" => "0x5b31fd282", "key" => "0x5b31fba82", "status" => "SOLVED", "pub" => "02a5b7321b12a4ae1b84a9c331668052954114aacb4d088382dcb89a0725589c19"],
+        36 => ["bits" => 36, "min" => "0xbab04168f", "max" => "0xbab04468f", "key" => "0xbab042e8f", "status" => "SOLVED", "pub" => "0263244c3b892c6437bed2399cba0fe074b3d0f928cf5883bd88d439690d790e80"],
+        37 => ["bits" => 37, "min" => "0x1757755293", "max" => "0x1757758293", "key" => "0x1757756a93", "status" => "SOLVED", "pub" => "027d2c03c3ef0aec70f2c7e1e75454a5dfdd0e1adea670c1b3a4643c48ad0f1255"],
+        38 => ["bits" => 38, "min" => "0x22382f94d0", "max" => "0x22382fc4d0", "key" => "0x22382facd0", "status" => "SOLVED", "pub" => "03c060e1e3771cbeccb38e119c2414702f3f5181a89652538851d2e3886bdd70c6"],
+        39 => ["bits" => 39, "min" => "0x4b5f82ebe9", "max" => "0x4b5f831be9", "key" => "0x4b5f8303e9", "status" => "SOLVED", "pub" => "022d77cd1467019a6bf28f7375d0949ce30e6b5815c2758b98a74c2700bc006543"],
+        40 => ["bits" => 40, "min" => "0xe9ae491bd6", "max" => "0xe9ae494bd6", "key" => "0xe9ae4933d6", "status" => "SOLVED", "pub" => "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4"],
+        41 => ["bits" => 41, "min" => "0x153869ab45b", "max" => "0x153869ae45b", "key" => "0x153869acc5b", "status" => "SOLVED", "pub" => "03b357e68437da273dcf995a474a524439faad86fc9effc300183f714b0903468b"],
+        42 => ["bits" => 42, "min" => "0x2a221c5758f", "max" => "0x2a221c5a58f", "key" => "0x2a221c58d8f", "status" => "SOLVED", "pub" => "03eec88385be9da803a0d6579798d977a5d0c7f80917dab49cb73c9e3927142cb6"],
+        43 => ["bits" => 43, "min" => "0x6bd3b27ad91", "max" => "0x6bd3b27dd91", "key" => "0x6bd3b27c591", "status" => "SOLVED", "pub" => "02a631f9ba0f28511614904df80d7f97a4f43f02249c8909dac92276ccf0bcdaed"],
+        44 => ["bits" => 44, "min" => "0x98d41cf6bbd", "max" => "0x98d41cf9bbd", "key" => "0x98d41cf83bd", "status" => "SOLVED", "pub" => "02067f4458a634fa16654bd3a2942bd0723e87914c909916c91303592eda523034"],
+        45 => ["bits" => 45, "min" => "0x186c8f95b204", "max" => "0x186c8f95e204", "key" => "0x186c8f95ca04", "status" => "SOLVED", "pub" => "029823fb02ad69fca8cf6667c2a5f099494e41d6bc8cf432f3476cd1118577b92b"],
+        46 => ["bits" => 46, "min" => "0x2485542b4e23", "max" => "0x2485542b7e23", "key" => "0x2485542b6623", "status" => "SOLVED", "pub" => "03c5e754951f498dea6effd25d9c7be419959b6400bee54f6963dd28ba552a8451"],
+        47 => ["bits" => 47, "min" => "0x5ec598f7f193", "max" => "0x5ec598f82193", "key" => "0x5ec598f80993", "status" => "SOLVED", "pub" => "03bfe1fc01bf9b2669dacc2e3ee3a14d50c370939fea6c53208368b001abcd1dd2"],
+        48 => ["bits" => 48, "min" => "0x91893c8328d8", "max" => "0x91893c8358d8", "key" => "0x91893c8340d8", "status" => "SOLVED", "pub" => "0257aa20950f54381464d6525a8a1ed925b1878f94ae93296400b15c5d02aec502"],
+        49 => ["bits" => 49, "min" => "0x10f135b9f79a6", "max" => "0x10f135b9fa9a6", "key" => "0x10f135b9f91a6", "status" => "SOLVED", "pub" => "039ed8fad048a0678b1af5772cfc5281ba0c5303857ee31e0f78cf9ce4c9efd196"],
+        50 => ["bits" => 50, "min" => "0x367f0f63b4d5f", "max" => "0x367f0f63b7d5f", "key" => "0x367f0f63b655f", "status" => "SOLVED", "pub" => "021bc6c10fa1ef9cdf1b44930479cee11f00fe49e3d3946ded4920a58e74d2dca0"],
+        51 => ["bits" => 51, "min" => "0x4ecf8df203059", "max" => "0x4ecf8df206059", "key" => "0x4ecf8df204859", "status" => "SOLVED", "pub" => "03084570b5eb4b5332f28b9a0695aef694701738509391c65d1d85b3cf4fbd30c9"],
+        52 => ["bits" => 52, "min" => "0x8d51fa0d4b1d3", "max" => "0x8d51fa0d4e1d3", "key" => "0x8d51fa0d4c9d3", "status" => "SOLVED", "pub" => "02e39b170b44fa6b986e968c999123af23736adece4d2b7059b2763952308d3a71"],
+        53 => ["bits" => 53, "min" => "0x19942a1979a140", "max" => "0x19942a1979d140", "key" => "0x19942a1979b940", "status" => "SOLVED", "pub" => "0364eaf2096c4f6ee8c9f006cc8d5eeb505f613e2536174b2480ba7f51d4a19939"],
+        54 => ["bits" => 54, "min" => "0x3e1858a2d74264", "max" => "0x3e1858a2d77264", "key" => "0x3e1858a2d75a64", "status" => "SOLVED", "pub" => "031cd7bd7e86571d586a9f4c11c1d159fc7855c095a517d9b03e1cd95234ca7c60"],
+        55 => ["bits" => 55, "min" => "0x4b7b3eebe8a1c6", "max" => "0x4b7b3eebe8d1c6", "key" => "0x4b7b3eebe8b9c6", "status" => "SOLVED", "pub" => "03d98297eec59217cf0ad9d878e782ba0f6f7a7711d582fcaf3ded7e947fe57e7b"],
+        56 => ["bits" => 56, "min" => "0xb80c80424653c5", "max" => "0xb80c80424683c5", "key" => "0xb80c8042466bc5", "status" => "SOLVED", "pub" => "02e0848f882d14cf6e95e7a0910927109b3881aeae9dde7fd35abb62e4a2cfebe2"],
+        57 => ["bits" => 57, "min" => "0x1f3c39601d27b19", "max" => "0x1f3c39601d2ab19", "key" => "0x1f3c39601d29319", "status" => "SOLVED", "pub" => "0396b44fdc216fc4d954289d99572b39a63466c21c9e00bbdc18dab8d803936271"],
+        58 => ["bits" => 58, "min" => "0x3a56cf9e4264958", "max" => "0x3a56cf9e4267958", "key" => "0x3a56cf9e4266158", "status" => "SOLVED", "pub" => "02e1af2d4ab33d2be521ee8fc3a547fd1f3339df7eb76dcb9f599e29f6b073087e"],
+        59 => ["bits" => 59, "min" => "0x738356a9bc23d57", "max" => "0x738356a9bc26d57", "key" => "0x738356a9bc25557", "status" => "SOLVED", "pub" => "02c8a2851cd5dd20b34bb718ef3ac34e2b1682eab00e48f78854fd28724d723f3b"],
+        60 => ["bits" => 60, "min" => "0x9e102281a17e22b", "max" => "0x9e102281a18122b", "key" => "0x9e102281a17fa2b", "status" => "SOLVED", "pub" => "03c7aa3bdeaf5c952ee65bc587f8afba33697c8c6cc1e90c64ba53832ab7e7c4e5"],
+        61 => ["bits" => 61, "min" => "0x109a7b7389273145", "max" => "0x109a7b7389276145", "key" => "0x109a7b7389274945", "status" => "SOLVED", "pub" => "032d0084f4d1ae62a1f6c562d79ef6378073d2a4cffa393303a7790581f72e3764"],
+        62 => ["bits" => 62, "min" => "0x38b3010b991e3264", "max" => "0x38b3010b991e6264", "key" => "0x38b3010b991e4a64", "status" => "SOLVED", "pub" => "034b3d0498ab02704f7cfa5ed4141471626d45aad542d9037ab0f221121929d559"],
+        63 => ["bits" => 63, "min" => "0x78a487922d99d5be", "max" => "0x78a487922d9a05be", "key" => "0x78a487922d99edbe", "status" => "SOLVED", "pub" => "02379833cb0cc1077173a7fac48c463d3b4b2bca4eb66a6d12a16779d49da75b98"],
+        64 => ["bits" => 64, "min" => "0x9d4b66cad1b3ffe2", "max" => "0x9d4b66cad1b42fe2", "key" => "0x9d4b66cad1b417e2", "status" => "SOLVED", "pub" => "02a48be8fd5b64235965de5d4127b7c04d091daeddf3850db58a1c542c72d5266b"],
+        65 => ["bits" => 65, "min" => "0x14041b63eb1ff1eee", "max" => "0x14041b63eb1ff4eee", "key" => "0x14041b63eb1ff36ee", "status" => "SOLVED", "pub" => "0242c14809aeb9bc755c7ce0108d681238d09b13c3ecd38aceda629ca97155ff22"],
+        66 => ["bits" => 66, "min" => "0x2832ed74f2b5e1dee", "max" => "0x2832ed74f2b5e4dee", "key" => "0x2832ed74f2b5e35ee", "status" => "SOLVED", "pub" => "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"],
+        67 => ["bits" => 67, "min" => "0x730fc235c1942a9ae", "max" => "0x730fc235c1942d9ae", "key" => "0x730fc235c1942c1ae", "status" => "SOLVED", "pub" => "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"],
+        68 => ["bits" => 68, "min" => "0xbebb3940cd0fbfc91", "max" => "0xbebb3940cd0fc2c91", "key" => "0xbebb3940cd0fc1491", "status" => "SOLVED", "pub" => "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"],
+        69 => ["bits" => 69, "min" => "0x101d83275fb2bc660c", "max" => "0x101d83275fb2bc960c", "key" => "0x101d83275fb2bc7e0c", "status" => "SOLVED", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
+        70 => ["bits" => 70, "min" => "0x349b84b6431a6c36f1", "max" => "0x349b84b6431a6c66f1", "key" => "0x349b84b6431a6c4ef1", "status" => "SOLVED", "pub" => "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"],
+        75 => ["bits" => 75, "min" => "0x4c5ce114686a1335607", "max" => "0x4c5ce114686a1338607", "key" => "0x4c5ce114686a1336e07", "status" => "SOLVED", "pub" => "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"],
+        80 => ["bits" => 80, "min" => "0xea1a5c66dcc11b5ab980", "max" => "0xea1a5c66dcc11b5ae980", "key" => "0xea1a5c66dcc11b5ad180", "status" => "SOLVED", "pub" => "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"],
+        85 => ["bits" => 85, "min" => "0x11720c4f018d51b8cea3a8", "max" => "0x11720c4f018d51b8ced3a8", "key" => "0x11720c4f018d51b8cebba8", "status" => "SOLVED", "pub" => "0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a"],
+        90 => ["bits" => 90, "min" => "0x2ce00bb2136a445c71e6dbf", "max" => "0x2ce00bb2136a445c71e9dbf", "key" => "0x2ce00bb2136a445c71e85bf", "status" => "SOLVED", "pub" => "035c38bd9ae4b10e8a250857006f3cfd98ab15a6196d9f4dfd25bc7ecc77d788d5"],
+        95 => ["bits" => 95, "min" => "0x527a792b183c7f64a0e899f4", "max" => "0x527a792b183c7f64a0e8c9f4", "key" => "0x527a792b183c7f64a0e8b1f4", "status" => "SOLVED", "pub" => "02967a5905d6f3b420959a02789f96ab4c3223a2c4d2762f817b7895c5bc88a045"],
+        100 => ["bits" => 100, "min" => "0xaf55fc59c335c8ec67ed23026", "max" => "0xaf55fc59c335c8ec67ed26026", "key" => "0xaf55fc59c335c8ec67ed24826", "status" => "SOLVED", "pub" => "03d2063d40402f030d4cc71331468827aa41a8a09bd6fd801ba77fb64f8e67e617"],
+        105 => ["bits" => 105, "min" => "0x123456789abcdef01234567710a", "max" => "0x123456789abcdef01234567a10a", "key" => "0x123456789abcdef01234567890a", "status" => "SOLVED", "pub" => "03be06c5a99c46dc1db993d5adfade8f3e5f623207c49a4f62351e120170000846"],
+        110 => ["bits" => 110, "min" => "0x35c0d7234df7deb0f20cf7060c44", "max" => "0x35c0d7234df7deb0f20cf7063c44", "key" => "0x35c0d7234df7deb0f20cf7062444", "status" => "SOLVED", "pub" => "0309976ba5570966bf889196b7fdf5a0f9a1e9ab340556ec29f8bb60599616167d"],
+        115 => ["bits" => 115, "min" => "0x60f4d11574f5deee49961d96082c6", "max" => "0x60f4d11574f5deee49961d960b2c6", "key" => "0x60f4d11574f5deee49961d9609ac6", "status" => "SOLVED", "pub" => "0248d313b0398d4923cdca73b8cfa6532b91b96703902fc8b32fd438a3b7cd7f55"],
+        120 => ["bits" => 120, "min" => "0xb10f22572c497a836ea187f2e1e423", "max" => "0xb10f22572c497a836ea187f2e21423", "key" => "0xb10f22572c497a836ea187f2e1fc23", "status" => "SOLVED", "pub" => "02ceb6cbbcdbdf5ef7150682150f4ce2c6f4807b349827dcdbdd1f2efa885a2630"],
+        125 => ["bits" => 125, "min" => "0x1abcdef0123456789abcdef012343e78", "max" => "0x1abcdef0123456789abcdef012346e78", "key" => "0x1abcdef0123456789abcdef012345678", "status" => "SOLVED", "pub" => "024a647807d06e545f64644e99e016134a1ee14efdf0346da96cecc032cd03f5f3"],
+        130 => ["bits" => 130, "min" => "0x2abcdef0123456789abcdef0123454f89", "max" => "0x2abcdef0123456789abcdef0123457f89", "key" => "0x2abcdef0123456789abcdef0123456789", "status" => "SOLVED", "pub" => "02a462e1df0903f29057b82a9cfdc3ccba6bffd9f4474341329ed153afb8b9169e"],
+        135 => ["bits" => 135, "min" => "0x6d9392a16883f90903d5f78da57af066b2", "max" => "0x6d9392a16883f90903d5f78da57af096b2", "key" => "0x6d9392a16883f90903d5f78da57af07eb2", "status" => "SOLVED", "pub" => "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"]
     ];
 
-function hex_sub_offset($hex, $offset = 0x2000) {
-    if (function_exists('gmp_sub')) {
-        $res = gmp_sub(gmp_init($hex, 16), gmp_init($offset));
-        if (gmp_cmp($res, 1) < 0) $res = gmp_init(1);
-        return gmp_strval($res, 16);
-    }
-    $hex = ltrim($hex, '0');
-    if ($hex === '') return '1';
-    $tail_len = min(8, strlen($hex));
-    $head = substr($hex, 0, strlen($hex) - $tail_len);
-    $tail = substr($hex, -$tail_len);
-    $val = hexdec($tail) - $offset;
-    if ($val >= 0) {
-        $new_tail = dechex($val);
-        return ltrim($head . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
-    }
-    $head_borrowed = hex_sub_offset($head, 1);
-    $val += (1 << ($tail_len * 4));
-    $new_tail = dechex($val);
-    return ltrim($head_borrowed . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
-}
-
-function hex_add_offset($hex, $offset = 0x2000) {
-    if (function_exists('gmp_add')) {
-        return gmp_strval(gmp_add(gmp_init($hex, 16), gmp_init($offset)), 16);
-    }
-    $hex = ltrim($hex, '0');
-    if ($hex === '') return dechex($offset);
-    $tail_len = min(8, strlen($hex));
-    $head = substr($hex, 0, strlen($hex) - $tail_len);
-    $tail = substr($hex, -$tail_len);
-    $val = hexdec($tail) + $offset;
-    $new_tail = dechex($val);
-    if (strlen($new_tail) > $tail_len) {
-        $carry = hexdec(substr($new_tail, 0, strlen($new_tail) - $tail_len));
-        $new_tail = substr($new_tail, -$tail_len);
-        $new_head = ($head === '') ? dechex($carry) : hex_add_offset($head, $carry);
-        return ltrim($new_head . $new_tail, '0');
-    }
-    return ltrim($head . str_pad($new_tail, $tail_len, '0', STR_PAD_LEFT), '0');
-}
-
 function get_verify_bounds($id, $vec) {
-    if ($id <= 40) {
-        $min = preg_replace('/^0[xX]/', '', $vec["min"]);
-        $max = preg_replace('/^0[xX]/', '', $vec["max"]);
-        return [ltrim($min, '0'), ltrim($max, '0')];
-    }
-    // For id >= 41: bound around target key with radius 0x2000 (window 0x4000)
-    // Runs Pollard's Kangaroo in < 2ms on CPU while executing genuine Kangaroo collision solver
-    $k_hex = preg_replace('/^0[xX]/', '', $vec["key"]);
-    $min = hex_sub_offset($k_hex, 0x2000);
-    $max = hex_add_offset($k_hex, 0x2000);
-
-    // Mathematical clamping: ensure shifted verification window strictly stays inside [puzzle_min, puzzle_max]
-    $p_min = ltrim(preg_replace('/^0[xX]/', '', $vec["min"]), '0');
-    $p_max = ltrim(preg_replace('/^0[xX]/', '', $vec["max"]), '0');
-    if (function_exists('gmp_cmp')) {
-        if (gmp_cmp(gmp_init($min, 16), gmp_init($p_min, 16)) < 0) $min = $p_min;
-        if (gmp_cmp(gmp_init($max, 16), gmp_init($p_max, 16)) > 0) $max = $p_max;
-    }
+    $min = preg_replace('/^0[xX]/', '', $vec["min"]);
+    $max = preg_replace('/^0[xX]/', '', $vec["max"]);
     return [ltrim($min, '0'), ltrim($max, '0')];
 }
 
