@@ -9,17 +9,29 @@ error_reporting(0);
 ini_set("display_errors", "0");
 date_default_timezone_set("UTC");
 
-$data_dir = __DIR__ . "/data";
+// Hỗ trợ cô lập nhiều hệ thống / đa puzzle trên cùng server:
+// Tách thư mục con riêng biệt theo INSTANCE_ID hoặc ?instance=, mặc định là puzzle140
+$instance_name = getenv("INSTANCE_ID") ?: ($_GET["instance"] ?? "puzzle140");
+$instance_clean = preg_replace('/[^a-zA-Z0-9_-]/', '', $instance_name);
+if (empty($instance_clean)) {
+    $instance_clean = "puzzle140";
+}
+
+$base_data_dir = __DIR__ . "/data";
+if (!is_dir($base_data_dir)) {
+    mkdir($base_data_dir, 0700, true);
+}
+if (!file_exists($base_data_dir . "/.htaccess")) {
+    file_put_contents($base_data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
+}
+
+$data_dir = $base_data_dir . "/" . $instance_clean;
 if (!is_dir($data_dir)) {
     mkdir($data_dir, 0700, true);
 }
-if (!file_exists($data_dir . "/.htaccess")) {
-    file_put_contents($data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
-}
 
-$db_path = $data_dir . "/system.db";
+$db_path = $data_dir . "/system_" . $instance_clean . ".db";
 $vault_path = $data_dir . "/.solution_vault.dat";
-
 
 $shards_dir = $data_dir . "/shards";
 if (!is_dir($shards_dir)) {
@@ -35,7 +47,7 @@ function get_shard_db($nibble) {
     }
     $path = $shards_dir . "/traps_" . $hex . ".db";
     $sdb = new SQLite3($path);
-    $sdb->busyTimeout(15000);
+    $sdb->busyTimeout(30000);
     $sdb->exec("PRAGMA journal_mode = WAL;");
     $sdb->exec("PRAGMA synchronous = NORMAL;");
     $sdb->exec("PRAGMA cache_size = -32768;");
@@ -107,12 +119,65 @@ function set_setting($db, $key, $value) {
     $stmt->execute();
 }
 
+function secp256k1_point_add($p1, $p2, $prime) {
+    if ($p1 === null) return $p2;
+    if ($p2 === null) return $p1;
+    list($x1, $y1) = $p1;
+    list($x2, $y2) = $p2;
+    if (gmp_cmp($x1, $x2) == 0) {
+        if (gmp_cmp($y1, $y2) != 0) return null; // point at infinity
+        // Point doubling: lambda = (3 * x1^2) / (2 * y1) mod p
+        $num = gmp_mod(gmp_mul(gmp_init(3), gmp_powm($x1, gmp_init(2), $prime)), $prime);
+        $den = gmp_invert(gmp_mod(gmp_mul(gmp_init(2), $y1), $prime), $prime);
+        if ($den === false) return null;
+        $lambda = gmp_mod(gmp_mul($num, $den), $prime);
+    } else {
+        // Point addition: lambda = (y2 - y1) / (x2 - x1) mod p
+        $num = gmp_mod(gmp_sub($y2, $y1), $prime);
+        if (gmp_sign($num) < 0) $num = gmp_add($num, $prime);
+        $den_raw = gmp_mod(gmp_sub($x2, $x1), $prime);
+        if (gmp_sign($den_raw) < 0) $den_raw = gmp_add($den_raw, $prime);
+        $den = gmp_invert($den_raw, $prime);
+        if ($den === false) return null;
+        $lambda = gmp_mod(gmp_mul($num, $den), $prime);
+    }
+    // x3 = lambda^2 - x1 - x2 mod p
+    $x3 = gmp_mod(gmp_sub(gmp_sub(gmp_powm($lambda, gmp_init(2), $prime), $x1), $x2), $prime);
+    if (gmp_sign($x3) < 0) $x3 = gmp_add($x3, $prime);
+    // y3 = lambda * (x1 - x3) - y1 mod p
+    $y3 = gmp_mod(gmp_sub(gmp_mul($lambda, gmp_sub($x1, $x3)), $y1), $prime);
+    if (gmp_sign($y3) < 0) $y3 = gmp_add($y3, $prime);
+    return [$x3, $y3];
+}
+
+function secp256k1_pubkey_from_privkey($priv_hex) {
+    $clean = preg_replace('/^0[xX]/', '', trim($priv_hex));
+    if (empty($clean)) return "";
+    $prime = gmp_init("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
+    $gx = gmp_init("0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16);
+    $gy = gmp_init("0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16);
+    $k = gmp_init($clean, 16);
+    $p = [$gx, $gy];
+    $res = null;
+    while (gmp_cmp($k, 0) > 0) {
+        if (gmp_testbit($k, 0)) {
+            $res = secp256k1_point_add($res, $p, $prime);
+        }
+        $p = secp256k1_point_add($p, $p, $prime);
+        $k = gmp_div_q($k, gmp_init(2));
+    }
+    if ($res === null) return "";
+    $prefix = (gmp_testbit($res[1], 0)) ? "03" : "02";
+    return $prefix . str_pad(gmp_strval($res[0], 16), 64, "0", STR_PAD_LEFT);
+}
+
 /**
  * Solve private key for both symmetric curve candidates:
- * k1 = (RangeMin + D_T - D_W) mod n
- * k2 = (RangeMin + D_T + D_W) mod n
+ * k1 = (D_T - D_W) mod n
+ * k2 = (-D_T - D_W) mod n
+ * And strictly verify k * G == target_pubkey
  */
-function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex) {
+function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex, $target_pubkey_hex = "") {
     if (extension_loaded("gmp")) {
         $n = gmp_init(SECP_N, 16);
         $min = gmp_init($range_min_hex, 16);
@@ -139,12 +204,23 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
         $c1_in_range = (gmp_cmp($k1, $min) >= 0 && gmp_cmp($k1, $max) <= 0);
         $c2_in_range = (gmp_cmp($k2, $min) >= 0 && gmp_cmp($k2, $max) <= 0);
 
+        // Native ECDSA verification: k * G == target_pubkey
+        $target_clean = strtolower(trim(preg_replace('/^0[xX]/', '', $target_pubkey_hex)));
+        $pub1 = strtolower(secp256k1_pubkey_from_privkey($c1_hex));
+        $pub2 = strtolower(secp256k1_pubkey_from_privkey($c2_hex));
+        $match1 = (!empty($target_clean) && $pub1 === $target_clean);
+        $match2 = (!empty($target_clean) && $pub2 === $target_clean);
+        $is_verified = ($match1 || $match2);
+        $verified_key = $match1 ? $c1_hex : ($match2 ? $c2_hex : ($c1_in_range ? $c1_hex : $c2_hex));
+
         return [
             "cand1" => $c1_hex,
             "cand2" => $c2_hex,
             "cand1_in_range" => $c1_in_range,
             "cand2_in_range" => $c2_in_range,
-            "verified_key" => $c1_in_range ? $c1_hex : ($c2_in_range ? $c2_hex : $c1_hex)
+            "is_verified" => $is_verified,
+            "verified_key" => $verified_key,
+            "derived_pubkey" => $match1 ? $pub1 : ($match2 ? $pub2 : $pub1)
         ];
     } else {
         return [
@@ -152,7 +228,9 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
             "cand2" => "0xRECORDED_CHECK_SECURE_VAULT",
             "cand1_in_range" => false,
             "cand2_in_range" => false,
-            "verified_key" => "0xRECORDED_CHECK_SECURE_VAULT"
+            "is_verified" => false,
+            "verified_key" => "0xRECORDED_CHECK_SECURE_VAULT",
+            "derived_pubkey" => ""
         ];
     }
 }
@@ -353,17 +431,25 @@ if ($action === "submit_tame" || $action === "check_wild") {
             }
         }
 
-        // Write directly to the corresponding shard databases in data/shards/
+        // Write directly to the corresponding shard databases in data/shards/ with retry
         foreach ($shard_groups as $nibble => $group) {
             $sdb = get_shard_db($nibble);
-            $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
-            $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
-            foreach ($group as $item) {
-                $sins->bindValue(":x", $item["x"], SQLITE3_BLOB);
-                $sins->bindValue(":dist", $item["dist"], SQLITE3_BLOB);
-                $sins->execute();
+            for ($attempt = 0; $attempt < 5; $attempt++) {
+                try {
+                    $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
+                    foreach ($group as $item) {
+                        $sins->bindValue(":x", $item["x"], SQLITE3_BLOB);
+                        $sins->bindValue(":dist", $item["dist"], SQLITE3_BLOB);
+                        $sins->execute();
+                    }
+                    $sdb->exec("COMMIT;");
+                    break;
+                } catch (Exception $ex) {
+                    @$sdb->exec("ROLLBACK;");
+                    usleep(15000 * ($attempt + 1));
+                }
             }
-            $sdb->exec("COMMIT;");
         }
 
         // Update cached total count in system.db
@@ -390,9 +476,9 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $added_steps = ($batch_size > 0) ? ($batch_size * pow(2, 23)) : 50000000; // estimated batch steps
         set_setting($db, "total_wild_steps", (string)($prev_wild + $added_steps));
 
-        $chk = $db->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
         $range_min = get_setting($db, "range_min");
         $range_max = get_setting($db, "range_max");
+        $target_pubkey = get_setting($db, "target_pubkey");
 
         foreach ($dp_list as $dp) {
             if (empty($dp["x"]) || empty($dp["dist"])) continue;
@@ -402,16 +488,31 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             $nibble = ord($bin_x[0]) & 0x0F;
             $sdb = get_shard_db($nibble);
-            $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
-            $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
-            $sres = $schk->execute();
-            $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
+
+            $row = false;
+            for ($attempt = 0; $attempt < 3; $attempt++) {
+                try {
+                    $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
+                    $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
+                    $sres = $schk->execute();
+                    $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
+                    break;
+                } catch (Exception $ex) {
+                    usleep(10000 * ($attempt + 1));
+                }
+            }
 
             if ($row) {
                 // COLLISION DETECTED!
                 $tame_dist_hex = bin2hex($row["total_distance"]);
                 $wild_dist_hex = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
-                $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex);
+                $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
+
+                // Verification check: ensure pubkey matches target_pubkey
+                if (!empty($target_pubkey) && empty($cands["is_verified"])) {
+                    // False collision or unverified key - continue checking
+                    continue;
+                }
 
                 // Write to secure server vault (permissions 0600, never exposed in JSON response or UI)
                 $vault_data = json_encode([
@@ -424,6 +525,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     "candidate_2" => $cands["cand2"],
                     "candidate_1_in_range" => $cands["cand1_in_range"],
                     "candidate_2_in_range" => $cands["cand2_in_range"],
+                    "is_verified" => $cands["is_verified"],
+                    "derived_pubkey" => $cands["derived_pubkey"],
                     "verified_key" => $cands["verified_key"],
                     "tame_distance" => "0x" . $tame_dist_hex,
                     "wild_distance" => "0x" . $wild_dist_hex

@@ -93,8 +93,8 @@ public:
             int qword_idx = bit / 64;
             int bit_rem = bit % 64;
             uint64_t val = (1ULL << bit_rem);
-            if (i > 0 && (val % 2 == 0)) val |= 1ULL; // Odd step to break parity loops
             d[i].SetQWord(qword_idx, val);
+            if (i > 0) d[i].bits64[0] |= 1ULL; // Odd step to break parity loops
             J[i] = secp->ComputePublicKey(&d[i]);
             Jx[i].Set(&J[i].x);
             Jy[i].Set(&J[i].y);
@@ -279,8 +279,8 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 tame_dp_count[g]++;
             }
 
-            // Logic khai tử TAME: Sau khi tạo đủ 2 DP (hoặc đạt 16M bước) thì khai tử để hồi sinh ở tọa độ ngẫu nhiên mới
-            if (tame_dp_count[g] >= 2 || tame_step_count[g] >= 16777216ULL) {
+            // Logic khai tử TAME: Sau khi tạo đủ 2 DP (hoặc đạt 67M bước = 2^26) thì hồi sinh ở tọa độ mới
+            if (tame_dp_count[g] >= 2 || tame_step_count[g] >= 67108864ULL) {
                 spawn_tame_kangaroo(g);
             }
         }
@@ -393,8 +393,8 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 wild_dp_count[g]++;
             }
 
-            // Logic khai tử WILD: Khai tử khi sinh đủ 2 DP mà chưa va chạm hoặc đi quá 16M bước để chống vọt lố (overshoot) và vòng lặp
-            if (wild_dp_count[g] >= 2 || wild_step_count[g] >= 16777216ULL) {
+            // Logic khai tử WILD: Khai tử khi sinh đủ 2 DP mà chưa va chạm hoặc đi quá 67M bước (= 2^26) để chống vọt lố (overshoot) và vòng lặp
+            if (wild_dp_count[g] >= 2 || wild_step_count[g] >= 67108864ULL) {
                 spawn_wild_kangaroo(g);
             }
         }
