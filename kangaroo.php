@@ -17,7 +17,7 @@ if (!file_exists($data_dir . "/.htaccess")) {
     file_put_contents($data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
 }
 
-$db_path = $data_dir . "/tame_traps.db";
+$db_path = $data_dir . "/system.db";
 $vault_path = $data_dir . "/.solution_vault.dat";
 
 
@@ -63,11 +63,6 @@ try {
 
     // Compact Binary BLOB Schema WITHOUT ROWID (64-byte payload per trap)
     $db->exec("
-        CREATE TABLE IF NOT EXISTS tame_traps (
-            dp_x BLOB PRIMARY KEY,
-            total_distance BLOB NOT NULL
-        ) WITHOUT ROWID;
-
         CREATE TABLE IF NOT EXISTS system_settings (
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL
@@ -88,6 +83,7 @@ try {
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_steps', '0');
+        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
     ");
 } catch (Exception $e) {
     http_response_code(500);
@@ -286,8 +282,7 @@ if ($action === "get_task") {
     $worker_id = isset($_GET["worker_id"]) ? $_GET["worker_id"] : "anon_node";
     $hardware = isset($_GET["hardware"]) ? $_GET["hardware"] : "Node";
 
-    $res = $db->querySingle("SELECT COUNT(*) FROM tame_traps;");
-    $tame_count = $res ? intval($res) : 0;
+    $tame_count = intval(get_setting($db, "total_tame_traps", "0"));
     $target_dp = intval(get_setting($db, "target_dp", "50000000"));
 
     $task_type = ($tame_count >= $target_dp) ? "WILD" : "TAME";
@@ -341,34 +336,40 @@ if ($action === "submit_tame" || $action === "check_wild") {
     $w_stmt->execute();
 
     if ($action === "submit_tame") {
-        $db->exec("BEGIN TRANSACTION;");
-        $ins = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
         $saved = 0;
+        $shard_groups = [];
 
         foreach ($dp_list as $dp) {
             if (empty($dp["x"]) || empty($dp["dist"])) continue;
             $x_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["x"])), 64, "0", STR_PAD_LEFT);
             $dist_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
-            $bin_x = hex2bin($x_clean);
-            $bin_dist = hex2bin($dist_clean);
+            $bin_x = isset($dp["bin_x"]) ? $dp["bin_x"] : hex2bin($x_clean);
+            $bin_dist = isset($dp["bin_dist"]) ? $dp["bin_dist"] : hex2bin($dist_clean);
 
             if ($bin_x !== false && $bin_dist !== false) {
-                $ins->bindValue(":x", $bin_x, SQLITE3_BLOB);
-                $ins->bindValue(":dist", $bin_dist, SQLITE3_BLOB);
-                $ins->execute();
-                $saved++;
-
                 $nibble = ord($bin_x[0]) & 0x0F;
-                $sdb = get_shard_db($nibble);
-                $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
-                $sins->bindValue(":x", $bin_x, SQLITE3_BLOB);
-                $sins->bindValue(":dist", $bin_dist, SQLITE3_BLOB);
-                $sins->execute();
+                $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $bin_dist];
+                $saved++;
             }
         }
-        $db->exec("COMMIT;");
 
-        $total = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+        // Write directly to the corresponding shard databases in data/shards/
+        foreach ($shard_groups as $nibble => $group) {
+            $sdb = get_shard_db($nibble);
+            $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
+            $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
+            foreach ($group as $item) {
+                $sins->bindValue(":x", $item["x"], SQLITE3_BLOB);
+                $sins->bindValue(":dist", $item["dist"], SQLITE3_BLOB);
+                $sins->execute();
+            }
+            $sdb->exec("COMMIT;");
+        }
+
+        // Update cached total count in system.db
+        $prev_total = intval(get_setting($db, "total_tame_traps", "0"));
+        $total = $prev_total + $saved;
+        set_setting($db, "total_tame_traps", (string)$total);
         $target_dp = intval(get_setting($db, "target_dp", "50000000"));
         $task_type = ($total >= $target_dp) ? "WILD" : "TAME";
         $prob_info = calculate_hit_probability($total, 0);
@@ -405,11 +406,6 @@ if ($action === "submit_tame" || $action === "check_wild") {
             $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
             $sres = $schk->execute();
             $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
-            if (!$row) {
-                $chk->bindValue(":x", $bin_x, SQLITE3_BLOB);
-                $res = $chk->execute();
-                $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
-            }
 
             if ($row) {
                 // COLLISION DETECTED!
@@ -471,7 +467,7 @@ if ($action === "set_target_dp") {
 // API 5: GET STATS
 if ($action === "get_stats") {
     header("Content-Type: application/json");
-    $total_traps = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+    $total_traps = intval(get_setting($db, "total_tame_traps", "0"));
     $target_dp = intval(get_setting($db, "target_dp", "50000000"));
     $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
     $prob = calculate_hit_probability($total_traps, $wild_steps);
@@ -498,8 +494,12 @@ if ($action === "get_stats") {
         $workers_list[] = $w;
     }
 
-    $db_size_bytes = file_exists($db_path) ? filesize($db_path) : 0;
-    $db_size_mb = round($db_size_bytes / (1024 * 1024), 2);
+    $total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
+    for ($i = 0; $i < 16; $i++) {
+        $sp = $shards_dir . "/traps_" . dechex($i) . ".db";
+        if (file_exists($sp)) $total_bytes += filesize($sp);
+    }
+    $db_size_mb = round($total_bytes / (1024 * 1024), 2);
 
     echo json_encode([
         "current_dp" => $total_traps,
