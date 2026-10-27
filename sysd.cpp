@@ -86,12 +86,15 @@ public:
     Int Jy[NB_JUMP];
 
     void init(Secp256K1 *secp) {
+        // Task 1.3: Optimal logarithmic jump distribution with odd step tuning
         for (int i = 0; i < NB_JUMP; ++i) {
             d[i].SetInt32(0);
-            int bit = i + 62;
+            int bit = 54 + (i * 30) / (NB_JUMP - 1); // Spans 54 to 84 bits around mu = 2^68.5
             int qword_idx = bit / 64;
             int bit_rem = bit % 64;
-            d[i].SetQWord(qword_idx, 1ULL << bit_rem);
+            uint64_t val = (1ULL << bit_rem);
+            if (i > 0 && (val % 2 == 0)) val |= 1ULL; // Odd step to break parity loops
+            d[i].SetQWord(qword_idx, val);
             J[i] = secp->ComputePublicKey(&d[i]);
             Jx[i].Set(&J[i].x);
             Jy[i].Set(&J[i].y);

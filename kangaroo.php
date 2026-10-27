@@ -20,6 +20,35 @@ if (!file_exists($data_dir . "/.htaccess")) {
 $db_path = $data_dir . "/tame_traps.db";
 $vault_path = $data_dir . "/.solution_vault.dat";
 
+
+$shards_dir = $data_dir . "/shards";
+if (!is_dir($shards_dir)) {
+    mkdir($shards_dir, 0700, true);
+}
+
+function get_shard_db($nibble) {
+    global $shards_dir;
+    static $shard_handles = [];
+    $hex = strtolower(dechex($nibble & 0x0F));
+    if (isset($shard_handles[$hex])) {
+        return $shard_handles[$hex];
+    }
+    $path = $shards_dir . "/traps_" . $hex . ".db";
+    $sdb = new SQLite3($path);
+    $sdb->busyTimeout(15000);
+    $sdb->exec("PRAGMA journal_mode = WAL;");
+    $sdb->exec("PRAGMA synchronous = NORMAL;");
+    $sdb->exec("PRAGMA cache_size = -32768;");
+    $sdb->exec("PRAGMA mmap_size = 134217728;");
+    $sdb->exec("PRAGMA temp_store = MEMORY;");
+    $sdb->exec("CREATE TABLE IF NOT EXISTS tame_traps (
+        dp_x BLOB PRIMARY KEY,
+        total_distance BLOB NOT NULL
+    ) WITHOUT ROWID;");
+    $shard_handles[$hex] = $sdb;
+    return $sdb;
+}
+
 define("SECP_N", "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
 define("SPACE_WIDTH_140", "6.968e41"); // 2^139 = 696800000000000000000000000000000000000000
 
@@ -137,6 +166,86 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
  * Space W = 2^139 ≈ 6.968e41
  * Each DP represents 2^23 steps (≈ 8,388,608 steps)
  */
+
+function parse_incoming_dp_payload() {
+    $raw = file_get_contents("php://input");
+    if (empty($raw)) return null;
+
+    if (strlen($raw) >= 16) {
+        $magic = substr($raw, 0, 4);
+        if ($magic === "DPKG" || $magic === "KGDP") {
+            $hdr = unpack("nver/nwid_len", substr($raw, 4, 4));
+            $pos = 8;
+            $wid = substr($raw, $pos, $hdr["wid_len"]);
+            $pos += $hdr["wid_len"];
+
+            $hw_hdr = unpack("nhw_len", substr($raw, $pos, 2));
+            $pos += 2;
+            $hw = substr($raw, $pos, $hw_hdr["hw_len"]);
+            $pos += $hw_hdr["hw_len"];
+
+            $hr_hdr = unpack("nhr_len", substr($raw, $pos, 2));
+            $pos += 2;
+            $hr = substr($raw, $pos, $hr_hdr["hr_len"]);
+            $pos += $hr_hdr["hr_len"];
+
+            $cnt_hdr = unpack("Ncount", substr($raw, $pos, 4));
+            $pos += 4;
+            $count = $cnt_hdr["count"];
+
+            $dps = [];
+            for ($i = 0; $i < $count && ($pos + 64) <= strlen($raw); ++$i) {
+                $bin_x = substr($raw, $pos, 32);
+                $pos += 32;
+                $bin_dist = substr($raw, $pos, 32);
+                $pos += 32;
+                $dps[] = [
+                    "bin_x" => $bin_x,
+                    "bin_dist" => $bin_dist,
+                    "x" => bin2hex($bin_x),
+                    "dist" => bin2hex($bin_dist)
+                ];
+            }
+
+            return [
+                "protocol" => "RAW_BINARY_FAST",
+                "worker_id" => $wid ?: "node_worker",
+                "hardware" => $hw ?: "Node",
+                "hashrate" => $hr ?: "0.00 MH/s",
+                "dp_list" => $dps
+            ];
+        }
+    }
+
+    $json = json_decode($raw, true);
+    if ($json && isset($json["dp_list"]) && is_array($json["dp_list"])) {
+        $dps = [];
+        foreach ($json["dp_list"] as $item) {
+            if (empty($item["x"]) || empty($item["dist"])) continue;
+            $x_clean = str_pad(preg_replace("/^0[xX]/", "", trim($item["x"])), 64, "0", STR_PAD_LEFT);
+            $dist_clean = str_pad(preg_replace("/^0[xX]/", "", trim($item["dist"])), 64, "0", STR_PAD_LEFT);
+            $bx = hex2bin($x_clean);
+            $bdist = hex2bin($dist_clean);
+            if ($bx !== false && $bdist !== false) {
+                $dps[] = [
+                    "bin_x" => $bx,
+                    "bin_dist" => $bdist,
+                    "x" => $x_clean,
+                    "dist" => $dist_clean
+                ];
+            }
+        }
+        return [
+            "protocol" => "JSON_STANDARD",
+            "worker_id" => isset($json["worker_id"]) ? $json["worker_id"] : "node_worker",
+            "hardware" => isset($json["hardware"]) ? $json["hardware"] : "Node",
+            "hashrate" => isset($json["hashrate"]) ? $json["hashrate"] : "0.00 MH/s",
+            "dp_list" => $dps
+        ];
+    }
+    return null;
+}
+
 function calculate_hit_probability($total_traps, $wild_steps = 0) {
     $dp_step = pow(2, 23); // 8388608
     $w = 6.968e41; // 2^139
@@ -201,8 +310,7 @@ if ($action === "get_task") {
 // API 2 & 3: SUBMIT TAME & CHECK WILD
 if ($action === "submit_tame" || $action === "check_wild") {
     header("Content-Type: application/json");
-    $input = file_get_contents("php://input");
-    $payload = json_decode($input, true);
+    $payload = parse_incoming_dp_payload();
 
     if (!$payload || !isset($payload["dp_list"]) || !is_array($payload["dp_list"])) {
         echo json_encode(["status" => "ERROR", "message" => "Invalid payload"]);
@@ -249,6 +357,13 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $ins->bindValue(":dist", $bin_dist, SQLITE3_BLOB);
                 $ins->execute();
                 $saved++;
+
+                $nibble = ord($bin_x[0]) & 0x0F;
+                $sdb = get_shard_db($nibble);
+                $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
+                $sins->bindValue(":x", $bin_x, SQLITE3_BLOB);
+                $sins->bindValue(":dist", $bin_dist, SQLITE3_BLOB);
+                $sins->execute();
             }
         }
         $db->exec("COMMIT;");
@@ -284,9 +399,17 @@ if ($action === "submit_tame" || $action === "check_wild") {
             $bin_x = hex2bin($x_clean);
             if ($bin_x === false) continue;
 
-            $chk->bindValue(":x", $bin_x, SQLITE3_BLOB);
-            $res = $chk->execute();
-            $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+            $nibble = ord($bin_x[0]) & 0x0F;
+            $sdb = get_shard_db($nibble);
+            $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
+            $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
+            $sres = $schk->execute();
+            $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
+            if (!$row) {
+                $chk->bindValue(":x", $bin_x, SQLITE3_BLOB);
+                $res = $chk->execute();
+                $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+            }
 
             if ($row) {
                 // COLLISION DETECTED!
@@ -488,6 +611,42 @@ function get_verify_bounds($id, $vec) {
     $min = preg_replace('/^0[xX]/', '', $vec["min"]);
     $max = preg_replace('/^0[xX]/', '', $vec["max"]);
     return [ltrim($min, '0'), ltrim($max, '0')];
+}
+
+// API: DYNAMIC RANDOMIZED VERIFICATION SUITE (action=verify_random)
+if ($action === "verify_random") {
+    header("Content-Type: application/json");
+    $bits = isset($_GET["bits"]) ? intval($_GET["bits"]) : 22;
+    if ($bits < 14) $bits = 14;
+    if ($bits > 28) $bits = 28;
+
+    $cand_keys = [16, 20, 22, 25, 30, 35, 40, 50, 60, 70];
+    $pid = isset($_GET["id"]) ? intval($_GET["id"]) : $cand_keys[array_rand($cand_keys)];
+    if (!isset($VERIFY_PUZZLES[$pid])) $pid = 25;
+
+    $vec = $VERIFY_PUZZLES[$pid];
+    $key_hex = $vec["key"];
+
+    if (extension_loaded("gmp")) {
+        $k = gmp_init($key_hex, 16);
+        $window_size = gmp_pow(2, $bits);
+        $offset = gmp_random_range(0, $window_size);
+        $min = gmp_sub($k, $offset);
+        if (gmp_sign($min) < 0) $min = gmp_init(1);
+        $max = gmp_add($min, $window_size);
+
+        echo json_encode([
+            "status" => "OK",
+            "puzzle_id" => $pid,
+            "bits" => $bits,
+            "window_size" => gmp_strval($window_size, 10),
+            "min" => gmp_strval($min, 16),
+            "max" => gmp_strval($max, 16),
+            "target_pubkey" => $vec["pub"],
+            "pub" => $vec["pub"]
+        ]);
+        exit;
+    }
 }
 
 // API 6: UNIFIED VERIFICATION ENDPOINT (action=verify, backwards compatible with legacy aliases)
