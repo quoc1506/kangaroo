@@ -86,10 +86,17 @@ public:
     Int Jy[NB_JUMP];
 
     void init(Secp256K1 *secp) {
-        // Task 1.3: Optimal logarithmic jump distribution with odd step tuning
+        // Tối ưu hóa bảng bước nhảy cho Puzzle #140 (Độ rộng không gian W = 2^139):
+        // Theo lý thuyết của Pollard Kangaroo: bước nhảy bình quân tối ưu là mu = 0.5 * sqrt(W) = 2^68.5.
+        // Khi chọn số mũ bit trải từ 57 đến 72:
+        //   - Bước nhỏ nhất: 2^57
+        //   - Bước lớn nhất: 2^72
+        //   - Tổng 32 bước: sum(2^bit_i) ≈ 2^73.58
+        //   - Trung bình cộng số học thực tế: E[d] = 2^73.58 / 32 = 2^68.58 (khớp tuyệt đối với 2^68.5 lý thuyết)
+        // Việc giới hạn max bit ở 72 ngăn chặn hiện tượng các bước 2^80-2^84 áp đảo kéo trung bình vọt lên 2^80 (vọt lố bẫy).
         for (int i = 0; i < NB_JUMP; ++i) {
             d[i].SetInt32(0);
-            int bit = 54 + (i * 30) / (NB_JUMP - 1); // Spans 54 to 84 bits around mu = 2^68.5
+            int bit = 57 + (i * 15) / (NB_JUMP - 1); // Trải đều 57 đến 72 bit: E[d] = 2^68.58 ~ 2^68.5
             int qword_idx = bit / 64;
             int bit_rem = bit % 64;
             uint64_t val = (1ULL << bit_rem);
@@ -134,9 +141,15 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
-        curl_easy_perform(curl);
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
+        // Neu ket noi loi hoac ma HTTP khong phai 2xx (e.g. 500, 502, timeout), xoa buffer de kich hoat retry
+        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+            readBuffer.clear();
+        }
     }
     return readBuffer;
 }
@@ -448,7 +461,8 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         for (int i = 0; i < total_kangaroos; ++i) {
             Int r_scalar;
             r_scalar.Rand(&range_width);
-            r_scalar.ModSubK1order(&half_width); // Centered in [-2^138, +2^138]
+            // Dong bo 100% voi CPU WorkerWildThread: Giu r_scalar luon duong trong [0, range_width]
+            // Loai bo hoan toan so am va hien tuong tran modulo N tren GPU
             Point offset_pt = secp->ComputePublicKey(&r_scalar);
             Point P = secp->AddDirect(target_pub, offset_pt);
             px[i].Set(&P.x);

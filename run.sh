@@ -7,37 +7,28 @@ OS="$(uname -s)"
 GPU_FLAG=""
 
 if [ "$OS" = "Darwin" ]; then
-    for c in "$DIR/bin/sysd_darwin_all" "$DIR/sysd_darwin_all" "$DIR/bin/sysd" "$DIR/sysd"; do
-        if [ -f "$c" ]; then
-            BIN="$c"
-            break
-        fi
-    done
+    if [ -f "$DIR/bin/sysd_darwin_all" ]; then
+        BIN="$DIR/bin/sysd_darwin_all"
+    fi
 elif [ "$OS" = "Linux" ]; then
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        for c in "$DIR/bin/sysd_linux_gpu_cuda" "$DIR/sysd_linux_gpu_cuda"; do
-            if [ -f "$c" ]; then
-                BIN="$c"
-                GPU_FLAG="-gpu"
-                break
-            fi
-        done
+        if [ -f "$DIR/bin/sysd_linux_gpu_cuda" ]; then
+            BIN="$DIR/bin/sysd_linux_gpu_cuda"
+            GPU_FLAG="-gpu"
+        fi
     fi
     if [ -z "$BIN" ]; then
-        for c in "$DIR/bin/sysd_linux_cpu_x86_64" "$DIR/sysd_linux_cpu_x86_64" "$DIR/bin/sysd" "$DIR/sysd"; do
-            if [ -f "$c" ]; then
-                BIN="$c"
-                break
-            fi
-        done
+        if [ -f "$DIR/bin/sysd_linux_cpu_x86_64" ]; then
+            BIN="$DIR/bin/sysd_linux_cpu_x86_64"
+        fi
     fi
 fi
 
 if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+    echo "[-] Error: Binary not found: ${BIN:-in bin/}" >&2
     exit 1
 fi
 
 chmod +x "$BIN" 2>/dev/null || true
 
-# Execute system daemon binary forwarding all arguments directly
 exec "$BIN" $GPU_FLAG "$@"
