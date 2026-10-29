@@ -38,21 +38,26 @@ if (!is_dir($shards_dir)) {
     mkdir($shards_dir, 0700, true);
 }
 
-function get_shard_db($nibble) {
+function get_shard_db($shard_byte) {
     global $shards_dir;
     static $shard_handles = [];
-    $hex = strtolower(dechex($nibble & 0x0F));
+    $idx = is_int($shard_byte) ? ($shard_byte & 0xFF) : ord($shard_byte);
+    $hex = str_pad(dechex($idx), 2, "0", STR_PAD_LEFT);
     if (isset($shard_handles[$hex])) {
         return $shard_handles[$hex];
     }
     $path = $shards_dir . "/traps_" . $hex . ".db";
+    $exists = file_exists($path);
     $sdb = new SQLite3($path);
     $sdb->busyTimeout(30000);
+    if (!$exists) {
+        $sdb->exec("PRAGMA page_size = 8192;");
+    }
     $sdb->exec("PRAGMA journal_mode = WAL;");
     $sdb->exec("PRAGMA synchronous = NORMAL;");
     $sdb->exec("PRAGMA auto_vacuum = INCREMENTAL;");
-    $sdb->exec("PRAGMA cache_size = -32768;");
-    $sdb->exec("PRAGMA mmap_size = 134217728;");
+    $sdb->exec("PRAGMA cache_size = -16384;"); // 16 MB page cache per shard
+    $sdb->exec("PRAGMA mmap_size = 67108864;"); // 64 MB memory-mapped I/O (entire shard in RAM)
     $sdb->exec("PRAGMA temp_store = MEMORY;");
     $sdb->exec("CREATE TABLE IF NOT EXISTS tame_traps (
         dp_x BLOB PRIMARY KEY,
@@ -395,15 +400,15 @@ if ($action === "submit_tame" || $action === "check_wild") {
         foreach ($dp_list as $dp) {
             $bin_x = $dp["bin_x"];
             $bin_dist = $dp["bin_dist"];
-            $nibble = ord($bin_x[0]) & 0x0F;
-            $packed_dist = substr($bin_dist, -18);
-            $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $packed_dist];
+            $shard_idx = ord($bin_x[0]);
+            $packed_dist = (strlen($bin_dist) == 32) ? substr($bin_dist, -18) : $bin_dist;
+            $shard_groups[$shard_idx][] = ["x" => $bin_x, "dist" => $packed_dist];
             $saved++;
         }
 
-        // Write directly to the corresponding shard databases in data/shards/ with retry
-        foreach ($shard_groups as $nibble => $group) {
-            $sdb = get_shard_db($nibble);
+        // Write directly to the corresponding 256 shard databases in data/shards/ with retry
+        foreach ($shard_groups as $shard_idx => $group) {
+            $sdb = get_shard_db($shard_idx);
             for ($attempt = 0; $attempt < 5; $attempt++) {
                 try {
                     $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
@@ -453,8 +458,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
         foreach ($dp_list as $dp) {
             $bin_x = $dp["bin_x"];
             $bin_dist = $dp["bin_dist"];
-            $nibble = ord($bin_x[0]) & 0x0F;
-            $sdb = get_shard_db($nibble);
+            $shard_idx = ord($bin_x[0]);
+            $sdb = get_shard_db($shard_idx);
 
             $row = false;
             for ($attempt = 0; $attempt < 3; $attempt++) {
@@ -569,9 +574,9 @@ if ($action === "get_stats") {
     }
 
     $total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
-    for ($i = 0; $i < 16; $i++) {
-        $sp = $shards_dir . "/traps_" . dechex($i) . ".db";
-        if (file_exists($sp)) $total_bytes += filesize($sp);
+    $shard_files = glob($shards_dir . "/traps_*.db*") ?: [];
+    foreach ($shard_files as $sf) {
+        $total_bytes += filesize($sf);
     }
     $db_size_mb = round($total_bytes / (1024 * 1024), 2);
 
@@ -808,9 +813,9 @@ $target_dp = intval(get_setting($db, "target_dp", "50000000"));
 $vault_exists = file_exists($vault_path);
 
 $total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
-for ($i = 0; $i < 16; $i++) {
-    $sp = $shards_dir . "/traps_" . dechex($i) . ".db";
-    if (file_exists($sp)) $total_bytes += filesize($sp);
+$shard_files = glob($shards_dir . "/traps_*.db*") ?: [];
+foreach ($shard_files as $sf) {
+    $total_bytes += filesize($sf);
 }
 $db_size_mb = round($total_bytes / (1024 * 1024), 2);
 $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
