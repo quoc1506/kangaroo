@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <cmath>
 #include <random>
+#include <arpa/inet.h>
 
 #if defined(__linux__)
 #include <sys/prctl.h>
@@ -154,6 +155,58 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
         }
     }
     return readBuffer;
+static std::string HttpPostBinary(const std::string& url, const uint8_t *data, size_t len) {
+    CURL *curl = curl_easy_init();
+    std::string readBuffer;
+    if (curl) {
+        struct curl_slist *headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (const char*)data);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+            readBuffer.clear();
+        }
+    }
+    return readBuffer;
+}
+
+static void HexToBin32(const std::string &hex_str, uint8_t *out) {
+    std::string s;
+    for (char c : hex_str) {
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            s += c;
+        }
+    }
+    if (s.size() >= 2 && (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))) {
+        s = s.substr(2);
+    }
+    while (s.size() < 64) s = "0" + s;
+    if (s.size() > 64) s = s.substr(s.size() - 64);
+
+    for (int i = 0; i < 32; ++i) {
+        char h1 = s[i * 2];
+        char h2 = s[i * 2 + 1];
+        auto val = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return 0;
+        };
+        out[i] = (val(h1) << 4) | val(h2);
+    }
 }
 
 // Global runtime coordinator
@@ -879,9 +932,6 @@ int main(int argc, char **argv) {
                 }
             }
 
-            std::ostringstream ss;
-            ss << "{";
-            ss << "\"worker_id\":\"" << g_state.worker_id << "\",";
             std::string hw_info;
             if (g_state.use_gpu) {
                 hw_info = "NVIDIA CUDA GPU #" + std::to_string(g_state.gpu_device_id) + " (Active CUDA Kernel)";
@@ -891,19 +941,49 @@ int main(int argc, char **argv) {
             } else {
                 hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
             }
-            ss << "\"hardware\":\"" << hw_info << "\",";
-            ss << "\"hashrate\":\"" << std::fixed << std::setprecision(2) << hashrate_mhs << " MH/s\",";
-            ss << "\"count\":" << batch.size() << ",";
-            ss << "\"dp_list\":[";
-            for (size_t i = 0; i < batch.size(); ++i) {
-                if (i > 0) ss << ",";
-                ss << "{\"x\":\"" << batch[i].x_hex << "\",\"dist\":\"" << batch[i].dist_hex << "\"}";
+
+            std::string hr_str;
+            {
+                std::ostringstream hr_ss;
+                hr_ss << std::fixed << std::setprecision(2) << hashrate_mhs << " MH/s";
+                hr_str = hr_ss.str();
             }
-            ss << "]}";
+
+            // High-Performance Native Binary DPKG packet serialization (64 bytes/DP raw binary)
+            std::vector<uint8_t> packet;
+            packet.reserve(16 + g_state.worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
+
+            // Magic: "DPKG" (4 bytes)
+            packet.push_back('D'); packet.push_back('P'); packet.push_back('K'); packet.push_back('G');
+
+            uint16_t ver_be = htons(1);
+            packet.insert(packet.end(), (uint8_t*)&ver_be, (uint8_t*)&ver_be + 2);
+
+            uint16_t wid_len_be = htons((uint16_t)g_state.worker_id.size());
+            packet.insert(packet.end(), (uint8_t*)&wid_len_be, (uint8_t*)&wid_len_be + 2);
+            packet.insert(packet.end(), g_state.worker_id.begin(), g_state.worker_id.end());
+
+            uint16_t hw_len_be = htons((uint16_t)hw_info.size());
+            packet.insert(packet.end(), (uint8_t*)&hw_len_be, (uint8_t*)&hw_len_be + 2);
+            packet.insert(packet.end(), hw_info.begin(), hw_info.end());
+
+            uint16_t hr_len_be = htons((uint16_t)hr_str.size());
+            packet.insert(packet.end(), (uint8_t*)&hr_len_be, (uint8_t*)&hr_len_be + 2);
+            packet.insert(packet.end(), hr_str.begin(), hr_str.end());
+
+            uint32_t count_be = htonl((uint32_t)batch.size());
+            packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
+
+            uint8_t dp_buf[64];
+            for (size_t i = 0; i < batch.size(); ++i) {
+                HexToBin32(batch[i].x_hex, dp_buf);
+                HexToBin32(batch[i].dist_hex, dp_buf + 32);
+                packet.insert(packet.end(), dp_buf, dp_buf + 64);
+            }
 
             std::string action = is_wild_mode ? "check_wild" : "submit_tame";
             std::string submit_url = g_state.server_url + "?action=" + action;
-            std::string post_resp = HttpPostJson(submit_url, ss.str());
+            std::string post_resp = HttpPostBinary(submit_url, packet.data(), packet.size());
 
             // Network retry safeguard: If server unreachable or error, put DP batch back to avoid data loss
             if (post_resp.empty() || post_resp.find("\"status\"") == std::string::npos) {

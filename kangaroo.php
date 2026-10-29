@@ -50,6 +50,7 @@ function get_shard_db($nibble) {
     $sdb->busyTimeout(30000);
     $sdb->exec("PRAGMA journal_mode = WAL;");
     $sdb->exec("PRAGMA synchronous = NORMAL;");
+    $sdb->exec("PRAGMA auto_vacuum = INCREMENTAL;");
     $sdb->exec("PRAGMA cache_size = -32768;");
     $sdb->exec("PRAGMA mmap_size = 134217728;");
     $sdb->exec("PRAGMA temp_store = MEMORY;");
@@ -426,7 +427,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             if ($bin_x !== false && $bin_dist !== false) {
                 $nibble = ord($bin_x[0]) & 0x0F;
-                $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $bin_dist];
+                // Lossless optimization for Puzzle #140: W = 2^139 fits within 18 bytes (140 bits / 8 = 17.5 bytes)
+                // We strip the 14 leading 0x00 zero-bytes to save 14 bytes per record
+                $packed_dist = (strlen($bin_dist) == 32) ? substr($bin_dist, -18) : $bin_dist;
+                $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $packed_dist];
                 $saved++;
             }
         }
@@ -504,7 +508,11 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             if ($row) {
                 // COLLISION DETECTED!
-                $tame_dist_hex = bin2hex($row["total_distance"]);
+                $raw_tame_dist = $row["total_distance"];
+                if (strlen($raw_tame_dist) < 32) {
+                    $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
+                }
+                $tame_dist_hex = bin2hex($raw_tame_dist);
                 $wild_dist_hex = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
                 $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
 
