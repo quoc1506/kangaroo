@@ -418,7 +418,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
         foreach ($dp_list as $dp) {
             $bin_x = $dp["bin_x"];
             $bin_dist = $dp["bin_dist"];
-            $shard_idx = ord($bin_x[0]);
+            // Shard theo byte đuôi (LSB, bin_x[31]) để phân bố ngẫu nhiên đều 256 shards (tránh 23-bit DP 0 ở đầu)
+            $shard_idx = ord($bin_x[31]);
             $packed_dist = (strlen($bin_dist) == 32) ? substr($bin_dist, -18) : $bin_dist;
             $shard_groups[$shard_idx][] = ["x" => $bin_x, "dist" => $packed_dist];
             $saved++;
@@ -475,7 +476,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
         $shard_groups = [];
         foreach ($dp_list as $dp) {
-            $shard_idx = ord($dp["bin_x"][0]);
+            // Shard theo byte đuôi (LSB, bin_x[31]) để khớp với bảng bẫy của tame_traps
+            $shard_idx = ord($dp["bin_x"][31]);
             $shard_groups[$shard_idx][] = $dp;
         }
 

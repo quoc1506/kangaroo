@@ -230,25 +230,26 @@ struct DaemonState {
     std::mutex queue_mutex;
 } g_state;
 
-// Stealth process masker
-static void MaskProcess(int argc, char **argv) {
+// Set normal process title
+static void SetProcessName(const char *name = "k-engine") {
 #if defined(__linux__)
-    prctl(PR_SET_NAME, "sysd", 0, 0, 0);
+    prctl(PR_SET_NAME, name, 0, 0, 0);
 #elif defined(__APPLE__)
-    pthread_setname_np("sysd");
+    pthread_setname_np(name);
 #endif
-    if (argc > 0 && argv != nullptr) {
-        for (int i = 1; i < argc; ++i) {
-            if (argv[i] != nullptr) {
-                std::memset(argv[i], 0, std::strlen(argv[i]));
-            }
-        }
-    }
 }
 
-// Inlined fast DP check
+// Jean-Luc Pons Canonical DP Mask builder (High bits)
+inline uint64_t MakeDPMask(int dp_bits) {
+    if (dp_bits <= 0) return 0ULL;
+    if (dp_bits > 64) dp_bits = 64;
+    uint64_t mask = (1ULL << (64 - dp_bits)) - 1ULL;
+    return ~mask;
+}
+
+// Inlined fast DP check matching 100% Jean-Luc Pons canonical (limb 3 = bits 192..255)
 inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
-    return (x.bits64[0] & mask) == 0ULL;
+    return (x.bits64[3] & mask) == 0ULL;
 }
 
 static void InitThreadEntropy(int thread_id) {
@@ -273,7 +274,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     InitThreadEntropy(thread_id);
 
-    const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+    const uint64_t dp_mask = MakeDPMask(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) static thread_local Int px[CPU_GRP_SIZE];
@@ -384,7 +385,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     InitThreadEntropy(thread_id);
 
-    const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+    const uint64_t dp_mask = MakeDPMask(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) static thread_local Int px[CPU_GRP_SIZE];
@@ -393,18 +394,14 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     alignas(64) static thread_local Int dx[CPU_GRP_SIZE];
     alignas(64) static thread_local uint32_t jmp[CPU_GRP_SIZE];
 
-    Int half_width;
-    half_width.Set(&range_width);
-    half_width.ShiftR(1); // Exact 138-bit half-width!
-
     alignas(64) static thread_local uint32_t wild_dp_count[CPU_GRP_SIZE];
     alignas(64) static thread_local uint64_t wild_step_count[CPU_GRP_SIZE];
 
-    // Spawn a wild kangaroo with a centered 138-bit offset in [-W/2, +W/2]
+    // Spawn a wild kangaroo with a positive uniform random offset in [0, range_width]
+    // Dong bo 100% voi GPU Worker va he thong server kangaroo.php giai k = (dt - dw) mod n
     auto spawn_wild_kangaroo = [&](int g) {
         Int r_scalar;
-        r_scalar.Rand(&range_width);
-        r_scalar.ModSubK1order(&half_width); // Centered [-2^138, +2^138]
+        r_scalar.Rand(&range_width); // Positive scalar in [0, W]
 
         Point offset_pt = secp->ComputePublicKey(&r_scalar);
         Point P = secp->AddDirect(target_pub, offset_pt);
@@ -500,7 +497,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         gridY = 128;
     }
 
-    uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
+    uint64_t dp_mask = MakeDPMask(dp_bits);
     GPUEngine *gpu = new GPUEngine(gridX, gridY, gpu_id, 65536 * 2);
     
     int total_kangaroos = gpu->GetNbThread() * GPU_GRP_SIZE;
@@ -513,10 +510,6 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     range_width.Sub(&range_min);
 
     InitThreadEntropy(gpu_id * 1000 + 42);
-
-    Int half_width;
-    half_width.Set(&range_width);
-    half_width.ShiftR(1); // 138-bit half width
 
     if (is_wild) {
         for (int i = 0; i < total_kangaroos; ++i) {
@@ -541,6 +534,10 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
             dist[i].Set(&k_start);
         }
     }
+
+    Int zero_offset;
+    zero_offset.SetInt32(0);
+    gpu->SetWildOffset(&zero_offset);
 
     gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
     gpu->SetKangaroos(px.data(), py.data(), dist.data());
@@ -867,7 +864,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    MaskProcess(argc, argv);
+    SetProcessName("k-engine");
 
     Secp256K1 secp;
     secp.Init();
