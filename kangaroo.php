@@ -9,6 +9,11 @@ error_reporting(0);
 ini_set("display_errors", "0");
 date_default_timezone_set("UTC");
 
+@umask(0000);
+if (function_exists("posix_setrlimit")) {
+    @posix_setrlimit(POSIX_RLIMIT_NOFILE, 65535, 65535);
+}
+
 // Hỗ trợ cô lập nhiều hệ thống / đa puzzle trên cùng server:
 // Tách thư mục con riêng biệt theo INSTANCE_ID hoặc ?instance=, mặc định là puzzle140
 $instance_name = getenv("INSTANCE_ID") ?: ($_GET["instance"] ?? "puzzle140");
@@ -19,7 +24,8 @@ if (empty($instance_clean)) {
 
 $base_data_dir = __DIR__ . "/data";
 if (!is_dir($base_data_dir)) {
-    mkdir($base_data_dir, 0700, true);
+    @mkdir($base_data_dir, 0777, true);
+    @chmod($base_data_dir, 0777);
 }
 if (!file_exists($base_data_dir . "/.htaccess")) {
     file_put_contents($base_data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
@@ -27,7 +33,8 @@ if (!file_exists($base_data_dir . "/.htaccess")) {
 
 $data_dir = $base_data_dir . "/" . $instance_clean;
 if (!is_dir($data_dir)) {
-    mkdir($data_dir, 0700, true);
+    @mkdir($data_dir, 0777, true);
+    @chmod($data_dir, 0777);
 }
 
 $db_path = $data_dir . "/system_" . $instance_clean . ".db";
@@ -35,7 +42,8 @@ $vault_path = $data_dir . "/.solution_vault.dat";
 
 $shards_dir = $data_dir . "/shards";
 if (!is_dir($shards_dir)) {
-    mkdir($shards_dir, 0700, true);
+    @mkdir($shards_dir, 0777, true);
+    @chmod($shards_dir, 0777);
 }
 
 function get_shard_db($shard_byte) {
@@ -46,18 +54,28 @@ function get_shard_db($shard_byte) {
     if (isset($shard_handles[$hex])) {
         return $shard_handles[$hex];
     }
+    // Bể kết nối LRU: Giới hạn tối đa 24 shard mở đồng thời (tương đương ~72 file descriptors).
+    // Tự động giải phóng shard cũ nhất. Không bao giờ vượt qua giới hạn ulimit mặc định (1024) của bất kỳ VPS nào!
+    if (count($shard_handles) >= 24) {
+        $oldest_key = array_key_first($shard_handles);
+        $old_db = $shard_handles[$oldest_key];
+        @$old_db->close();
+        unset($shard_handles[$oldest_key]);
+    }
     $path = $shards_dir . "/traps_" . $hex . ".db";
     $exists = file_exists($path);
     $sdb = new SQLite3($path);
-    $sdb->busyTimeout(30000);
+    $sdb->busyTimeout(20000);
     if (!$exists) {
         $sdb->exec("PRAGMA page_size = 8192;");
+        @chmod($path, 0666);
     }
     $sdb->exec("PRAGMA journal_mode = WAL;");
     $sdb->exec("PRAGMA synchronous = NORMAL;");
     $sdb->exec("PRAGMA auto_vacuum = INCREMENTAL;");
-    $sdb->exec("PRAGMA cache_size = -16384;"); // 16 MB page cache per shard
-    $sdb->exec("PRAGMA mmap_size = 67108864;"); // 64 MB memory-mapped I/O (entire shard in RAM)
+    $sdb->exec("PRAGMA wal_autocheckpoint = 1000;"); // Tự động dọn sạch file WAL khi đạt 1000 trang (~8MB), không cần cronjob
+    $sdb->exec("PRAGMA cache_size = -4096;"); // 4 MB cache per active shard
+    $sdb->exec("PRAGMA mmap_size = 67108864;"); // 64 MB memory-mapped I/O
     $sdb->exec("PRAGMA temp_store = MEMORY;");
     $sdb->exec("CREATE TABLE IF NOT EXISTS tame_traps (
         dp_x BLOB PRIMARY KEY,
@@ -455,24 +473,30 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $range_max = get_setting($db, "range_max");
         $target_pubkey = get_setting($db, "target_pubkey");
 
+        $shard_groups = [];
         foreach ($dp_list as $dp) {
-            $bin_x = $dp["bin_x"];
-            $bin_dist = $dp["bin_dist"];
-            $shard_idx = ord($bin_x[0]);
-            $sdb = get_shard_db($shard_idx);
+            $shard_idx = ord($dp["bin_x"][0]);
+            $shard_groups[$shard_idx][] = $dp;
+        }
 
-            $row = false;
-            for ($attempt = 0; $attempt < 3; $attempt++) {
-                try {
-                    $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
-                    $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
-                    $sres = $schk->execute();
-                    $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
-                    break;
-                } catch (Exception $ex) {
-                    usleep(10000 * ($attempt + 1));
+        foreach ($shard_groups as $shard_idx => $group) {
+            $sdb = get_shard_db($shard_idx);
+            foreach ($group as $dp) {
+                $bin_x = $dp["bin_x"];
+                $bin_dist = $dp["bin_dist"];
+
+                $row = false;
+                for ($attempt = 0; $attempt < 3; $attempt++) {
+                    try {
+                        $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
+                        $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
+                        $sres = $schk->execute();
+                        $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
+                        break;
+                    } catch (Exception $ex) {
+                        usleep(10000 * ($attempt + 1));
+                    }
                 }
-            }
 
             if ($row) {
                 // COLLISION DETECTED!
@@ -520,6 +544,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 exit;
             }
         }
+    }
 
         echo json_encode(["status" => "CONTINUE", "stop" => false, "checked" => $batch_size]);
         exit;
