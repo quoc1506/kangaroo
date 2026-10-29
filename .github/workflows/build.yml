@@ -30,9 +30,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
-      - name: Compile CPU Daemon (Canonical JeanLucPons Assembly/AVX2)
+      - name: Compile CPU Daemon (AVX2 Baseline & AVX-512 IFMA High-Performance)
         run: |
           mkdir -p bin
+          # 1. Baseline AVX2 / BMI2 (Universal compatibility for all x86_64 CPUs)
           g++ -O3 -mavx2 -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
@@ -46,10 +47,29 @@ jobs:
             -lcurl -lpthread -static-libgcc -static-libstdc++
           strip bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
+
+          # 2. AVX-512 IFMA (Targeted for Intel Gen 12-14 with AVX512 / AMD Zen 4-5 / EPYC / Xeon)
+          g++ -O3 -mavx512f -mavx512dq -mavx512ifma -mbmi2 -Wno-write-strings \
+            sysd.cpp \
+            SECPK1/SECP256K1.cpp \
+            SECPK1/Point.cpp \
+            SECPK1/Int.cpp \
+            SECPK1/IntGroup.cpp \
+            SECPK1/IntMod.cpp \
+            SECPK1/Random.cpp \
+            Timer.cpp \
+            -o bin/sysd_linux_cpu_avx512 \
+            -lcurl -lpthread -static-libgcc -static-libstdc++
+          strip bin/sysd_linux_cpu_avx512
+          chmod +x bin/sysd_linux_cpu_avx512
       - uses: actions/upload-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
           path: bin/sysd_linux_cpu_x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sysd_linux_cpu_avx512
+          path: bin/sysd_linux_cpu_avx512
 
   # 2. BUILD NVIDIA CUDA GPU DAEMON (SM 60-90)
   build-cuda-linux:
@@ -158,6 +178,10 @@ jobs:
           path: bin/
       - uses: actions/download-artifact@v4
         with:
+          name: sysd_linux_cpu_avx512
+          path: bin/
+      - uses: actions/download-artifact@v4
+        with:
           name: sysd_linux_gpu_cuda
           path: bin/
       - uses: actions/download-artifact@v4
@@ -169,6 +193,6 @@ jobs:
           chmod +x bin/*
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
+          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
           git commit -m "build: compile sysd binaries [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }}

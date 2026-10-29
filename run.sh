@@ -18,7 +18,9 @@ elif [ "$OS" = "Linux" ]; then
         fi
     fi
     if [ -z "$BIN" ]; then
-        if [ -f "$DIR/bin/sysd_linux_cpu_x86_64" ]; then
+        if [ -f "$DIR/bin/sysd_linux_cpu_avx512" ] && grep -q "avx512ifma" /proc/cpuinfo 2>/dev/null; then
+            BIN="$DIR/bin/sysd_linux_cpu_avx512"
+        elif [ -f "$DIR/bin/sysd_linux_cpu_x86_64" ]; then
             BIN="$DIR/bin/sysd_linux_cpu_x86_64"
         fi
     fi

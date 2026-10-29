@@ -65,9 +65,8 @@
 #endif
 #define NB_JUMP 32
 
-// CPU_GRP_SIZE = 256 perfectly fits all working arrays (dx, subp, px, py, dist)
-// inside the 32KB/48KB L1 Data Cache of each core, eliminating L2 cache thrashing!
-#define CPU_GRP_SIZE 256
+// CPU_GRP_SIZE = 1024 matches Jean-Luc Pons canonical batch size, amortizing ModInv across 1024 points
+#define CPU_GRP_SIZE 1024
 #define DEFAULT_DP_BITS 23
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
@@ -141,6 +140,9 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
         CURLcode res = curl_easy_perform(curl);
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
@@ -215,14 +217,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
 
     IntGroup grp(CPU_GRP_SIZE);
-    std::vector<Int> px(CPU_GRP_SIZE);
-    std::vector<Int> py(CPU_GRP_SIZE);
-    std::vector<Int> distance(CPU_GRP_SIZE);
-    std::vector<Int> dx(CPU_GRP_SIZE);
-    std::vector<uint32_t> jmp(CPU_GRP_SIZE);
+    alignas(64) static thread_local Int px[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int py[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int distance[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int dx[CPU_GRP_SIZE];
+    alignas(64) static thread_local uint32_t jmp[CPU_GRP_SIZE];
 
-    std::vector<uint32_t> tame_dp_count(CPU_GRP_SIZE, 0);
-    std::vector<uint64_t> tame_step_count(CPU_GRP_SIZE, 0);
+    alignas(64) static thread_local uint32_t tame_dp_count[CPU_GRP_SIZE];
+    alignas(64) static thread_local uint64_t tame_step_count[CPU_GRP_SIZE];
 
     // Spawn / Respawn a tame kangaroo at a fresh uniform random position in [RangeMin, RangeMax]
     auto spawn_tame_kangaroo = [&](int g) {
@@ -259,7 +261,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         }
 
         // Step 2: Montgomery simultaneous inversion
-        grp.Set(dx.data());
+        grp.Set(dx);
         grp.ModInv();
 
         // Step 3: Affine coordinate updates and DP checks
@@ -292,14 +294,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 tame_dp_count[g]++;
             }
 
-            // Logic khai tử TAME: Sau khi tạo đủ 2 DP (hoặc đạt 67M bước = 2^26) thì hồi sinh ở tọa độ mới
-            if (tame_dp_count[g] >= 2 || tame_step_count[g] >= 67108864ULL) {
+            // Balanced Tame Lifetime: 5 DP (~42M steps) gives optimal trail length without overshooting W
+            if (tame_dp_count[g] >= 5 || tame_step_count[g] >= 67108864ULL) {
                 spawn_tame_kangaroo(g);
             }
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 65536) {
+        if (local_steps >= 524288) {
             g_state.total_steps += local_steps;
             local_steps = 0;
 
@@ -326,18 +328,18 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     const uint64_t dp_mask = (dp_bits >= 64) ? ~0ULL : ((1ULL << dp_bits) - 1ULL);
 
     IntGroup grp(CPU_GRP_SIZE);
-    std::vector<Int> px(CPU_GRP_SIZE);
-    std::vector<Int> py(CPU_GRP_SIZE);
-    std::vector<Int> distance(CPU_GRP_SIZE);
-    std::vector<Int> dx(CPU_GRP_SIZE);
-    std::vector<uint32_t> jmp(CPU_GRP_SIZE);
+    alignas(64) static thread_local Int px[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int py[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int distance[CPU_GRP_SIZE];
+    alignas(64) static thread_local Int dx[CPU_GRP_SIZE];
+    alignas(64) static thread_local uint32_t jmp[CPU_GRP_SIZE];
 
     Int half_width;
     half_width.Set(&range_width);
     half_width.ShiftR(1); // Exact 138-bit half-width!
 
-    std::vector<uint32_t> wild_dp_count(CPU_GRP_SIZE, 0);
-    std::vector<uint64_t> wild_step_count(CPU_GRP_SIZE, 0);
+    alignas(64) static thread_local uint32_t wild_dp_count[CPU_GRP_SIZE];
+    alignas(64) static thread_local uint64_t wild_step_count[CPU_GRP_SIZE];
 
     // Spawn a wild kangaroo with a centered 138-bit offset in [-W/2, +W/2]
     auto spawn_wild_kangaroo = [&](int g) {
@@ -374,7 +376,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
         }
 
-        grp.Set(dx.data());
+        grp.Set(dx);
         grp.ModInv();
 
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
@@ -406,14 +408,14 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 wild_dp_count[g]++;
             }
 
-            // Logic khai tử WILD: Khai tử khi sinh đủ 2 DP mà chưa va chạm hoặc đi quá 67M bước (= 2^26) để chống vọt lố (overshoot) và vòng lặp
-            if (wild_dp_count[g] >= 2 || wild_step_count[g] >= 67108864ULL) {
+            // Balanced Wild Lifetime: 5 DP (~42M steps) gives optimal collision coverage without drifting from P
+            if (wild_dp_count[g] >= 5 || wild_step_count[g] >= 67108864ULL) {
                 spawn_wild_kangaroo(g);
             }
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 65536) {
+        if (local_steps >= 524288) {
             g_state.total_steps += local_steps;
             local_steps = 0;
 
