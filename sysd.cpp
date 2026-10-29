@@ -28,7 +28,11 @@
 #include <unordered_map>
 #include <cmath>
 #include <random>
+#if defined(_WIN32)
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/prctl.h>
@@ -155,6 +159,8 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
         }
     }
     return readBuffer;
+}
+
 static std::string HttpPostBinary(const std::string& url, const uint8_t *data, size_t len) {
     CURL *curl = curl_easy_init();
     std::string readBuffer;
