@@ -991,11 +991,24 @@ int main(int argc, char **argv) {
             std::string submit_url = g_state.server_url + "?action=" + action;
             std::string post_resp = HttpPostBinary(submit_url, packet.data(), packet.size());
 
-            // Network retry safeguard: If server unreachable or error, put DP batch back to avoid data loss
-            if (post_resp.empty() || post_resp.find("\"status\"") == std::string::npos) {
-                if (!batch.empty()) {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+            // Network retry safeguard: Differentiate transient network drop vs permanent server error
+            bool success = (!post_resp.empty() && (post_resp.find("\"status\":\"OK\"") != std::string::npos ||
+                                                   post_resp.find("\"status\":\"CONTINUE\"") != std::string::npos ||
+                                                   post_resp.find("\"BINGO\"") != std::string::npos));
+            if (!success) {
+                // If server explicitly returned an ERROR (format rejected / invalid payload), DO NOT retry
+                // to prevent infinite retry storm and memory leak (poison-pill packet)
+                if (!post_resp.empty() && post_resp.find("\"status\":\"ERROR\"") != std::string::npos) {
+                    std::cerr << "[-] Server permanently rejected batch: " << post_resp
+                              << " - Dropping batch to avoid infinite loop.\n";
+                } else {
+                    // Transient network failure (timeout / unreachable): retry with safety cap (max 5,000 DPs in queue)
+                    if (!batch.empty()) {
+                        std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                        if (g_state.dp_queue.size() < 5000) {
+                            g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+                        }
+                    }
                 }
             }
 

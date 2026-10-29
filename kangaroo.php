@@ -292,32 +292,6 @@ function parse_incoming_dp_payload() {
         }
     }
 
-    $json = json_decode($raw, true);
-    if ($json && isset($json["dp_list"]) && is_array($json["dp_list"])) {
-        $dps = [];
-        foreach ($json["dp_list"] as $item) {
-            if (empty($item["x"]) || empty($item["dist"])) continue;
-            $x_clean = str_pad(preg_replace("/^0[xX]/", "", trim($item["x"])), 64, "0", STR_PAD_LEFT);
-            $dist_clean = str_pad(preg_replace("/^0[xX]/", "", trim($item["dist"])), 64, "0", STR_PAD_LEFT);
-            $bx = hex2bin($x_clean);
-            $bdist = hex2bin($dist_clean);
-            if ($bx !== false && $bdist !== false) {
-                $dps[] = [
-                    "bin_x" => $bx,
-                    "bin_dist" => $bdist,
-                    "x" => $x_clean,
-                    "dist" => $dist_clean
-                ];
-            }
-        }
-        return [
-            "protocol" => "JSON_STANDARD",
-            "worker_id" => isset($json["worker_id"]) ? $json["worker_id"] : "node_worker",
-            "hardware" => isset($json["hardware"]) ? $json["hardware"] : "Node",
-            "hashrate" => isset($json["hashrate"]) ? $json["hashrate"] : "0.00 MH/s",
-            "dp_list" => $dps
-        ];
-    }
     return null;
 }
 
@@ -419,20 +393,12 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $shard_groups = [];
 
         foreach ($dp_list as $dp) {
-            if (empty($dp["x"]) || empty($dp["dist"])) continue;
-            $x_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["x"])), 64, "0", STR_PAD_LEFT);
-            $dist_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
-            $bin_x = isset($dp["bin_x"]) ? $dp["bin_x"] : hex2bin($x_clean);
-            $bin_dist = isset($dp["bin_dist"]) ? $dp["bin_dist"] : hex2bin($dist_clean);
-
-            if ($bin_x !== false && $bin_dist !== false) {
-                $nibble = ord($bin_x[0]) & 0x0F;
-                // Lossless optimization for Puzzle #140: W = 2^139 fits within 18 bytes (140 bits / 8 = 17.5 bytes)
-                // We strip the 14 leading 0x00 zero-bytes to save 14 bytes per record
-                $packed_dist = (strlen($bin_dist) == 32) ? substr($bin_dist, -18) : $bin_dist;
-                $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $packed_dist];
-                $saved++;
-            }
+            $bin_x = $dp["bin_x"];
+            $bin_dist = $dp["bin_dist"];
+            $nibble = ord($bin_x[0]) & 0x0F;
+            $packed_dist = substr($bin_dist, -18);
+            $shard_groups[$nibble][] = ["x" => $bin_x, "dist" => $packed_dist];
+            $saved++;
         }
 
         // Write directly to the corresponding shard databases in data/shards/ with retry
@@ -485,11 +451,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $target_pubkey = get_setting($db, "target_pubkey");
 
         foreach ($dp_list as $dp) {
-            if (empty($dp["x"]) || empty($dp["dist"])) continue;
-            $x_clean = str_pad(preg_replace('/^0[xX]/', '', trim($dp["x"])), 64, "0", STR_PAD_LEFT);
-            $bin_x = hex2bin($x_clean);
-            if ($bin_x === false) continue;
-
+            $bin_x = $dp["bin_x"];
+            $bin_dist = $dp["bin_dist"];
             $nibble = ord($bin_x[0]) & 0x0F;
             $sdb = get_shard_db($nibble);
 
@@ -513,7 +476,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
                 }
                 $tame_dist_hex = bin2hex($raw_tame_dist);
-                $wild_dist_hex = str_pad(preg_replace('/^0[xX]/', '', trim($dp["dist"])), 64, "0", STR_PAD_LEFT);
+                $wild_dist_hex = bin2hex($bin_dist);
                 $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
 
                 // Verification check: ensure pubkey matches target_pubkey
