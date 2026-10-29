@@ -803,11 +803,16 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
 }
 
 // Web Dashboard
-$total_traps = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+$total_traps = intval(get_setting($db, "total_tame_traps", "0"));
 $target_dp = intval(get_setting($db, "target_dp", "50000000"));
 $vault_exists = file_exists($vault_path);
-$db_size_bytes = file_exists($db_path) ? filesize($db_path) : 0;
-$db_size_mb = round($db_size_bytes / (1024 * 1024), 2);
+
+$total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
+for ($i = 0; $i < 16; $i++) {
+    $sp = $shards_dir . "/traps_" . dechex($i) . ".db";
+    if (file_exists($sp)) $total_bytes += filesize($sp);
+}
+$db_size_mb = round($total_bytes / (1024 * 1024), 2);
 $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
 $prob_info = calculate_hit_probability($total_traps, $wild_steps);
 
