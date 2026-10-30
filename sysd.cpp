@@ -470,6 +470,12 @@ inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
     return (x.bits64[3] & mask) == 0ULL;
 }
 
+inline uint64_t ComputeMaxKangarooSteps(int dp_bits) {
+    if (dp_bits <= 21) return 67108864ULL;
+    if (dp_bits >= 58) return ~0ULL;
+    return (1ULL << (dp_bits + 5));
+}
+
 // TAME Worker Thread (CPU - L1 Cache Aligned Montgomery Walk)
 static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Int range_min, Int range_max) {
     Int range_width(&range_max);
@@ -479,6 +485,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     const uint64_t rng_salt = (uint64_t)thread_id * 7919ULL + 0x517CC1B727220A95ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) static thread_local Int px[CPU_GRP_SIZE];
@@ -563,7 +570,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 tame_dp_count[g]++;
             }
 
-            if (tame_dp_count[g] >= 5 || tame_step_count[g] >= 67108864ULL) {
+            if (tame_dp_count[g] >= 5 || tame_step_count[g] >= max_kangaroo_steps) {
                 spawn_tame_kangaroo(g);
             }
         }
@@ -601,6 +608,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     const uint64_t rng_salt = (uint64_t)thread_id * 104729ULL + 0x9E3779B97F4A7C15ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) static thread_local Int px[CPU_GRP_SIZE];
@@ -690,7 +698,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 wild_dp_count[g]++;
             }
 
-            if (wild_dp_count[g] >= 5 || wild_step_count[g] >= 67108864ULL) {
+            if (wild_dp_count[g] >= 5 || wild_step_count[g] >= max_kangaroo_steps) {
                 spawn_wild_kangaroo(g);
             }
         }
@@ -715,8 +723,8 @@ struct GpuStagedRespawn {
     Int new_base;
 };
 
-// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn)
-static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
+// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Parallel Montgomery Init + Staged Respawn)
+static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
     cudaError_t dev_err = cudaSetDevice(gpu_id);
     if (dev_err != cudaSuccess) {
         std::cerr << "[-] Fatal GPU #" << gpu_id << ": cudaSetDevice failed: " << cudaGetErrorString(dev_err) << "\n";
@@ -784,27 +792,31 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
 
     const uint64_t rng_salt = (uint64_t)gpu_id * 100003ULL + 0x243F6A8885A308D3ULL;
 
-    auto make_kangaroo_state = [&](Point &out_p, Int &out_base) {
+    auto make_kangaroo_state = [&](Point &out_p, Int &out_base, uint64_t salt_val) {
+        Int loc_span(&spawn_span);
+        Int loc_min(&range_min);
+        Int loc_whalf(&w_half);
+        Point loc_tshift(target_shifted);
         while (true) {
             if (is_wild) {
                 Int r_scalar;
-                ThreadRandRange(r_scalar, spawn_span, rng_salt);
+                ThreadRandRange(r_scalar, loc_span, salt_val);
                 Point P;
                 if (r_scalar.IsZero()) {
-                    P = target_shifted;
+                    P = loc_tshift;
                 } else {
                     Point offset_pt = secp->ComputePublicKey(&r_scalar);
-                    P = SafeAddAffine(secp, target_shifted, offset_pt);
+                    P = SafeAddAffine(secp, loc_tshift, offset_pt);
                 }
                 if (P.isZero()) continue;
                 out_p = P;
                 out_base.Set(&r_scalar);
-                out_base.ModSubK1order(&w_half);
+                out_base.ModSubK1order(&loc_whalf);
                 return;
             } else {
                 Int k_start;
-                ThreadRandRange(k_start, spawn_span, rng_salt);
-                k_start.Add(&range_min);
+                ThreadRandRange(k_start, loc_span, salt_val);
+                k_start.Add(&loc_min);
                 if (k_start.IsZero()) continue;
                 Point P = secp->ComputePublicKey(&k_start);
                 if (P.isZero()) continue;
@@ -815,12 +827,163 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         }
     };
 
-    for (int i = 0; i < total_kangaroos; ++i) {
-        Point P;
-        make_kangaroo_state(P, base_dist[i]);
-        px[i].Set(&P.x);
-        py[i].Set(&P.y);
-        zero_dists[i].SetInt32(0);
+    auto init_kangaroo_range = [&](int start_idx, int end_idx, uint64_t thread_salt) {
+        constexpr int INIT_BATCH = 256;
+        IntGroup grp(INIT_BATCH);
+        Int scalars[INIT_BATCH];
+        Point pts[INIT_BATCH];
+        Int inv_buf[INIT_BATCH];
+        bool special[INIT_BATCH];
+
+        Int loc_span(&spawn_span);
+        Int loc_min(&range_min);
+        Int loc_whalf(&w_half);
+        Point loc_tshift(target_shifted);
+        Int dy, rx, ry, _s, _p;
+
+        int pos = start_idx;
+        while (pos < end_idx) {
+            if (!g_state.worker_active.load()) return;
+            if (end_idx - pos < INIT_BATCH) {
+                for (int i = pos; i < end_idx; ++i) {
+                    Point P;
+                    make_kangaroo_state(P, base_dist[i], thread_salt);
+                    px[i].Set(&P.x);
+                    py[i].Set(&P.y);
+                    zero_dists[i].SetInt32(0);
+                }
+                break;
+            }
+
+            for (int b = 0; b < INIT_BATCH; ++b) {
+                while (true) {
+                    ThreadRandRange(scalars[b], loc_span, thread_salt);
+                    if (!is_wild) {
+                        scalars[b].Add(&loc_min);
+                        if (scalars[b].IsZero()) continue;
+                    }
+                    if (scalars[b].IsZero()) {
+                        pts[b].Clear();
+                        inv_buf[b].SetInt32(1);
+                        break;
+                    }
+                    pts[b] = secp->ComputePublicKey(&scalars[b], false);
+                    if (pts[b].z.IsZero()) continue;
+                    inv_buf[b].Set(&pts[b].z);
+                    break;
+                }
+            }
+
+            grp.Set(inv_buf);
+            grp.ModInv();
+
+            for (int b = 0; b < INIT_BATCH; ++b) {
+                if (!pts[b].z.IsZero()) {
+                    pts[b].x.ModMulK1(&inv_buf[b]);
+                    pts[b].y.ModMulK1(&inv_buf[b]);
+                    pts[b].z.SetInt32(1);
+                }
+            }
+
+            if (!is_wild) {
+                for (int b = 0; b < INIT_BATCH; ++b) {
+                    int idx = pos + b;
+                    if (pts[b].isZero()) {
+                        Point P;
+                        make_kangaroo_state(P, base_dist[idx], thread_salt);
+                        px[idx].Set(&P.x);
+                        py[idx].Set(&P.y);
+                    } else {
+                        px[idx].Set(&pts[b].x);
+                        py[idx].Set(&pts[b].y);
+                        base_dist[idx].Set(&scalars[b]);
+                    }
+                    zero_dists[idx].SetInt32(0);
+                }
+            } else {
+                for (int b = 0; b < INIT_BATCH; ++b) {
+                    if (loc_tshift.isZero() || pts[b].isZero() || loc_tshift.x.IsEqual(&pts[b].x)) {
+                        special[b] = true;
+                        inv_buf[b].SetInt32(1);
+                    } else {
+                        special[b] = false;
+                        inv_buf[b].ModSub(&pts[b].x, &loc_tshift.x);
+                    }
+                }
+
+                grp.Set(inv_buf);
+                grp.ModInv();
+
+                for (int b = 0; b < INIT_BATCH; ++b) {
+                    int idx = pos + b;
+                    if (special[b]) {
+                        Point P = SafeAddAffine(secp, loc_tshift, pts[b]);
+                        if (P.isZero()) {
+                            make_kangaroo_state(P, base_dist[idx], thread_salt);
+                        } else {
+                            base_dist[idx].Set(&scalars[b]);
+                            base_dist[idx].ModSubK1order(&loc_whalf);
+                        }
+                        px[idx].Set(&P.x);
+                        py[idx].Set(&P.y);
+                    } else {
+                        dy.ModSub(&pts[b].y, &loc_tshift.y);
+                        _s.ModMulK1(&dy, &inv_buf[b]);
+                        _p.ModSquareK1(&_s);
+                        rx.ModSub(&_p, &loc_tshift.x);
+                        rx.ModSub(&pts[b].x);
+                        ry.ModSub(&pts[b].x, &rx);
+                        ry.ModMulK1(&_s);
+                        ry.ModSub(&pts[b].y);
+
+                        px[idx].Set(&rx);
+                        py[idx].Set(&ry);
+                        base_dist[idx].Set(&scalars[b]);
+                        base_dist[idx].ModSubK1order(&loc_whalf);
+                    }
+                    zero_dists[idx].SetInt32(0);
+                }
+            }
+
+            pos += INIT_BATCH;
+        }
+    };
+
+    unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    unsigned int gpu_div = (unsigned int)std::max<size_t>(1, active_gpu_count);
+    unsigned int init_threads = (total_kangaroos < 16384)
+        ? 1u
+        : std::max(1u, std::min(16u, hw_threads / gpu_div));
+
+    if (init_threads <= 1u) {
+        init_kangaroo_range(0, total_kangaroos, rng_salt);
+    } else {
+        std::vector<std::thread> init_pool;
+        init_pool.reserve(init_threads);
+        int base_chunk = total_kangaroos / (int)init_threads;
+        int rem = total_kangaroos % (int)init_threads;
+        int cur = 0;
+        for (unsigned int t = 0; t < init_threads; ++t) {
+            int len = base_chunk + ((int)t < rem ? 1 : 0);
+            if (len > 0) {
+                int s_idx = cur;
+                int e_idx = cur + len;
+                uint64_t t_salt = rng_salt ^ ((uint64_t)(t + 1) * 0x9E3779B97F4A7C15ULL);
+                init_pool.emplace_back([&init_kangaroo_range, s_idx, e_idx, t_salt]() {
+                    init_kangaroo_range(s_idx, e_idx, t_salt);
+                });
+                cur += len;
+            }
+        }
+        for (size_t t = 0; t < init_pool.size(); ++t) {
+            if (init_pool[t].joinable()) init_pool[t].join();
+        }
+    }
+
+    if (!g_state.worker_active.load()) {
+        cudaDeviceSynchronize();
+        delete gpu;
+        return;
     }
 
     Int zero_offset;
@@ -829,7 +992,12 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
 
     gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
     gpu->SetKangaroos(px.data(), py.data(), zero_dists.data());
-    gpu->callKernel();
+    if (!gpu->callKernel()) {
+        std::cerr << "[-] Fatal GPU #" << gpu_id << ": Initial CUDA kernel launch failed\n";
+        cudaDeviceSynchronize();
+        delete gpu;
+        std::exit(1);
+    }
 
     std::vector<ITEM> gpu_found;
     std::vector<GpuStagedRespawn> staged_respawns;
@@ -841,6 +1009,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         gpu_found.clear();
         if (!gpu->Launch(gpu_found)) {
             std::cerr << "[-] Fatal GPU #" << gpu_id << ": CUDA kernel execution failed\n";
+            cudaDeviceSynchronize();
             delete gpu;
             std::exit(1);
         }
@@ -893,7 +1062,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
                 uint64_t kIdx = respawn_indices[idx];
                 Point new_P;
                 Int new_base;
-                make_kangaroo_state(new_P, new_base);
+                make_kangaroo_state(new_P, new_base, rng_salt);
                 gpu->SetKangaroo(kIdx, &new_P.x, &new_P.y, &zero_int);
                 GpuStagedRespawn sr;
                 sr.kIdx = kIdx;
@@ -903,6 +1072,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         }
     }
 
+    cudaDeviceSynchronize();
     delete gpu;
 }
 #endif
@@ -1090,7 +1260,7 @@ static int RunKangarooSession(
 #ifdef USE_CUDA
         if (g_state.use_gpu) {
             for (size_t g = 0; g < active_gpus.size(); ++g) {
-                workers.emplace_back(WorkerGpuThread, active_gpus[g], secp, &jt, active_dp_bits, wild_mode, range_min, range_max, target_pub);
+                workers.emplace_back(WorkerGpuThread, active_gpus[g], active_gpus.size(), secp, &jt, active_dp_bits, wild_mode, range_min, range_max, target_pub);
             }
         }
 #endif
