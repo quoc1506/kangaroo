@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # 1. BUILD CPU DAEMON (Ubuntu 22.04 with AVX2/BMI2 & AVX-512 IFMA)
   build-cpu-linux:
@@ -17,13 +21,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Ensure JeanLucPons/Kangaroo core files are present
         run: |
-          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ]; then
-            echo "SECPK1/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ] || [ ! -f "Constants.h" ]; then
             git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
             cp -rf /tmp/upstream_kangaroo/SECPK1 .
             cp -rf /tmp/upstream_kangaroo/GPU .
-            cp -f /tmp/upstream_kangaroo/Timer.* .
-            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
+            cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
       - name: Install build tools & libraries
@@ -33,7 +36,6 @@ jobs:
       - name: Compile CPU Daemon (AVX2 Baseline & AVX-512 IFMA High-Performance)
         run: |
           mkdir -p bin
-          # 1. Baseline AVX2 / BMI2 (Universal compatibility for all x86_64 CPUs)
           g++ -std=c++17 -O3 -mavx2 -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
@@ -48,7 +50,6 @@ jobs:
           strip bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
 
-          # 2. AVX-512 IFMA (Targeted for Intel Gen 12-14 with AVX512 / AMD Zen 4-5 / EPYC / Xeon)
           g++ -std=c++17 -O3 -mavx512f -mavx512dq -mavx512ifma -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
@@ -79,13 +80,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Ensure JeanLucPons/Kangaroo core files are present
         run: |
-          if [ ! -d "SECPK1" ] || [ ! -d "GPU" ] || [ ! -f "Timer.cpp" ]; then
-            echo "SECPK1/GPU/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+          if [ ! -d "SECPK1" ] || [ ! -d "GPU" ] || [ ! -f "Timer.cpp" ] || [ ! -f "Constants.h" ]; then
             git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
             cp -rf /tmp/upstream_kangaroo/SECPK1 .
             cp -rf /tmp/upstream_kangaroo/GPU .
-            cp -f /tmp/upstream_kangaroo/Timer.* .
-            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
+            cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
       - name: Install CUDA Toolkit
@@ -114,12 +114,14 @@ jobs:
             -o bin/sysd_linux_gpu_cuda \
             -lcurl -lpthread \
             -gencode arch=compute_60,code=sm_60 \
+            -gencode arch=compute_61,code=sm_61 \
             -gencode arch=compute_70,code=sm_70 \
             -gencode arch=compute_75,code=sm_75 \
             -gencode arch=compute_80,code=sm_80 \
             -gencode arch=compute_86,code=sm_86 \
             -gencode arch=compute_89,code=sm_89 \
-            -gencode arch=compute_90,code=sm_90
+            -gencode arch=compute_90,code=sm_90 \
+            -gencode arch=compute_90,code=compute_90
           strip bin/sysd_linux_gpu_cuda
           chmod +x bin/sysd_linux_gpu_cuda
       - uses: actions/upload-artifact@v4
@@ -127,21 +129,20 @@ jobs:
           name: sysd_linux_gpu_cuda
           path: bin/sysd_linux_gpu_cuda
 
-  # 3. BUILD MACOS UNIVERSAL DAEMON
+  # 3. BUILD MACOS DAEMON
   build-macos:
-    name: Build macOS Universal Daemon
+    name: Build macOS Daemon
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Ensure JeanLucPons/Kangaroo core files are present
         run: |
-          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ]; then
-            echo "SECPK1/Timer not found in repo. Cloning canonical files from JeanLucPons/Kangaroo..."
+          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ] || [ ! -f "Constants.h" ]; then
             git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
             cp -rf /tmp/upstream_kangaroo/SECPK1 .
             cp -rf /tmp/upstream_kangaroo/GPU .
-            cp -f /tmp/upstream_kangaroo/Timer.* .
-            cp -f /tmp/upstream_kangaroo/Constants.h . 2>/dev/null || true
+            cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
+            cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
       - name: Compile on macOS
@@ -190,9 +191,14 @@ jobs:
           path: bin/
       - name: Commit and push binaries to branch
         run: |
-          chmod +x bin/*
+          chmod +x bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
-          git commit -m "build: compile sysd binaries [skip ci]" || echo "No changes to commit"
-          git push origin HEAD:${{ github.ref_name }}
+          if ! git diff --quiet -- bin/; then
+            git commit -m "build: compile sysd binaries [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }}
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No binary changes to commit"
+          fi

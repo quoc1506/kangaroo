@@ -1,50 +1,55 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN=""
 OS="$(uname -s)"
+BIN=""
 GPU_FLAG=""
 
 HAS_GPU_ARG=0
+FORCE_CPU=0
+ARGS=()
+
 for arg in "$@"; do
     if [ "$arg" = "-gpu" ]; then
         HAS_GPU_ARG=1
-        break
+        ARGS+=("$arg")
+    elif [ "$arg" = "--cpu-only" ]; then
+        FORCE_CPU=1
+    else
+        ARGS+=("$arg")
     fi
 done
 
 if [ "$OS" = "Darwin" ]; then
-    if [ -f "$DIR/bin/sysd_darwin_all" ]; then
-        BIN="$DIR/bin/sysd_darwin_all"
-    fi
+    BIN="$DIR/bin/sysd_darwin_all"
 elif [ "$OS" = "Linux" ]; then
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        if [ -f "$DIR/bin/sysd_linux_gpu_cuda" ]; then
-            BIN="$DIR/bin/sysd_linux_gpu_cuda"
-            if [ "$HAS_GPU_ARG" -eq 0 ]; then
-                GPU_FLAG="-gpu"
-            fi
+    if [ "$FORCE_CPU" -eq 0 ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        BIN="$DIR/bin/sysd_linux_gpu_cuda"
+        if [ "$HAS_GPU_ARG" -eq 0 ]; then
+            GPU_FLAG="-gpu"
         fi
+    elif grep -q "avx512ifma" /proc/cpuinfo; then
+        BIN="$DIR/bin/sysd_linux_cpu_avx512"
+    else
+        BIN="$DIR/bin/sysd_linux_cpu_x86_64"
     fi
-    if [ -z "$BIN" ]; then
-        if [ -f "$DIR/bin/sysd_linux_cpu_avx512" ] && grep -q "avx512ifma" /proc/cpuinfo 2>/dev/null; then
-            BIN="$DIR/bin/sysd_linux_cpu_avx512"
-        elif [ -f "$DIR/bin/sysd_linux_cpu_x86_64" ]; then
-            BIN="$DIR/bin/sysd_linux_cpu_x86_64"
-        fi
-    fi
-fi
-
-if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-    echo "[-] Error: Binary not found: ${BIN:-in bin/}" >&2
+else
+    echo "[-] Fatal: Unsupported operating system: $OS" >&2
     exit 1
 fi
 
-chmod +x "$BIN" 2>/dev/null || true
+if [ ! -f "$BIN" ]; then
+    echo "[-] Fatal: Required binary missing for detected hardware: $BIN" >&2
+    exit 1
+fi
+
+if [ ! -x "$BIN" ]; then
+    chmod +x "$BIN"
+fi
 
 if [ -n "$GPU_FLAG" ]; then
-    exec "$BIN" "$GPU_FLAG" "$@"
+    exec "$BIN" "$GPU_FLAG" ${ARGS[@]+"${ARGS[@]}"}
 else
-    exec "$BIN" "$@"
+    exec "$BIN" ${ARGS[@]+"${ARGS[@]}"}
 fi

@@ -1,13 +1,13 @@
 /**
- * Distributed Compute Engine Daemon (sysd) - Optimized High-Performance Edition
+ * Distributed Compute Engine Daemon (sysd) - Strict Zero-Fallback Edition
  * Core Cryptography: Jean-Luc Pons Canonical Kangaroo Engine (JeanLucPons/Kangaroo)
- * Features:
- *  - 100% Native Secp256k1 & BigInt from Jean-Luc Pons library (SECP256k1.h, Int.h, Point.h)
+ * Architecture:
+ *  - 100% Native Secp256k1 & BigInt public API (SECP256k1.h, Int.h, Point.h, IntGroup.h)
  *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 1024)
  *  - Full Native Multi-GPU CUDA execution with 256-bit host base-distance & staged respawn
  *  - Symmetric [-W/2, +W/2] Wild Kangaroo seeding (zero upper-bound blind spot, 75% avg overlap)
- *  - Lock-free thread_local 256-bit seeded MT19937_64 PRNG (zero cross-thread race conditions)
- *  - Dynamic Master-Worker task sync, bidirectional TAME <-> WILD switching & chunked DPKG batches
+ *  - Strict /dev/urandom 256-bit thread_local PRNG + pure rejection sampling (zero bias)
+ *  - Strict Master Coordinator task sync, lossless in-place retry & bidirectional TAME <-> WILD
  */
 
 #include <iostream>
@@ -28,6 +28,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <csignal>
 #if defined(_WIN32)
 #include <winsock2.h>
 #else
@@ -40,7 +41,7 @@
 #include <pthread.h>
 #endif
 
-// Compatibility fixes for macOS Clang without touching SECPK1 library
+// Compatibility definitions for macOS Clang without modifying upstream SECPK1 headers
 #if defined(__clang__) || defined(__APPLE__)
 #ifndef __rdtsc
 #define __rdtsc pons_rdtsc
@@ -73,19 +74,50 @@
 #define NB_JUMP 32
 
 #define CPU_GRP_SIZE 1024
-#define DEFAULT_DP_BITS 23
-#define DEFAULT_BATCH_LIMIT 1000
-#define MAX_RETRY_QUEUE_DPS 20000
-#define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
-#define RANGE_MIN_HEX "80000000000000000000000000000000000"
-#define RANGE_MAX_HEX "fffffffffffffffffffffffffffffffffff"
+#define MAX_QUEUE_DPS 100000
 
 struct DPRecord {
     std::string x_hex;
     std::string dist_hex;
 };
 
-// Safe affine point addition handling infinity, doubling, and inverse points
+struct HttpResult {
+    CURLcode curl_code = CURLE_FAILED_INIT;
+    long http_code = 0;
+    std::string body;
+};
+
+struct DaemonState {
+    std::string server_url = DEFAULT_SERVER_URL;
+    std::string worker_id = "node_worker";
+    int num_threads = 0;
+    bool verify_mode = false;
+    bool use_gpu = false;
+    std::vector<int> gpu_device_ids;
+    std::atomic<bool> running{true};
+    std::atomic<bool> worker_active{true};
+    std::atomic<bool> stop_signal{false};
+    std::atomic<uint64_t> total_steps{0};
+    std::atomic<uint64_t> total_dp{0};
+    std::vector<DPRecord> dp_queue;
+    std::mutex queue_mutex;
+} g_state;
+
+static void HandleStopSignal(int) {
+    g_state.stop_signal = true;
+    g_state.worker_active = false;
+    g_state.running = false;
+}
+
+static void SetProcessName(const char *name = "k-engine") {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#endif
+}
+
+// Affine point addition handling identity, doubling, and inverse points cleanly
 static Point SafeAddAffine(Secp256K1 *secp, Point &p1, Point &p2) {
     if (p1.isZero()) return p2;
     if (p2.isZero()) return p1;
@@ -100,27 +132,24 @@ static Point SafeAddAffine(Secp256K1 *secp, Point &p1, Point &p2) {
     return secp->AddDirect(p1, p2);
 }
 
-// Lock-free per-thread 256-bit seeded MT19937_64 PRNG (eliminates SECPK1/Random.cpp global state races)
+// Strict 256-bit OS CSPRNG (/dev/urandom) seeded thread_local MT19937_64 (zero RNG fallback)
 static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
     static thread_local bool initialized = false;
     static thread_local std::mt19937_64 rng;
     if (!initialized) {
         uint32_t seed_words[8] = {0};
-        bool urand_ok = false;
         std::ifstream urand("/dev/urandom", std::ios::binary);
-        if (urand.is_open()) {
-            urand.read(reinterpret_cast<char*>(seed_words), sizeof(seed_words));
-            if (urand.gcount() == (std::streamsize)sizeof(seed_words)) {
-                urand_ok = true;
-            }
-            urand.close();
+        if (!urand.is_open()) {
+            std::cerr << "[-] Fatal: Cannot open /dev/urandom for 256-bit CSPRNG seeding\n";
+            std::exit(1);
         }
-        if (!urand_ok) {
-            std::random_device rd;
-            for (int i = 0; i < 8; ++i) {
-                seed_words[i] = rd();
-            }
+        urand.read(reinterpret_cast<char*>(seed_words), sizeof(seed_words));
+        if (urand.gcount() != (std::streamsize)sizeof(seed_words)) {
+            std::cerr << "[-] Fatal: Incomplete entropy read from /dev/urandom\n";
+            std::exit(1);
         }
+        urand.close();
+
         uint64_t clk = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
         uint64_t tid_h = (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
         uint64_t pid_v = (uint64_t)getpid();
@@ -131,6 +160,7 @@ static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
         seed_words[4] ^= (uint32_t)(salt & 0xFFFFFFFFULL);
         seed_words[5] ^= (uint32_t)(salt >> 32);
         seed_words[6] ^= (uint32_t)(pid_v * 2654435761ULL);
+
         std::seed_seq seq(seed_words, seed_words + 8);
         rng.seed(seq);
         initialized = true;
@@ -138,26 +168,28 @@ static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
     return rng;
 }
 
-// Uniform unbiased random Int in [0, max_inclusive] via rejection sampling
+// Mathematically unbiased rejection sampling in [0, max_inclusive] (zero modulo bias)
 static void ThreadRandRange(Int &out, Int &max_inclusive, uint64_t salt = 0) {
-    out.CLEAR();
-    if (max_inclusive.IsZero() || max_inclusive.IsNegative()) {
+    if (max_inclusive.IsNegative()) {
+        std::cerr << "[-] Fatal: ThreadRandRange called with negative upper bound\n";
+        std::exit(1);
+    }
+    out.SetInt32(0);
+    if (max_inclusive.IsZero()) {
         return;
     }
     int bit_len = max_inclusive.GetBitLength();
-    if (bit_len <= 0) {
-        return;
-    }
-    if (bit_len > 256) {
-        bit_len = 256;
+    if (bit_len <= 0 || bit_len > 256) {
+        std::cerr << "[-] Fatal: Invalid bit_len in ThreadRandRange\n";
+        std::exit(1);
     }
     int full_qwords = bit_len / 64;
     int rem_bits = bit_len % 64;
     uint64_t top_mask = (rem_bits > 0) ? ((1ULL << rem_bits) - 1ULL) : 0ULL;
 
     std::mt19937_64 &rng = GetThreadRng(salt);
-    for (int attempt = 0; attempt < 128; ++attempt) {
-        out.CLEAR();
+    while (true) {
+        out.SetInt32(0);
         for (int q = 0; q < full_qwords && q < 4; ++q) {
             out.bits64[q] = rng();
         }
@@ -168,7 +200,6 @@ static void ThreadRandRange(Int &out, Int &max_inclusive, uint64_t salt = 0) {
             return;
         }
     }
-    out.Mod(&max_inclusive);
 }
 
 class JumpTable {
@@ -180,9 +211,10 @@ public:
 
     void init(Secp256K1 *secp, Int &range_width) {
         int w_bits = range_width.GetBitLength();
-        if (w_bits <= 0) w_bits = 139;
-        // Với Puzzle #140 (w_bits = 139): max_bit = 72, min_bit = 57 -> E[d] = 2^68.58 ~ 0.5 * sqrt(W)
-        // Đồng thời tự động co giãn chuẩn xác cho mọi puzzle khác từ server và vừa khít 128-bit jD trên GPU
+        if (w_bits <= 0) {
+            std::cerr << "[-] Fatal: JumpTable::init requires positive range_width\n";
+            std::exit(1);
+        }
         int max_bit = (w_bits + 5) / 2;
         if (max_bit > 120) max_bit = 120;
         if (max_bit < 16) max_bit = 16;
@@ -190,13 +222,13 @@ public:
         int min_bit = (max_bit > span) ? (max_bit - span) : 1;
 
         for (int i = 0; i < NB_JUMP; ++i) {
-            d[i].CLEAR();
+            d[i].SetInt32(0);
             int bit = min_bit + (i * (max_bit - min_bit)) / (NB_JUMP - 1);
             int qword_idx = bit / 64;
             int bit_rem = bit % 64;
             uint64_t val = (1ULL << bit_rem);
             d[i].SetQWord(qword_idx, val);
-            if (i > 0) d[i].bits64[0] |= 1ULL; // Odd step to break parity loops
+            if (i > 0) d[i].bits64[0] |= 1ULL;
             J[i] = secp->ComputePublicKey(&d[i]);
             Jx[i].Set(&J[i].x);
             Jy[i].Set(&J[i].y);
@@ -214,138 +246,195 @@ static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void 
     return size * nmemb;
 }
 
-static std::string HttpGet(const std::string &url) {
+static HttpResult HttpGet(const std::string &url) {
+    HttpResult out;
     CURL *curl = curl_easy_init();
-    std::string readBuffer;
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        CURLcode res = curl_easy_perform(curl);
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        curl_easy_cleanup(curl);
-        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
-            readBuffer.clear();
-        }
+    if (!curl) {
+        return out;
     }
-    return readBuffer;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    out.curl_code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
+    curl_easy_cleanup(curl);
+    return out;
 }
 
-static std::string HttpPostJson(const std::string &url, const std::string &json_str) {
+static HttpResult HttpPostJson(const std::string &url, const std::string &json_str) {
+    HttpResult out;
     CURL *curl = curl_easy_init();
-    std::string readBuffer;
-    if (curl) {
-        struct curl_slist *headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
-        CURLcode res = curl_easy_perform(curl);
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
-            readBuffer.clear();
-        }
+    if (!curl) {
+        return out;
     }
-    return readBuffer;
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+    out.curl_code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return out;
 }
 
-static std::string HttpPostBinary(const std::string &url, const uint8_t *data, size_t len) {
+static HttpResult HttpPostBinary(const std::string &url, const uint8_t *data, size_t len) {
+    HttpResult out;
     CURL *curl = curl_easy_init();
-    std::string readBuffer;
-    if (curl) {
-        struct curl_slist *headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (const char*)data);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
-        CURLcode res = curl_easy_perform(curl);
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
-            readBuffer.clear();
+    if (!curl) {
+        return out;
+    }
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (const char*)data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+    out.curl_code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+static bool NormalizeHex(const std::string &raw, std::string &out_hex) {
+    size_t start = 0;
+    size_t end = raw.size();
+    while (start < end && (raw[start] == ' ' || raw[start] == '\t' || raw[start] == '\r' || raw[start] == '\n' || raw[start] == '\"')) {
+        start++;
+    }
+    while (end > start && (raw[end - 1] == ' ' || raw[end - 1] == '\t' || raw[end - 1] == '\r' || raw[end - 1] == '\n' || raw[end - 1] == '\"')) {
+        end--;
+    }
+    if (end - start >= 2 && raw[start] == '0' && (raw[start + 1] == 'x' || raw[start + 1] == 'X')) {
+        start += 2;
+    }
+    if (start >= end) {
+        return false;
+    }
+    std::string clean;
+    clean.reserve(end - start);
+    for (size_t i = start; i < end; ++i) {
+        char c = raw[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            clean += c;
+        } else {
+            return false;
         }
     }
-    return readBuffer;
+    out_hex = clean;
+    return !out_hex.empty();
+}
+
+static bool ParseStrictInt(const std::string &s, long &out_val) {
+    if (s.empty()) return false;
+    char *endptr = nullptr;
+    long val = std::strtol(s.c_str(), &endptr, 10);
+    if (endptr == s.c_str() || *endptr != '\0') {
+        return false;
+    }
+    out_val = val;
+    return true;
 }
 
 static void HexToBin32(const std::string &hex_str, uint8_t *out) {
-    size_t start_idx = 0;
-    while (start_idx < hex_str.size() && (hex_str[start_idx] == ' ' || hex_str[start_idx] == '\t')) {
-        start_idx++;
+    std::string clean;
+    if (!NormalizeHex(hex_str, clean) || clean.size() > 64) {
+        std::cerr << "[-] Fatal: Invalid 256-bit hex in HexToBin32\n";
+        std::exit(1);
     }
-    if (start_idx + 2 <= hex_str.size() && hex_str[start_idx] == '0' &&
-        (hex_str[start_idx + 1] == 'x' || hex_str[start_idx + 1] == 'X')) {
-        start_idx += 2;
+    if (clean.size() < 64) {
+        clean.insert(0, 64 - clean.size(), '0');
     }
-
-    std::string s;
-    s.reserve(64);
-    for (size_t i = start_idx; i < hex_str.size(); ++i) {
-        char c = hex_str[i];
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-            s += c;
-        }
-    }
-    if (s.size() < 64) {
-        s.insert(0, 64 - s.size(), '0');
-    } else if (s.size() > 64) {
-        s = s.substr(s.size() - 64);
-    }
-
+    auto nibble = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+        if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+        return (uint8_t)(c - 'A' + 10);
+    };
     for (int i = 0; i < 32; ++i) {
-        char h1 = s[i * 2];
-        char h2 = s[i * 2 + 1];
-        auto val = [](char c) -> uint8_t {
-            if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-            if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
-            if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
-            return 0;
-        };
-        out[i] = (uint8_t)((val(h1) << 4) | val(h2));
+        out[i] = (uint8_t)((nibble(clean[i * 2]) << 4) | nibble(clean[i * 2 + 1]));
     }
 }
 
-struct DaemonState {
-    std::string server_url = DEFAULT_SERVER_URL;
-    std::string worker_id = "node_worker";
-    int num_threads = 0;
-    bool verify_mode = false;
-    bool use_gpu = false;
-    std::vector<int> gpu_device_ids;
-    std::atomic<bool> running{true};
-    std::atomic<uint64_t> total_steps{0};
-    std::atomic<uint64_t> total_dp{0};
-    std::vector<DPRecord> dp_queue;
-    std::mutex queue_mutex;
-} g_state;
+static std::vector<uint8_t> BuildDpkgPacket(
+    const std::string &worker_id,
+    const std::string &hw_info,
+    const std::string &hr_str,
+    const std::vector<DPRecord> &batch
+) {
+    std::vector<uint8_t> packet;
+    packet.reserve(16 + worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
 
-static void SetProcessName(const char *name = "k-engine") {
-#if defined(__linux__)
-    prctl(PR_SET_NAME, name, 0, 0, 0);
-#elif defined(__APPLE__)
-    pthread_setname_np(name);
-#endif
+    packet.push_back('D');
+    packet.push_back('P');
+    packet.push_back('K');
+    packet.push_back('G');
+
+    uint16_t ver_be = htons(1);
+    packet.insert(packet.end(), (uint8_t*)&ver_be, (uint8_t*)&ver_be + 2);
+
+    uint16_t wid_len_be = htons((uint16_t)worker_id.size());
+    packet.insert(packet.end(), (uint8_t*)&wid_len_be, (uint8_t*)&wid_len_be + 2);
+    packet.insert(packet.end(), worker_id.begin(), worker_id.end());
+
+    uint16_t hw_len_be = htons((uint16_t)hw_info.size());
+    packet.insert(packet.end(), (uint8_t*)&hw_len_be, (uint8_t*)&hw_len_be + 2);
+    packet.insert(packet.end(), hw_info.begin(), hw_info.end());
+
+    uint16_t hr_len_be = htons((uint16_t)hr_str.size());
+    packet.insert(packet.end(), (uint8_t*)&hr_len_be, (uint8_t*)&hr_len_be + 2);
+    packet.insert(packet.end(), hr_str.begin(), hr_str.end());
+
+    uint32_t count_be = htonl((uint32_t)batch.size());
+    packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
+
+    uint8_t dp_buf[64];
+    for (size_t i = 0; i < batch.size(); ++i) {
+        HexToBin32(batch[i].x_hex, dp_buf);
+        HexToBin32(batch[i].dist_hex, dp_buf + 32);
+        packet.insert(packet.end(), dp_buf, dp_buf + 64);
+    }
+    return packet;
+}
+
+static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
+    if (local_recs.empty()) return;
+    while (g_state.worker_active.load()) {
+        {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            if (g_state.dp_queue.size() < MAX_QUEUE_DPS) {
+                for (size_t idx = 0; idx < local_recs.size(); ++idx) {
+                    g_state.dp_queue.push_back(std::move(local_recs[idx]));
+                    g_state.total_dp++;
+                }
+                local_recs.clear();
+                return;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    // Even if worker_active just turned false (phase switch or shutdown), preserve collected DPs
+    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+    for (size_t idx = 0; idx < local_recs.size(); ++idx) {
+        g_state.dp_queue.push_back(std::move(local_recs[idx]));
+        g_state.total_dp++;
+    }
+    local_recs.clear();
 }
 
 inline uint64_t MakeDPMask(int dp_bits) {
@@ -378,7 +467,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     alignas(64) static thread_local uint64_t tame_step_count[CPU_GRP_SIZE];
 
     auto spawn_tame_kangaroo = [&](int g) {
-        for (int retry = 0; retry < 16; ++retry) {
+        while (true) {
             Int k_start;
             ThreadRandRange(k_start, range_width, rng_salt);
             k_start.Add(&range_min);
@@ -408,10 +497,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     uint64_t local_steps = 0;
     std::vector<DPRecord> local_dp_buffer;
 
-    while (g_state.running) {
+    while (g_state.worker_active.load()) {
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
+            if (dx[g].IsZero()) {
+                jmp[g] = (jmp[g] + 1) & (NB_JUMP - 1);
+                dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
+            }
         }
 
         grp.Set(dx);
@@ -455,17 +548,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         if (local_steps >= 262144) {
             g_state.total_steps += local_steps;
             local_steps = 0;
-
-            if (!local_dp_buffer.empty()) {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                for (size_t idx = 0; idx < local_dp_buffer.size(); ++idx) {
-                    g_state.dp_queue.push_back(std::move(local_dp_buffer[idx]));
-                    g_state.total_dp++;
-                }
-                local_dp_buffer.clear();
-            }
+            EnqueueWithBackpressure(local_dp_buffer);
         }
     }
+
+    if (local_steps > 0) {
+        g_state.total_steps += local_steps;
+    }
+    EnqueueWithBackpressure(local_dp_buffer);
 }
 
 // WILD Worker Thread (CPU - Symmetric [-W/2, +W/2] Centered Offset, Zero Blind Spots)
@@ -496,9 +586,8 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     alignas(64) static thread_local uint32_t wild_dp_count[CPU_GRP_SIZE];
     alignas(64) static thread_local uint64_t wild_step_count[CPU_GRP_SIZE];
 
-    // Dịch tâm đối xứng [-W/2, +W/2]: P = (Q - W/2 * G) + r_scalar * G, D_W = (r_scalar - W/2) mod n
     auto spawn_wild_kangaroo = [&](int g) {
-        for (int retry = 0; retry < 16; ++retry) {
+        while (true) {
             Int r_scalar;
             ThreadRandRange(r_scalar, range_width, rng_salt);
 
@@ -533,10 +622,14 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     uint64_t local_steps = 0;
     std::vector<DPRecord> local_dp_buffer;
 
-    while (g_state.running) {
+    while (g_state.worker_active.load()) {
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
+            if (dx[g].IsZero()) {
+                jmp[g] = (jmp[g] + 1) & (NB_JUMP - 1);
+                dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
+            }
         }
 
         grp.Set(dx);
@@ -580,17 +673,14 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         if (local_steps >= 262144) {
             g_state.total_steps += local_steps;
             local_steps = 0;
-
-            if (!local_dp_buffer.empty()) {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                for (size_t idx = 0; idx < local_dp_buffer.size(); ++idx) {
-                    g_state.dp_queue.push_back(std::move(local_dp_buffer[idx]));
-                    g_state.total_dp++;
-                }
-                local_dp_buffer.clear();
-            }
+            EnqueueWithBackpressure(local_dp_buffer);
         }
     }
+
+    if (local_steps > 0) {
+        g_state.total_steps += local_steps;
+    }
+    EnqueueWithBackpressure(local_dp_buffer);
 }
 
 #ifdef USE_CUDA
@@ -599,28 +689,45 @@ struct GpuStagedRespawn {
     Int new_base;
 };
 
-// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn + Centered Wild)
+// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn + Zero Fallbacks)
 static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
     cudaError_t dev_err = cudaSetDevice(gpu_id);
     if (dev_err != cudaSuccess) {
-        std::cerr << "[-] GPU #" << gpu_id << ": cudaSetDevice failed: " << cudaGetErrorString(dev_err) << "\n";
-        return;
+        std::cerr << "[-] Fatal GPU #" << gpu_id << ": cudaSetDevice failed: " << cudaGetErrorString(dev_err) << "\n";
+        std::exit(1);
     }
 
     int gridX = 0, gridY = 0;
-    if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY)) {
-        std::cerr << "[-] GPU #" << gpu_id << ": Cannot get grid size, falling back to 256x128\n";
-        gridX = 256;
-        gridY = 128;
+    if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY) || gridX <= 0 || gridY <= 0) {
+        std::cerr << "[-] Fatal GPU #" << gpu_id << ": GPUEngine::GetGridSize failed\n";
+        std::exit(1);
     }
 
+    size_t free_vram = 0, total_vram = 0;
+    cudaError_t mem_err = cudaMemGetInfo(&free_vram, &total_vram);
+    if (mem_err != cudaSuccess || free_vram == 0) {
+        std::cerr << "[-] Fatal GPU #" << gpu_id << ": cudaMemGetInfo failed: " << cudaGetErrorString(mem_err) << "\n";
+        std::exit(1);
+    }
+
+    const uint32_t max_found_cfg = 65536 * 2;
+    while (gridX > 16) {
+        size_t est_bytes = (size_t)gridX * (size_t)gridY * (size_t)GPU_GRP_SIZE * 11ULL * 8ULL +
+                           (size_t)max_found_cfg * 56ULL + (32ULL << 20);
+        if (est_bytes <= (free_vram * 85ULL) / 100ULL) break;
+        gridX /= 2;
+    }
+
+    cudaGetLastError();
     uint64_t dp_mask = MakeDPMask(dp_bits);
-    GPUEngine *gpu = new GPUEngine(gridX, gridY, gpu_id, 65536 * 2);
+    GPUEngine *gpu = new GPUEngine(gridX, gridY, gpu_id, max_found_cfg);
+    cudaError_t init_err = cudaGetLastError();
 
     int total_kangaroos = gpu->GetNbThread() * GPU_GRP_SIZE;
-    if (total_kangaroos <= 0) {
+    if (init_err != cudaSuccess || gpu->deviceName.empty() || total_kangaroos <= 0) {
+        std::cerr << "[-] Fatal GPU #" << gpu_id << ": GPUEngine initialization failed: " << cudaGetErrorString(init_err) << "\n";
         delete gpu;
-        return;
+        std::exit(1);
     }
 
     std::vector<Int> px(total_kangaroos);
@@ -645,7 +752,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     const uint64_t rng_salt = (uint64_t)gpu_id * 100003ULL + 0x243F6A8885A308D3ULL;
 
     auto make_kangaroo_state = [&](Point &out_p, Int &out_base) {
-        for (int retry = 0; retry < 16; ++retry) {
+        while (true) {
             if (is_wild) {
                 Int r_scalar;
                 ThreadRandRange(r_scalar, range_width, rng_salt);
@@ -688,7 +795,6 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     gpu->SetWildOffset(&zero_offset);
 
     gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
-    // Truyền dist = 0 xuống GPU (128-bit Add128 chỉ đếm quãng đường nhảy thêm < 2^95, không bao giờ mất bit cao!)
     gpu->SetKangaroos(px.data(), py.data(), zero_dists.data());
     gpu->callKernel();
 
@@ -698,11 +804,12 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     Int zero_int;
     zero_int.SetInt32(0);
 
-    while (g_state.running) {
+    while (g_state.worker_active.load()) {
         gpu_found.clear();
         if (!gpu->Launch(gpu_found)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            std::cerr << "[-] Fatal GPU #" << gpu_id << ": CUDA kernel execution failed\n";
+            delete gpu;
+            std::exit(1);
         }
 
         uint64_t batch_steps = (uint64_t)total_kangaroos * NB_RUN;
@@ -720,7 +827,6 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
                     continue;
                 }
 
-                // Khôi phục khoảng cách đầy đủ 256-bit: real_dist = (base_dist[kIdx] + item.d) mod n
                 Int real_dist(&base_dist[item.kIdx]);
                 Int d_walk((Int*)&item.d);
                 real_dist.ModAddK1order(&d_walk);
@@ -731,22 +837,15 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
                 local_recs.push_back(std::move(rec));
 
                 gpu_dp_count[item.kIdx]++;
-                if (gpu_dp_count[item.kIdx] >= 5) {
+                if (gpu_dp_count[item.kIdx] >= 5 && respawn_indices.size() < 64) {
                     gpu_dp_count[item.kIdx] = 0;
                     respawn_indices.push_back(item.kIdx);
                 }
             }
 
-            if (!local_recs.empty()) {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                for (size_t idx = 0; idx < local_recs.size(); ++idx) {
-                    g_state.dp_queue.push_back(std::move(local_recs[idx]));
-                    g_state.total_dp++;
-                }
-            }
+            EnqueueWithBackpressure(local_recs);
         }
 
-        // Áp dụng base_dist mới từ chu kỳ trước (khớp chính xác với kernel vừa chạy)
         if (!staged_respawns.empty()) {
             for (size_t idx = 0; idx < staged_respawns.size(); ++idx) {
                 uint64_t kIdx = staged_respawns[idx].kIdx;
@@ -756,7 +855,6 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
             staged_respawns.clear();
         }
 
-        // Đẩy kangaroo mới lên Stream 0 (sẽ chạy ở chu kỳ kế tiếp sau kernel hiện tại)
         if (!respawn_indices.empty()) {
             for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
                 uint64_t kIdx = respawn_indices[idx];
@@ -799,27 +897,6 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
         end++;
     }
     return json.substr(pos, end - pos);
-}
-
-static std::string CleanHex(std::string s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n' || s.front() == '\"')) {
-        s.erase(s.begin());
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n' || s.back() == '\"')) {
-        s.pop_back();
-    }
-    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        s = s.substr(2);
-    }
-    std::string clean;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-            clean += c;
-        }
-    }
-    if (clean.empty()) clean = "0";
-    return clean;
 }
 
 static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const Int &r_min, const Int &r_max, Int &solved_key) {
@@ -967,7 +1044,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     return false;
 }
 
-static void RunVerification(Secp256K1 *secp) {
+static int RunVerification(Secp256K1 *secp) {
     std::cout << "========================================================\n";
     std::cout << "[*] Canonical Pollard's Kangaroo Cryptographic Engine Verification\n";
     std::cout << "========================================================\n";
@@ -978,12 +1055,18 @@ static void RunVerification(Secp256K1 *secp) {
     Point p1 = secp->ComputePublicKey(&privOne);
     Point p2 = secp->ComputePublicKey(&privTwo);
     Point p1_doubled = secp->DoubleDirect(p1);
-    if (p2.equals(p1_doubled)) {
-        std::cout << "[+] Point doubling 2*G = 2G verification: [PASS]\n";
+    if (!p2.equals(p1_doubled)) {
+        std::cerr << "[-] Point doubling 2*G = 2G verification failed\n";
+        return 1;
     }
+    std::cout << "[+] Point doubling 2*G = 2G verification: [PASS]\n";
 
     std::string catalog_url = BuildApiUrl(g_state.server_url, "action=verify");
-    std::string catalog_resp = HttpGet(catalog_url);
+    HttpResult catalog_res = HttpGet(catalog_url);
+    if (catalog_res.curl_code != CURLE_OK || catalog_res.http_code != 200 || catalog_res.body.empty()) {
+        std::cerr << "[-] Failed to retrieve verification catalog from server\n";
+        return 1;
+    }
 
     struct TestPuzzleItem {
         int id = 0;
@@ -994,36 +1077,42 @@ static void RunVerification(Secp256K1 *secp) {
     };
     std::vector<TestPuzzleItem> catalog;
 
-    size_t p_pos = catalog_resp.find("\"puzzles\"");
+    size_t p_pos = catalog_res.body.find("\"puzzles\"");
     if (p_pos != std::string::npos) {
-        size_t cur = catalog_resp.find('{', p_pos + 9);
+        size_t cur = catalog_res.body.find('{', p_pos + 9);
         while (cur != std::string::npos) {
-            size_t end_obj = catalog_resp.find('}', cur);
+            size_t end_obj = catalog_res.body.find('}', cur);
             if (end_obj == std::string::npos) break;
-            std::string item = catalog_resp.substr(cur, end_obj - cur + 1);
+            std::string item = catalog_res.body.substr(cur, end_obj - cur + 1);
             TestPuzzleItem tp;
-            std::string id_str = ExtractJsonField(item, "id");
-            if (!id_str.empty()) tp.id = std::atoi(id_str.c_str());
-            std::string bits_str = ExtractJsonField(item, "bits");
-            if (!bits_str.empty()) tp.bits = std::atoi(bits_str.c_str());
-            tp.min_hex = CleanHex(ExtractJsonField(item, "min"));
-            tp.max_hex = CleanHex(ExtractJsonField(item, "max"));
-            tp.pub_hex = CleanHex(ExtractJsonField(item, "pub"));
-            if (tp.id > 0) catalog.push_back(tp);
-            cur = catalog_resp.find('{', end_obj);
+            long id_v = 0, bits_v = 0;
+            if (ParseStrictInt(ExtractJsonField(item, "id"), id_v) &&
+                ParseStrictInt(ExtractJsonField(item, "bits"), bits_v) &&
+                NormalizeHex(ExtractJsonField(item, "min"), tp.min_hex) &&
+                NormalizeHex(ExtractJsonField(item, "max"), tp.max_hex) &&
+                NormalizeHex(ExtractJsonField(item, "pub"), tp.pub_hex) &&
+                id_v > 0) {
+                tp.id = (int)id_v;
+                tp.bits = (int)bits_v;
+                catalog.push_back(tp);
+            }
+            cur = catalog_res.body.find('{', end_obj);
         }
+    }
+
+    if (catalog.empty()) {
+        std::cerr << "[-] Verification catalog is empty or malformed\n";
+        return 1;
     }
 
     int solved_count = 0;
     for (size_t idx = 0; idx < catalog.size(); ++idx) {
         const TestPuzzleItem &puzzle = catalog[idx];
-        int p_id = puzzle.id;
         Point target_Q;
         bool is_compressed = false;
-        bool valid_pub = (!puzzle.pub_hex.empty() && secp->ParsePublicKeyHex(puzzle.pub_hex, target_Q, is_compressed));
-        if (!valid_pub) {
-            std::cout << "  - Puzzle #" << p_id << ": [SKIP - Invalid PubKey]\n";
-            continue;
+        if (!secp->ParsePublicKeyHex(puzzle.pub_hex, target_Q, is_compressed) || target_Q.isZero()) {
+            std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Invalid PubKey]\n";
+            return 1;
         }
 
         Int r_min, r_max;
@@ -1033,42 +1122,97 @@ static void RunVerification(Secp256K1 *secp) {
         Int solved_key;
         if (SolveKangarooEngine(secp, target_Q, r_min, r_max, solved_key)) {
             std::string sub_url = BuildApiUrl(g_state.server_url, "action=verify");
-            std::string sub_body = "{\"id\":" + std::to_string(p_id) + ",\"solved_key\":\"" + solved_key.GetBase16() + "\"}";
-            std::string sub_resp = HttpPostJson(sub_url, sub_body);
-            if (sub_resp.find("\"PASS\"") != std::string::npos) {
+            std::string sub_body = "{\"id\":" + std::to_string(puzzle.id) + ",\"solved_key\":\"" + solved_key.GetBase16() + "\"}";
+            HttpResult sub_res = HttpPostJson(sub_url, sub_body);
+            if (sub_res.curl_code == CURLE_OK && sub_res.http_code == 200 &&
+                ExtractJsonField(sub_res.body, "status") == "PASS") {
                 solved_count++;
-                std::cout << "  - Puzzle #" << p_id << ": [PASS]\n";
+                std::cout << "  - Puzzle #" << puzzle.id << ": [PASS]\n";
             } else {
-                std::cout << "  - Puzzle #" << p_id << ": [FAIL - Rejected]\n";
+                std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Server Rejected]\n";
+                return 1;
             }
         } else {
-            std::cout << "  - Puzzle #" << p_id << ": [FAIL - Solver Missed]\n";
+            std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Solver Missed]\n";
+            return 1;
         }
     }
     std::cout << "[+] Verified: " << solved_count << "/" << catalog.size() << " puzzles passed.\n";
+    return (solved_count == (int)catalog.size()) ? 0 : 1;
+}
+
+static bool SendBatchReliable(
+    bool is_wild_mode,
+    const std::string &hw_info,
+    const std::string &hr_str,
+    const std::vector<DPRecord> &batch,
+    std::string &out_resp_body,
+    bool allow_retry_until_stopped
+) {
+    std::vector<uint8_t> packet = BuildDpkgPacket(g_state.worker_id, hw_info, hr_str, batch);
+    std::string action = is_wild_mode ? "check_wild" : "submit_tame";
+    std::string submit_url = BuildApiUrl(g_state.server_url, "action=" + action);
+
+    while (true) {
+        HttpResult res = HttpPostBinary(submit_url, packet.data(), packet.size());
+        if (res.curl_code == CURLE_OK && res.http_code == 200) {
+            std::string st = ExtractJsonField(res.body, "status");
+            if (st == "OK" || st == "CONTINUE" || st == "BINGO") {
+                out_resp_body = std::move(res.body);
+                return true;
+            }
+        }
+
+        if (res.curl_code == CURLE_OK && res.http_code == 400) {
+            std::cerr << "[-] Fatal: Server rejected malformed DPKG payload (HTTP 400): " << res.body << "\n";
+            std::exit(1);
+        }
+
+        if (!allow_retry_until_stopped || g_state.stop_signal.load()) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
 }
 
 int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    std::signal(SIGINT, HandleStopSignal);
+    std::signal(SIGTERM, HandleStopSignal);
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "-j") == 0) {
-            if (i + 1 < argc) {
-                if (std::strcmp(argv[i + 1], "max") == 0 || std::strcmp(argv[i + 1], "MAX") == 0) {
-                    g_state.num_threads = (int)std::thread::hardware_concurrency();
-                    ++i;
-                } else {
-                    g_state.num_threads = std::atoi(argv[++i]);
+            if (i + 1 >= argc) {
+                std::cerr << "[-] Fatal: Missing value after " << argv[i] << "\n";
+                return 1;
+            }
+            if (std::strcmp(argv[i + 1], "max") == 0 || std::strcmp(argv[i + 1], "MAX") == 0) {
+                g_state.num_threads = (int)std::thread::hardware_concurrency();
+                ++i;
+            } else {
+                long parsed_t = 0;
+                if (!ParseStrictInt(argv[++i], parsed_t) || parsed_t <= 0) {
+                    std::cerr << "[-] Fatal: Invalid thread count\n";
+                    return 1;
                 }
+                g_state.num_threads = (int)parsed_t;
             }
         } else if (std::strcmp(argv[i], "-m") == 0 || std::strcmp(argv[i], "-max") == 0 ||
                    std::strcmp(argv[i], "--max") == 0 || std::strcmp(argv[i], "-f") == 0 ||
                    std::strcmp(argv[i], "--full") == 0) {
             g_state.num_threads = (int)std::thread::hardware_concurrency();
         } else if (std::strcmp(argv[i], "-u") == 0) {
-            if (i + 1 < argc) g_state.worker_id = argv[++i];
+            if (i + 1 >= argc) {
+                std::cerr << "[-] Fatal: Missing worker_id after -u\n";
+                return 1;
+            }
+            g_state.worker_id = argv[++i];
         } else if (std::strcmp(argv[i], "-s") == 0) {
-            if (i + 1 < argc) g_state.server_url = argv[++i];
+            if (i + 1 >= argc) {
+                std::cerr << "[-] Fatal: Missing server_url after -s\n";
+                return 1;
+            }
+            g_state.server_url = argv[++i];
         } else if (std::strcmp(argv[i], "--verify") == 0) {
             g_state.verify_mode = true;
         } else if (std::strcmp(argv[i], "-gpu") == 0) {
@@ -1079,15 +1223,40 @@ int main(int argc, char **argv) {
                 while (start < list_str.size()) {
                     size_t comma = list_str.find(',', start);
                     std::string tok = (comma == std::string::npos) ? list_str.substr(start) : list_str.substr(start, comma - start);
-                    if (!tok.empty()) {
-                        g_state.gpu_device_ids.push_back(std::atoi(tok.c_str()));
+                    long gid = -1;
+                    if (!ParseStrictInt(tok, gid) || gid < 0) {
+                        std::cerr << "[-] Fatal: Invalid GPU device ID: " << tok << "\n";
+                        return 1;
                     }
+                    g_state.gpu_device_ids.push_back((int)gid);
                     if (comma == std::string::npos) break;
                     start = comma + 1;
                 }
             }
+        } else {
+            std::cerr << "[-] Fatal: Unknown CLI argument: " << argv[i] << "\n";
+            return 1;
         }
     }
+
+    if (g_state.worker_id.empty() || g_state.worker_id.size() > 128) {
+        std::cerr << "[-] Fatal: worker_id must be 1..128 bytes\n";
+        curl_global_cleanup();
+        return 1;
+    }
+    if (g_state.server_url.empty()) {
+        std::cerr << "[-] Fatal: server_url cannot be empty\n";
+        curl_global_cleanup();
+        return 1;
+    }
+
+#ifndef USE_CUDA
+    if (g_state.use_gpu) {
+        std::cerr << "[-] Fatal: -gpu requested on CPU-only binary (built without USE_CUDA)\n";
+        curl_global_cleanup();
+        return 1;
+    }
+#endif
 
     SetProcessName("k-engine");
 
@@ -1095,64 +1264,85 @@ int main(int argc, char **argv) {
     secp.Init();
 
     if (g_state.verify_mode) {
-        RunVerification(&secp);
+        int code = RunVerification(&secp);
         curl_global_cleanup();
-        return 0;
+        return code;
     }
 
-    // Fetch dynamic task configuration from Master Coordinator with startup retry
+    // Strict synchronization with Master Coordinator (zero hardcoded offline task fallbacks)
     std::string task_url = BuildApiUrl(g_state.server_url, "action=get_task&worker_id=" + g_state.worker_id);
     std::string task_resp;
-    for (int attempt = 0; attempt < 5; ++attempt) {
-        task_resp = HttpGet(task_url);
-        if (!task_resp.empty()) break;
+    while (g_state.running.load()) {
+        HttpResult tr = HttpGet(task_url);
+        if (tr.curl_code == CURLE_OK && tr.http_code == 200 && !tr.body.empty()) {
+            std::string st = ExtractJsonField(tr.body, "status");
+            if (st == "BINGO") {
+                curl_global_cleanup();
+                return 0;
+            }
+            if (st == "OK") {
+                task_resp = std::move(tr.body);
+                break;
+            }
+        }
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
-    if (!task_resp.empty() && task_resp.find("\"BINGO\"") != std::string::npos) {
+    if (!g_state.running.load()) {
         curl_global_cleanup();
         return 0;
     }
 
-    std::string srv_min = CleanHex(ExtractJsonField(task_resp, "range_min"));
-    std::string srv_max = CleanHex(ExtractJsonField(task_resp, "range_max"));
-    std::string srv_pub = CleanHex(ExtractJsonField(task_resp, "target_pubkey"));
-    std::string srv_dp_bits = ExtractJsonField(task_resp, "dp_mask_bits");
-    std::string srv_batch = ExtractJsonField(task_resp, "batch_limit");
+    std::string active_min_hex;
+    std::string active_max_hex;
+    std::string active_pub_hex;
+    if (!NormalizeHex(ExtractJsonField(task_resp, "range_min"), active_min_hex) ||
+        !NormalizeHex(ExtractJsonField(task_resp, "range_max"), active_max_hex) ||
+        !NormalizeHex(ExtractJsonField(task_resp, "target_pubkey"), active_pub_hex) ||
+        (active_pub_hex.size() != 66 && active_pub_hex.size() != 130)) {
+        std::cerr << "[-] Fatal: Invalid range or target_pubkey returned by get_task\n";
+        curl_global_cleanup();
+        return 1;
+    }
+
+    long parsed_bits = 0;
+    long parsed_batch = 0;
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "dp_mask_bits"), parsed_bits) || parsed_bits < 8 || parsed_bits > 60) {
+        std::cerr << "[-] Fatal: Invalid dp_mask_bits returned by get_task\n";
+        curl_global_cleanup();
+        return 1;
+    }
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "batch_limit"), parsed_batch) || parsed_batch < 1 || parsed_batch > 10000) {
+        std::cerr << "[-] Fatal: Invalid batch_limit returned by get_task\n";
+        curl_global_cleanup();
+        return 1;
+    }
+
     std::string srv_task = ExtractJsonField(task_resp, "task_type");
-
-    std::string active_min_hex = (!task_resp.empty() && srv_min != "0") ? srv_min : RANGE_MIN_HEX;
-    std::string active_max_hex = (!task_resp.empty() && srv_max != "0") ? srv_max : RANGE_MAX_HEX;
-    std::string active_pub_hex = (!task_resp.empty() && (srv_pub.size() == 66 || srv_pub.size() == 130)) ? srv_pub : TARGET_PUBKEY_HEX;
-
-    int active_dp_bits = DEFAULT_DP_BITS;
-    if (!srv_dp_bits.empty()) {
-        int parsed_bits = std::atoi(srv_dp_bits.c_str());
-        if (parsed_bits >= 8 && parsed_bits <= 60) {
-            active_dp_bits = parsed_bits;
-        }
+    if (srv_task != "TAME" && srv_task != "WILD") {
+        std::cerr << "[-] Fatal: Invalid task_type returned by get_task\n";
+        curl_global_cleanup();
+        return 1;
     }
 
-    size_t batch_limit = DEFAULT_BATCH_LIMIT;
-    if (!srv_batch.empty()) {
-        int parsed_batch = std::atoi(srv_batch.c_str());
-        if (parsed_batch >= 100 && parsed_batch <= 4000) {
-            batch_limit = (size_t)parsed_batch;
-        }
-    }
+    int active_dp_bits = (int)parsed_bits;
+    size_t batch_limit = (size_t)parsed_batch;
 
     Int range_min, range_max;
     range_min.SetBase16((char*)active_min_hex.c_str());
     range_max.SetBase16((char*)active_max_hex.c_str());
     if (!range_max.IsGreater(&range_min)) {
-        range_min.SetBase16((char*)RANGE_MIN_HEX);
-        range_max.SetBase16((char*)RANGE_MAX_HEX);
+        std::cerr << "[-] Fatal: range_max must be strictly greater than range_min\n";
+        curl_global_cleanup();
+        return 1;
     }
 
     Point target_pub;
     bool is_compressed = false;
-    if (!secp.ParsePublicKeyHex(active_pub_hex, target_pub, is_compressed)) {
-        secp.ParsePublicKeyHex(TARGET_PUBKEY_HEX, target_pub, is_compressed);
+    if (!secp.ParsePublicKeyHex(active_pub_hex, target_pub, is_compressed) || target_pub.isZero()) {
+        std::cerr << "[-] Fatal: Failed to parse curve point target_pubkey\n";
+        curl_global_cleanup();
+        return 1;
     }
 
     Int range_width(&range_max);
@@ -1163,20 +1353,30 @@ int main(int argc, char **argv) {
 
     bool is_wild_mode = (srv_task == "WILD");
 
-    // Resolve active GPU device list (auto-detect all CUDA GPUs when -gpu is given without IDs)
+    // Strict hardware discovery (zero GPU 0 or 4-thread guessing fallbacks)
     std::vector<int> active_gpus;
 #ifdef USE_CUDA
     if (g_state.use_gpu) {
+        int dev_count = 0;
+        cudaError_t cnt_err = cudaGetDeviceCount(&dev_count);
+        if (cnt_err != cudaSuccess || dev_count <= 0) {
+            std::cerr << "[-] Fatal: No CUDA-capable GPU detected\n";
+            curl_global_cleanup();
+            return 1;
+        }
         if (!g_state.gpu_device_ids.empty()) {
-            active_gpus = g_state.gpu_device_ids;
-        } else {
-            int dev_count = 0;
-            if (cudaGetDeviceCount(&dev_count) == cudaSuccess && dev_count > 0) {
-                for (int d = 0; d < dev_count; ++d) {
-                    active_gpus.push_back(d);
+            for (size_t i = 0; i < g_state.gpu_device_ids.size(); ++i) {
+                int gid = g_state.gpu_device_ids[i];
+                if (gid < 0 || gid >= dev_count) {
+                    std::cerr << "[-] Fatal: Requested GPU #" << gid << " out of range (0.." << (dev_count - 1) << ")\n";
+                    curl_global_cleanup();
+                    return 1;
                 }
-            } else {
-                active_gpus.push_back(0);
+                active_gpus.push_back(gid);
+            }
+        } else {
+            for (int d = 0; d < dev_count; ++d) {
+                active_gpus.push_back(d);
             }
         }
     }
@@ -1185,13 +1385,28 @@ int main(int argc, char **argv) {
     if (!g_state.use_gpu || g_state.num_threads > 0) {
         if (g_state.num_threads <= 0) {
             g_state.num_threads = (int)std::thread::hardware_concurrency();
-            if (g_state.num_threads <= 0) g_state.num_threads = 4;
+            if (g_state.num_threads <= 0) {
+                std::cerr << "[-] Fatal: Unable to query CPU hardware_concurrency; specify -t <threads> explicitly\n";
+                curl_global_cleanup();
+                return 1;
+            }
         }
+    }
+
+    std::string hw_info;
+    if (g_state.use_gpu) {
+        hw_info = "NVIDIA CUDA (" + std::to_string(active_gpus.size()) + "x GPU)";
+        if (g_state.num_threads > 0) {
+            hw_info += " + " + std::to_string(g_state.num_threads) + " CPU Cores";
+        }
+    } else {
+        hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
     }
 
     std::vector<std::thread> workers;
 
     auto launch_all_workers = [&](bool wild_mode) {
+        g_state.worker_active = true;
 #ifdef USE_CUDA
         if (g_state.use_gpu) {
             for (size_t g = 0; g < active_gpus.size(); ++g) {
@@ -1217,7 +1432,13 @@ int main(int argc, char **argv) {
     uint64_t last_steps = 0;
     double cached_hashrate_mhs = 0.0;
 
-    while (g_state.running) {
+    auto format_hashrate = [&](double mhs) -> std::string {
+        std::ostringstream hr_ss;
+        hr_ss << std::fixed << std::setprecision(2) << mhs << " MH/s";
+        return hr_ss.str();
+    };
+
+    while (g_state.running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         auto now = std::chrono::steady_clock::now();
         double since_send = std::chrono::duration<double>(now - last_send_time).count();
@@ -1228,7 +1449,6 @@ int main(int argc, char **argv) {
             queued_count = g_state.dp_queue.size();
         }
 
-        // Flush immediately when queue hits batch_limit (~1,000 DPs) OR every 15s heartbeat
         if (queued_count < batch_limit && since_send < 15.0) {
             continue;
         }
@@ -1256,103 +1476,105 @@ int main(int argc, char **argv) {
             }
         }
 
-        std::string hw_info;
-        if (g_state.use_gpu) {
-            hw_info = "NVIDIA CUDA (" + std::to_string(active_gpus.empty() ? 1 : active_gpus.size()) + "x GPU)";
-            if (g_state.num_threads > 0) {
-                hw_info += " + " + std::to_string(g_state.num_threads) + " CPU Cores";
+        std::string hr_str = format_hashrate(cached_hashrate_mhs);
+        std::string post_resp;
+        if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, batch, post_resp, true)) {
+            // Interrupted by stop_signal; return batch to front for final flush
+            if (!batch.empty()) {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
             }
-        } else {
-            hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
+            break;
         }
 
-        std::string hr_str;
-        {
-            std::ostringstream hr_ss;
-            hr_ss << std::fixed << std::setprecision(2) << cached_hashrate_mhs << " MH/s";
-            hr_str = hr_ss.str();
-        }
-
-        std::vector<uint8_t> packet;
-        packet.reserve(16 + g_state.worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
-
-        packet.push_back('D'); packet.push_back('P'); packet.push_back('K'); packet.push_back('G');
-
-        uint16_t ver_be = htons(1);
-        packet.insert(packet.end(), (uint8_t*)&ver_be, (uint8_t*)&ver_be + 2);
-
-        uint16_t wid_len_be = htons((uint16_t)g_state.worker_id.size());
-        packet.insert(packet.end(), (uint8_t*)&wid_len_be, (uint8_t*)&wid_len_be + 2);
-        packet.insert(packet.end(), g_state.worker_id.begin(), g_state.worker_id.end());
-
-        uint16_t hw_len_be = htons((uint16_t)hw_info.size());
-        packet.insert(packet.end(), (uint8_t*)&hw_len_be, (uint8_t*)&hw_len_be + 2);
-        packet.insert(packet.end(), hw_info.begin(), hw_info.end());
-
-        uint16_t hr_len_be = htons((uint16_t)hr_str.size());
-        packet.insert(packet.end(), (uint8_t*)&hr_len_be, (uint8_t*)&hr_len_be + 2);
-        packet.insert(packet.end(), hr_str.begin(), hr_str.end());
-
-        uint32_t count_be = htonl((uint32_t)batch.size());
-        packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
-
-        uint8_t dp_buf[64];
-        for (size_t i = 0; i < batch.size(); ++i) {
-            HexToBin32(batch[i].x_hex, dp_buf);
-            HexToBin32(batch[i].dist_hex, dp_buf + 32);
-            packet.insert(packet.end(), dp_buf, dp_buf + 64);
-        }
-
-        std::string action = is_wild_mode ? "check_wild" : "submit_tame";
-        std::string submit_url = BuildApiUrl(g_state.server_url, "action=" + action);
-        std::string post_resp = HttpPostBinary(submit_url, packet.data(), packet.size());
-
-        bool success = (!post_resp.empty() && (post_resp.find("\"status\":\"OK\"") != std::string::npos ||
-                                               post_resp.find("\"status\":\"CONTINUE\"") != std::string::npos ||
-                                               post_resp.find("\"BINGO\"") != std::string::npos));
-        if (!success) {
-            if (!post_resp.empty() && post_resp.find("\"status\":\"ERROR\"") != std::string::npos) {
-                std::cerr << "[-] Server permanently rejected batch: " << post_resp
-                          << " - Dropping batch to avoid infinite loop.\n";
-            } else {
-                if (!batch.empty()) {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    if (g_state.dp_queue.size() + batch.size() <= MAX_RETRY_QUEUE_DPS) {
-                        g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
-                    }
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-            }
-            continue;
-        }
-
-        if (post_resp.find("\"BINGO\"") != std::string::npos) {
+        if (ExtractJsonField(post_resp, "status") == "BINGO") {
+            g_state.worker_active = false;
             g_state.running = false;
             break;
         }
 
-        // Bidirectional dynamic phase transition: TAME <-> WILD
         std::string next_task = ExtractJsonField(post_resp, "task_type");
-        bool want_wild = (next_task == "WILD") ? true : ((next_task == "TAME") ? false : is_wild_mode);
-
-        if (want_wild != is_wild_mode) {
+        if (next_task != "TAME" && next_task != "WILD") {
+            std::cerr << "[-] Fatal: Server returned invalid task_type: " << next_task << "\n";
+            g_state.worker_active = false;
             g_state.running = false;
             for (size_t i = 0; i < workers.size(); ++i) {
                 if (workers[i].joinable()) workers[i].join();
             }
-            workers.clear();
-            {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                g_state.dp_queue.clear();
+            curl_global_cleanup();
+            return 1;
+        }
+
+        bool want_wild = (next_task == "WILD");
+        if (want_wild != is_wild_mode) {
+            g_state.worker_active = false;
+            for (size_t i = 0; i < workers.size(); ++i) {
+                if (workers[i].joinable()) workers[i].join();
             }
+            workers.clear();
+
+            // Flush all remaining buffered DPs belonging to the old phase before switching
+            bool bingo_during_flush = false;
+            while (!g_state.stop_signal.load()) {
+                std::vector<DPRecord> rem_batch;
+                {
+                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                    if (g_state.dp_queue.empty()) break;
+                    size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                    rem_batch.assign(
+                        std::make_move_iterator(g_state.dp_queue.begin()),
+                        std::make_move_iterator(g_state.dp_queue.begin() + take)
+                    );
+                    g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                }
+                std::string flush_resp;
+                if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, rem_batch, flush_resp, true)) {
+                    break;
+                }
+                if (ExtractJsonField(flush_resp, "status") == "BINGO") {
+                    bingo_during_flush = true;
+                    break;
+                }
+            }
+
+            if (bingo_during_flush || g_state.stop_signal.load()) {
+                g_state.running = false;
+                break;
+            }
+
             is_wild_mode = want_wild;
-            g_state.running = true;
             launch_all_workers(is_wild_mode);
         }
     }
 
+    g_state.worker_active = false;
     for (size_t i = 0; i < workers.size(); ++i) {
         if (workers[i].joinable()) workers[i].join();
+    }
+
+    // Drain all remaining buffered DPs on graceful SIGINT/SIGTERM shutdown
+    if (g_state.stop_signal.load()) {
+        std::string hr_str = "0.00 MH/s";
+        while (true) {
+            std::vector<DPRecord> final_batch;
+            {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                if (g_state.dp_queue.empty()) break;
+                size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                final_batch.assign(
+                    std::make_move_iterator(g_state.dp_queue.begin()),
+                    std::make_move_iterator(g_state.dp_queue.begin() + take)
+                );
+                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+            }
+            std::string final_resp;
+            if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, final_batch, final_resp, false)) {
+                break;
+            }
+            if (ExtractJsonField(final_resp, "status") == "BINGO") {
+                break;
+            }
+        }
     }
 
     curl_global_cleanup();
