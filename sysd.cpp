@@ -3,12 +3,11 @@
  * Core Cryptography: Jean-Luc Pons Canonical Kangaroo Engine (JeanLucPons/Kangaroo)
  * Features:
  *  - 100% Native Secp256k1 & BigInt from Jean-Luc Pons library (SECP256k1.h, Int.h, Point.h)
- *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 256)
- *  - Direct AVX2/BMI2 assembly support via IntMod.asm / Int.cpp
- *  - Full Native CUDA GPU kernel execution via GPUEngine (sm_60 - sm_90)
- *  - Automated stealth mode (prctl process disguise, argv memory zeroing, silent execution)
- *  - Thread pooling with hardware_concurrency auto-detection
- *  - Master-Worker HTTP coordination via libcurl
+ *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 1024)
+ *  - Full Native Multi-GPU CUDA execution with 256-bit host base-distance & staged respawn
+ *  - Symmetric [-W/2, +W/2] Wild Kangaroo seeding (zero upper-bound blind spot, 75% avg overlap)
+ *  - Lock-free thread_local 256-bit seeded MT19937_64 PRNG (zero cross-thread race conditions)
+ *  - Dynamic Master-Worker task sync, bidirectional TAME <-> WILD switching & chunked DPKG batches
  */
 
 #include <iostream>
@@ -28,6 +27,7 @@
 #include <unordered_map>
 #include <cmath>
 #include <random>
+#include <algorithm>
 #if defined(_WIN32)
 #include <winsock2.h>
 #else
@@ -42,7 +42,9 @@
 
 // Compatibility fixes for macOS Clang without touching SECPK1 library
 #if defined(__clang__) || defined(__APPLE__)
+#ifndef __rdtsc
 #define __rdtsc pons_rdtsc
+#endif
 #ifndef __builtin_ia32_sbb_u64
 #define __builtin_ia32_sbb_u64 __builtin_ia32_subborrow_u64
 #endif
@@ -54,10 +56,10 @@
 #include "SECPK1/Point.h"
 #include "SECPK1/Int.h"
 #include "SECPK1/IntGroup.h"
-#include "SECPK1/Random.h"
 #include "Timer.h"
 
 #ifdef USE_CUDA
+#include <cuda_runtime.h>
 #include "GPU/GPUEngine.h"
 #endif
 
@@ -70,9 +72,10 @@
 #endif
 #define NB_JUMP 32
 
-// CPU_GRP_SIZE = 1024 matches Jean-Luc Pons canonical batch size, amortizing ModInv across 1024 points
 #define CPU_GRP_SIZE 1024
 #define DEFAULT_DP_BITS 23
+#define DEFAULT_BATCH_LIMIT 1000
+#define MAX_RETRY_QUEUE_DPS 20000
 #define TARGET_PUBKEY_HEX "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
 #define RANGE_MIN_HEX "80000000000000000000000000000000000"
 #define RANGE_MAX_HEX "fffffffffffffffffffffffffffffffffff"
@@ -82,6 +85,92 @@ struct DPRecord {
     std::string dist_hex;
 };
 
+// Safe affine point addition handling infinity, doubling, and inverse points
+static Point SafeAddAffine(Secp256K1 *secp, Point &p1, Point &p2) {
+    if (p1.isZero()) return p2;
+    if (p2.isZero()) return p1;
+    if (p1.x.IsEqual(&p2.x)) {
+        if (p1.y.IsEqual(&p2.y)) {
+            return secp->DoubleDirect(p1);
+        }
+        Point inf;
+        inf.Clear();
+        return inf;
+    }
+    return secp->AddDirect(p1, p2);
+}
+
+// Lock-free per-thread 256-bit seeded MT19937_64 PRNG (eliminates SECPK1/Random.cpp global state races)
+static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
+    static thread_local bool initialized = false;
+    static thread_local std::mt19937_64 rng;
+    if (!initialized) {
+        uint32_t seed_words[8] = {0};
+        bool urand_ok = false;
+        std::ifstream urand("/dev/urandom", std::ios::binary);
+        if (urand.is_open()) {
+            urand.read(reinterpret_cast<char*>(seed_words), sizeof(seed_words));
+            if (urand.gcount() == (std::streamsize)sizeof(seed_words)) {
+                urand_ok = true;
+            }
+            urand.close();
+        }
+        if (!urand_ok) {
+            std::random_device rd;
+            for (int i = 0; i < 8; ++i) {
+                seed_words[i] = rd();
+            }
+        }
+        uint64_t clk = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        uint64_t tid_h = (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
+        uint64_t pid_v = (uint64_t)getpid();
+        seed_words[0] ^= (uint32_t)(clk & 0xFFFFFFFFULL);
+        seed_words[1] ^= (uint32_t)(clk >> 32);
+        seed_words[2] ^= (uint32_t)(tid_h & 0xFFFFFFFFULL);
+        seed_words[3] ^= (uint32_t)(tid_h >> 32);
+        seed_words[4] ^= (uint32_t)(salt & 0xFFFFFFFFULL);
+        seed_words[5] ^= (uint32_t)(salt >> 32);
+        seed_words[6] ^= (uint32_t)(pid_v * 2654435761ULL);
+        std::seed_seq seq(seed_words, seed_words + 8);
+        rng.seed(seq);
+        initialized = true;
+    }
+    return rng;
+}
+
+// Uniform unbiased random Int in [0, max_inclusive] via rejection sampling
+static void ThreadRandRange(Int &out, Int &max_inclusive, uint64_t salt = 0) {
+    out.CLEAR();
+    if (max_inclusive.IsZero() || max_inclusive.IsNegative()) {
+        return;
+    }
+    int bit_len = max_inclusive.GetBitLength();
+    if (bit_len <= 0) {
+        return;
+    }
+    if (bit_len > 256) {
+        bit_len = 256;
+    }
+    int full_qwords = bit_len / 64;
+    int rem_bits = bit_len % 64;
+    uint64_t top_mask = (rem_bits > 0) ? ((1ULL << rem_bits) - 1ULL) : 0ULL;
+
+    std::mt19937_64 &rng = GetThreadRng(salt);
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        out.CLEAR();
+        for (int q = 0; q < full_qwords && q < 4; ++q) {
+            out.bits64[q] = rng();
+        }
+        if (rem_bits > 0 && full_qwords < 4) {
+            out.bits64[full_qwords] = rng() & top_mask;
+        }
+        if (out.IsLowerOrEqual(&max_inclusive)) {
+            return;
+        }
+    }
+    out.Mod(&max_inclusive);
+}
+
 class JumpTable {
 public:
     Int d[NB_JUMP];
@@ -89,18 +178,20 @@ public:
     Int Jx[NB_JUMP];
     Int Jy[NB_JUMP];
 
-    void init(Secp256K1 *secp) {
-        // Tối ưu hóa bảng bước nhảy cho Puzzle #140 (Độ rộng không gian W = 2^139):
-        // Theo lý thuyết của Pollard Kangaroo: bước nhảy bình quân tối ưu là mu = 0.5 * sqrt(W) = 2^68.5.
-        // Khi chọn số mũ bit trải từ 57 đến 72:
-        //   - Bước nhỏ nhất: 2^57
-        //   - Bước lớn nhất: 2^72
-        //   - Tổng 32 bước: sum(2^bit_i) ≈ 2^73.58
-        //   - Trung bình cộng số học thực tế: E[d] = 2^73.58 / 32 = 2^68.58 (khớp tuyệt đối với 2^68.5 lý thuyết)
-        // Việc giới hạn max bit ở 72 ngăn chặn hiện tượng các bước 2^80-2^84 áp đảo kéo trung bình vọt lên 2^80 (vọt lố bẫy).
+    void init(Secp256K1 *secp, Int &range_width) {
+        int w_bits = range_width.GetBitLength();
+        if (w_bits <= 0) w_bits = 139;
+        // Với Puzzle #140 (w_bits = 139): max_bit = 72, min_bit = 57 -> E[d] = 2^68.58 ~ 0.5 * sqrt(W)
+        // Đồng thời tự động co giãn chuẩn xác cho mọi puzzle khác từ server và vừa khít 128-bit jD trên GPU
+        int max_bit = (w_bits + 5) / 2;
+        if (max_bit > 120) max_bit = 120;
+        if (max_bit < 16) max_bit = 16;
+        int span = 15;
+        int min_bit = (max_bit > span) ? (max_bit - span) : 1;
+
         for (int i = 0; i < NB_JUMP; ++i) {
-            d[i].SetInt32(0);
-            int bit = 57 + (i * 15) / (NB_JUMP - 1); // Trải đều 57 đến 72 bit: E[d] = 2^68.58 ~ 2^68.5
+            d[i].CLEAR();
+            int bit = min_bit + (i * (max_bit - min_bit)) / (NB_JUMP - 1);
             int qword_idx = bit / 64;
             int bit_rem = bit % 64;
             uint64_t val = (1ULL << bit_rem);
@@ -113,12 +204,17 @@ public:
     }
 };
 
+static std::string BuildApiUrl(const std::string &base_url, const std::string &query) {
+    char sep = (base_url.find('?') == std::string::npos) ? '?' : '&';
+    return base_url + sep + query;
+}
+
 static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-static std::string HttpGet(const std::string& url) {
+static std::string HttpGet(const std::string &url) {
     CURL *curl = curl_easy_init();
     std::string readBuffer;
     if (curl) {
@@ -127,13 +223,18 @@ static std::string HttpGet(const std::string& url) {
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_perform(curl);
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         curl_easy_cleanup(curl);
+        if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+            readBuffer.clear();
+        }
     }
     return readBuffer;
 }
 
-static std::string HttpPostJson(const std::string& url, const std::string& json_str) {
+static std::string HttpPostJson(const std::string &url, const std::string &json_str) {
     CURL *curl = curl_easy_init();
     std::string readBuffer;
     if (curl) {
@@ -153,7 +254,6 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        // Neu ket noi loi hoac ma HTTP khong phai 2xx (e.g. 500, 502, timeout), xoa buffer de kich hoat retry
         if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
             readBuffer.clear();
         }
@@ -161,7 +261,7 @@ static std::string HttpPostJson(const std::string& url, const std::string& json_
     return readBuffer;
 }
 
-static std::string HttpPostBinary(const std::string& url, const uint8_t *data, size_t len) {
+static std::string HttpPostBinary(const std::string &url, const uint8_t *data, size_t len) {
     CURL *curl = curl_easy_init();
     std::string readBuffer;
     if (curl) {
@@ -173,7 +273,7 @@ static std::string HttpPostBinary(const std::string& url, const uint8_t *data, s
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
@@ -190,39 +290,49 @@ static std::string HttpPostBinary(const std::string& url, const uint8_t *data, s
 }
 
 static void HexToBin32(const std::string &hex_str, uint8_t *out) {
+    size_t start_idx = 0;
+    while (start_idx < hex_str.size() && (hex_str[start_idx] == ' ' || hex_str[start_idx] == '\t')) {
+        start_idx++;
+    }
+    if (start_idx + 2 <= hex_str.size() && hex_str[start_idx] == '0' &&
+        (hex_str[start_idx + 1] == 'x' || hex_str[start_idx + 1] == 'X')) {
+        start_idx += 2;
+    }
+
     std::string s;
-    for (char c : hex_str) {
+    s.reserve(64);
+    for (size_t i = start_idx; i < hex_str.size(); ++i) {
+        char c = hex_str[i];
         if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
             s += c;
         }
     }
-    if (s.size() >= 2 && (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))) {
-        s = s.substr(2);
+    if (s.size() < 64) {
+        s.insert(0, 64 - s.size(), '0');
+    } else if (s.size() > 64) {
+        s = s.substr(s.size() - 64);
     }
-    while (s.size() < 64) s = "0" + s;
-    if (s.size() > 64) s = s.substr(s.size() - 64);
 
     for (int i = 0; i < 32; ++i) {
         char h1 = s[i * 2];
         char h2 = s[i * 2 + 1];
         auto val = [](char c) -> uint8_t {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+            if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+            if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
             return 0;
         };
-        out[i] = (val(h1) << 4) | val(h2);
+        out[i] = (uint8_t)((val(h1) << 4) | val(h2));
     }
 }
 
-// Global runtime coordinator
 struct DaemonState {
     std::string server_url = DEFAULT_SERVER_URL;
     std::string worker_id = "node_worker";
     int num_threads = 0;
     bool verify_mode = false;
     bool use_gpu = false;
-    int gpu_device_id = 0;
+    std::vector<int> gpu_device_ids;
     std::atomic<bool> running{true};
     std::atomic<uint64_t> total_steps{0};
     std::atomic<uint64_t> total_dp{0};
@@ -230,7 +340,6 @@ struct DaemonState {
     std::mutex queue_mutex;
 } g_state;
 
-// Set normal process title
 static void SetProcessName(const char *name = "k-engine") {
 #if defined(__linux__)
     prctl(PR_SET_NAME, name, 0, 0, 0);
@@ -239,41 +348,23 @@ static void SetProcessName(const char *name = "k-engine") {
 #endif
 }
 
-// Jean-Luc Pons Canonical DP Mask builder (High bits)
 inline uint64_t MakeDPMask(int dp_bits) {
     if (dp_bits <= 0) return 0ULL;
-    if (dp_bits > 64) dp_bits = 64;
+    if (dp_bits >= 64) return ~0ULL;
     uint64_t mask = (1ULL << (64 - dp_bits)) - 1ULL;
     return ~mask;
 }
 
-// Inlined fast DP check matching 100% Jean-Luc Pons canonical (limb 3 = bits 192..255)
 inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
     return (x.bits64[3] & mask) == 0ULL;
 }
 
-static void InitThreadEntropy(int thread_id) {
-    uint32_t true_seed = 0;
-    std::ifstream urand("/dev/urandom", std::ios::binary);
-    if (urand.is_open()) {
-        urand.read(reinterpret_cast<char*>(&true_seed), sizeof(true_seed));
-        urand.close();
-    }
-    if (true_seed == 0) {
-        std::random_device rd;
-        true_seed = rd();
-    }
-    rseed(true_seed ^ (Timer::getSeed32() + (uint32_t)thread_id * 7919));
-}
-
-// TAME Worker Thread (CPU - Highly Optimized L1 Cache Aligned)
+// TAME Worker Thread (CPU - L1 Cache Aligned, Lock-Free Thread-Local 256-bit PRNG)
 static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Int range_min, Int range_max) {
-    Int range_width;
-    range_width.Set(&range_max);
+    Int range_width(&range_max);
     range_width.Sub(&range_min);
 
-    InitThreadEntropy(thread_id);
-
+    const uint64_t rng_salt = (uint64_t)thread_id * 7919ULL + 0x517CC1B727220A95ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
@@ -286,21 +377,25 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     alignas(64) static thread_local uint32_t tame_dp_count[CPU_GRP_SIZE];
     alignas(64) static thread_local uint64_t tame_step_count[CPU_GRP_SIZE];
 
-    // Spawn / Respawn a tame kangaroo at a fresh uniform random position in [RangeMin, RangeMax]
     auto spawn_tame_kangaroo = [&](int g) {
-        Int k_start;
-        k_start.Rand(&range_width);
-        k_start.Add(&range_min);
+        for (int retry = 0; retry < 16; ++retry) {
+            Int k_start;
+            ThreadRandRange(k_start, range_width, rng_salt);
+            k_start.Add(&range_min);
+            if (k_start.IsZero()) continue;
 
-        Point P = secp->ComputePublicKey(&k_start);
-        px[g].Set(&P.x);
-        py[g].Set(&P.y);
-        distance[g].Set(&k_start);
-        tame_dp_count[g] = 0;
-        tame_step_count[g] = 0;
+            Point P = secp->ComputePublicKey(&k_start);
+            if (P.isZero()) continue;
+
+            px[g].Set(&P.x);
+            py[g].Set(&P.y);
+            distance[g].Set(&k_start);
+            tame_dp_count[g] = 0;
+            tame_step_count[g] = 0;
+            return;
+        }
     };
 
-    // Initialize herd
     for (int g = 0; g < CPU_GRP_SIZE; ++g) {
         spawn_tame_kangaroo(g);
     }
@@ -314,17 +409,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     std::vector<DPRecord> local_dp_buffer;
 
     while (g_state.running) {
-        // Step 1: Jump indices & dx
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
         }
 
-        // Step 2: Montgomery simultaneous inversion
         grp.Set(dx);
         grp.ModInv();
 
-        // Step 3: Affine coordinate updates and DP checks
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             uint32_t j = jmp[g];
             Int *p1x = &jt->Jx[j];
@@ -350,25 +442,24 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
-                local_dp_buffer.push_back(rec);
+                local_dp_buffer.push_back(std::move(rec));
                 tame_dp_count[g]++;
             }
 
-            // Balanced Tame Lifetime: 5 DP (~42M steps) gives optimal trail length without overshooting W
             if (tame_dp_count[g] >= 5 || tame_step_count[g] >= 67108864ULL) {
                 spawn_tame_kangaroo(g);
             }
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 524288) {
+        if (local_steps >= 262144) {
             g_state.total_steps += local_steps;
             local_steps = 0;
 
             if (!local_dp_buffer.empty()) {
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                for (auto &r : local_dp_buffer) {
-                    g_state.dp_queue.push_back(std::move(r));
+                for (size_t idx = 0; idx < local_dp_buffer.size(); ++idx) {
+                    g_state.dp_queue.push_back(std::move(local_dp_buffer[idx]));
                     g_state.total_dp++;
                 }
                 local_dp_buffer.clear();
@@ -377,14 +468,22 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     }
 }
 
-// WILD Worker Thread (CPU - True 139-bit Uniform Random Seeding & Overshoot Reset)
+// WILD Worker Thread (CPU - Symmetric [-W/2, +W/2] Centered Offset, Zero Blind Spots)
 static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Point target_pub, Int range_min, Int range_max) {
-    Int range_width;
-    range_width.Set(&range_max);
+    Int range_width(&range_max);
     range_width.Sub(&range_min);
 
-    InitThreadEntropy(thread_id);
+    Int w_half(&range_width);
+    w_half.ShiftR(1);
 
+    Point target_shifted(target_pub);
+    if (!w_half.IsZero()) {
+        Point neg_half = secp->ComputePublicKey(&w_half);
+        neg_half.y.ModNeg();
+        target_shifted = SafeAddAffine(secp, target_pub, neg_half);
+    }
+
+    const uint64_t rng_salt = (uint64_t)thread_id * 104729ULL + 0x9E3779B97F4A7C15ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
@@ -397,23 +496,31 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     alignas(64) static thread_local uint32_t wild_dp_count[CPU_GRP_SIZE];
     alignas(64) static thread_local uint64_t wild_step_count[CPU_GRP_SIZE];
 
-    // Spawn a wild kangaroo with a positive uniform random offset in [0, range_width]
-    // Dong bo 100% voi GPU Worker va he thong server kangaroo.php giai k = (dt - dw) mod n
+    // Dịch tâm đối xứng [-W/2, +W/2]: P = (Q - W/2 * G) + r_scalar * G, D_W = (r_scalar - W/2) mod n
     auto spawn_wild_kangaroo = [&](int g) {
-        Int r_scalar;
-        r_scalar.Rand(&range_width); // Positive scalar in [0, W]
+        for (int retry = 0; retry < 16; ++retry) {
+            Int r_scalar;
+            ThreadRandRange(r_scalar, range_width, rng_salt);
 
-        Point offset_pt = secp->ComputePublicKey(&r_scalar);
-        Point P = secp->AddDirect(target_pub, offset_pt);
+            Point P;
+            if (r_scalar.IsZero()) {
+                P = target_shifted;
+            } else {
+                Point offset_pt = secp->ComputePublicKey(&r_scalar);
+                P = SafeAddAffine(secp, target_shifted, offset_pt);
+            }
+            if (P.isZero()) continue;
 
-        px[g].Set(&P.x);
-        py[g].Set(&P.y);
-        distance[g].Set(&r_scalar);
-        wild_dp_count[g] = 0;
-        wild_step_count[g] = 0;
+            px[g].Set(&P.x);
+            py[g].Set(&P.y);
+            distance[g].Set(&r_scalar);
+            distance[g].ModSubK1order(&w_half);
+            wild_dp_count[g] = 0;
+            wild_step_count[g] = 0;
+            return;
+        }
     };
 
-    // Initialize herd
     for (int g = 0; g < CPU_GRP_SIZE; ++g) {
         spawn_wild_kangaroo(g);
     }
@@ -460,25 +567,24 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
                 DPRecord rec;
                 rec.x_hex = "0x" + rx.GetBase16();
                 rec.dist_hex = "0x" + distance[g].GetBase16();
-                local_dp_buffer.push_back(rec);
+                local_dp_buffer.push_back(std::move(rec));
                 wild_dp_count[g]++;
             }
 
-            // Balanced Wild Lifetime: 5 DP (~42M steps) gives optimal collision coverage without drifting from P
             if (wild_dp_count[g] >= 5 || wild_step_count[g] >= 67108864ULL) {
                 spawn_wild_kangaroo(g);
             }
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 524288) {
+        if (local_steps >= 262144) {
             g_state.total_steps += local_steps;
             local_steps = 0;
 
             if (!local_dp_buffer.empty()) {
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                for (auto &r : local_dp_buffer) {
-                    g_state.dp_queue.push_back(std::move(r));
+                for (size_t idx = 0; idx < local_dp_buffer.size(); ++idx) {
+                    g_state.dp_queue.push_back(std::move(local_dp_buffer[idx]));
                     g_state.total_dp++;
                 }
                 local_dp_buffer.clear();
@@ -488,8 +594,19 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 }
 
 #ifdef USE_CUDA
-// FULL NATIVE CUDA GPU WORKER THREAD
+struct GpuStagedRespawn {
+    uint64_t kIdx;
+    Int new_base;
+};
+
+// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn + Centered Wild)
 static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
+    cudaError_t dev_err = cudaSetDevice(gpu_id);
+    if (dev_err != cudaSuccess) {
+        std::cerr << "[-] GPU #" << gpu_id << ": cudaSetDevice failed: " << cudaGetErrorString(dev_err) << "\n";
+        return;
+    }
+
     int gridX = 0, gridY = 0;
     if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY)) {
         std::cerr << "[-] GPU #" << gpu_id << ": Cannot get grid size, falling back to 256x128\n";
@@ -499,40 +616,71 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
 
     uint64_t dp_mask = MakeDPMask(dp_bits);
     GPUEngine *gpu = new GPUEngine(gridX, gridY, gpu_id, 65536 * 2);
-    
+
     int total_kangaroos = gpu->GetNbThread() * GPU_GRP_SIZE;
+    if (total_kangaroos <= 0) {
+        delete gpu;
+        return;
+    }
+
     std::vector<Int> px(total_kangaroos);
     std::vector<Int> py(total_kangaroos);
-    std::vector<Int> dist(total_kangaroos);
+    std::vector<Int> zero_dists(total_kangaroos);
+    std::vector<Int> base_dist(total_kangaroos);
+    std::vector<uint32_t> gpu_dp_count(total_kangaroos, 0);
 
-    Int range_width;
-    range_width.Set(&range_max);
+    Int range_width(&range_max);
     range_width.Sub(&range_min);
 
-    InitThreadEntropy(gpu_id * 1000 + 42);
+    Int w_half(&range_width);
+    w_half.ShiftR(1);
 
-    if (is_wild) {
-        for (int i = 0; i < total_kangaroos; ++i) {
-            Int r_scalar;
-            r_scalar.Rand(&range_width);
-            // Dong bo 100% voi CPU WorkerWildThread: Giu r_scalar luon duong trong [0, range_width]
-            // Loai bo hoan toan so am va hien tuong tran modulo N tren GPU
-            Point offset_pt = secp->ComputePublicKey(&r_scalar);
-            Point P = secp->AddDirect(target_pub, offset_pt);
-            px[i].Set(&P.x);
-            py[i].Set(&P.y);
-            dist[i].Set(&r_scalar);
+    Point target_shifted(target_pub);
+    if (is_wild && !w_half.IsZero()) {
+        Point neg_half = secp->ComputePublicKey(&w_half);
+        neg_half.y.ModNeg();
+        target_shifted = SafeAddAffine(secp, target_pub, neg_half);
+    }
+
+    const uint64_t rng_salt = (uint64_t)gpu_id * 100003ULL + 0x243F6A8885A308D3ULL;
+
+    auto make_kangaroo_state = [&](Point &out_p, Int &out_base) {
+        for (int retry = 0; retry < 16; ++retry) {
+            if (is_wild) {
+                Int r_scalar;
+                ThreadRandRange(r_scalar, range_width, rng_salt);
+                Point P;
+                if (r_scalar.IsZero()) {
+                    P = target_shifted;
+                } else {
+                    Point offset_pt = secp->ComputePublicKey(&r_scalar);
+                    P = SafeAddAffine(secp, target_shifted, offset_pt);
+                }
+                if (P.isZero()) continue;
+                out_p = P;
+                out_base.Set(&r_scalar);
+                out_base.ModSubK1order(&w_half);
+                return;
+            } else {
+                Int k_start;
+                ThreadRandRange(k_start, range_width, rng_salt);
+                k_start.Add(&range_min);
+                if (k_start.IsZero()) continue;
+                Point P = secp->ComputePublicKey(&k_start);
+                if (P.isZero()) continue;
+                out_p = P;
+                out_base.Set(&k_start);
+                return;
+            }
         }
-    } else {
-        for (int i = 0; i < total_kangaroos; ++i) {
-            Int k_start;
-            k_start.Rand(&range_width);
-            k_start.Add(&range_min);
-            Point P = secp->ComputePublicKey(&k_start);
-            px[i].Set(&P.x);
-            py[i].Set(&P.y);
-            dist[i].Set(&k_start);
-        }
+    };
+
+    for (int i = 0; i < total_kangaroos; ++i) {
+        Point P;
+        make_kangaroo_state(P, base_dist[i]);
+        px[i].Set(&P.x);
+        py[i].Set(&P.y);
+        zero_dists[i].SetInt32(0);
     }
 
     Int zero_offset;
@@ -540,25 +688,86 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     gpu->SetWildOffset(&zero_offset);
 
     gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
-    gpu->SetKangaroos(px.data(), py.data(), dist.data());
+    // Truyền dist = 0 xuống GPU (128-bit Add128 chỉ đếm quãng đường nhảy thêm < 2^95, không bao giờ mất bit cao!)
+    gpu->SetKangaroos(px.data(), py.data(), zero_dists.data());
     gpu->callKernel();
 
     std::vector<ITEM> gpu_found;
+    std::vector<GpuStagedRespawn> staged_respawns;
+    std::vector<uint64_t> respawn_indices;
+    Int zero_int;
+    zero_int.SetInt32(0);
+
     while (g_state.running) {
         gpu_found.clear();
-        gpu->Launch(gpu_found);
-        
+        if (!gpu->Launch(gpu_found)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
         uint64_t batch_steps = (uint64_t)total_kangaroos * NB_RUN;
         g_state.total_steps += batch_steps;
 
+        respawn_indices.clear();
+
         if (!gpu_found.empty()) {
-            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-            for (const auto &item : gpu_found) {
+            std::vector<DPRecord> local_recs;
+            local_recs.reserve(gpu_found.size());
+
+            for (size_t idx = 0; idx < gpu_found.size(); ++idx) {
+                const ITEM &item = gpu_found[idx];
+                if (item.kIdx >= (uint64_t)total_kangaroos) {
+                    continue;
+                }
+
+                // Khôi phục khoảng cách đầy đủ 256-bit: real_dist = (base_dist[kIdx] + item.d) mod n
+                Int real_dist(&base_dist[item.kIdx]);
+                Int d_walk((Int*)&item.d);
+                real_dist.ModAddK1order(&d_walk);
+
                 DPRecord rec;
                 rec.x_hex = "0x" + ((Int*)&item.x)->GetBase16();
-                rec.dist_hex = "0x" + ((Int*)&item.d)->GetBase16();
-                g_state.dp_queue.push_back(rec);
-                g_state.total_dp++;
+                rec.dist_hex = "0x" + real_dist.GetBase16();
+                local_recs.push_back(std::move(rec));
+
+                gpu_dp_count[item.kIdx]++;
+                if (gpu_dp_count[item.kIdx] >= 5) {
+                    gpu_dp_count[item.kIdx] = 0;
+                    respawn_indices.push_back(item.kIdx);
+                }
+            }
+
+            if (!local_recs.empty()) {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                for (size_t idx = 0; idx < local_recs.size(); ++idx) {
+                    g_state.dp_queue.push_back(std::move(local_recs[idx]));
+                    g_state.total_dp++;
+                }
+            }
+        }
+
+        // Áp dụng base_dist mới từ chu kỳ trước (khớp chính xác với kernel vừa chạy)
+        if (!staged_respawns.empty()) {
+            for (size_t idx = 0; idx < staged_respawns.size(); ++idx) {
+                uint64_t kIdx = staged_respawns[idx].kIdx;
+                base_dist[kIdx].Set(&staged_respawns[idx].new_base);
+                gpu_dp_count[kIdx] = 0;
+            }
+            staged_respawns.clear();
+        }
+
+        // Đẩy kangaroo mới lên Stream 0 (sẽ chạy ở chu kỳ kế tiếp sau kernel hiện tại)
+        if (!respawn_indices.empty()) {
+            for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
+                uint64_t kIdx = respawn_indices[idx];
+                Point new_P;
+                Int new_base;
+                make_kangaroo_state(new_P, new_base);
+                gpu->SetKangaroo(kIdx, &new_P.x, &new_P.y, &zero_int);
+                GpuStagedRespawn sr;
+                sr.kIdx = kIdx;
+                sr.new_base.Set(&new_base);
+                staged_respawns.push_back(sr);
             }
         }
     }
@@ -567,21 +776,31 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
 }
 #endif
 
-// Helper to extract JSON string field value
 static std::string ExtractJsonField(const std::string &json, const std::string &field) {
     std::string key = "\"" + field + "\"";
     size_t pos = json.find(key);
     if (pos == std::string::npos) return "";
-    pos = json.find(':', pos);
+    pos = json.find(':', pos + key.size());
     if (pos == std::string::npos) return "";
     pos++;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\"')) pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
+        pos++;
+    }
+    if (pos >= json.size()) return "";
+    if (json[pos] == '\"') {
+        pos++;
+        size_t end = json.find('\"', pos);
+        if (end == std::string::npos) return "";
+        return json.substr(pos, end - pos);
+    }
     size_t end = pos;
-    while (end < json.size() && json[end] != '\"' && json[end] != ',' && json[end] != '}') end++;
+    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']' &&
+           json[end] != ' ' && json[end] != '\t' && json[end] != '\r' && json[end] != '\n') {
+        end++;
+    }
     return json.substr(pos, end - pos);
 }
 
-// Helper to strip 0x prefix and any whitespace/quotes
 static std::string CleanHex(std::string s) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n' || s.front() == '\"')) {
         s.erase(s.begin());
@@ -593,7 +812,8 @@ static std::string CleanHex(std::string s) {
         s = s.substr(2);
     }
     std::string clean;
-    for (char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
         if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
             clean += c;
         }
@@ -602,7 +822,6 @@ static std::string CleanHex(std::string s) {
     return clean;
 }
 
-// Kangaroo verification solver
 static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const Int &r_min, const Int &r_max, Int &solved_key) {
     Int range_width;
     range_width.Set((Int*)&r_max);
@@ -672,12 +891,9 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     double d_avg = (double)total_jump_dist / (double)K_JUMPS;
     if (d_avg < 1.0) d_avg = 1.0;
 
-    // Wild kangaroo step count based on Pollard's birthday paradox
     uint64_t max_wild_steps = (uint64_t)(3.5 * sqrt_w) + 2048ULL;
     if (max_wild_steps > 32768ULL) max_wild_steps = 32768ULL;
 
-    // In Pollard's Kangaroo, Tame must walk far enough to cover interval W plus Wild's path:
-    // N_Tame >= ceil(W / d_avg) + N_Wild + buffer
     uint64_t steps_to_cross_w = (uint64_t)std::ceil(w_est / d_avg);
     uint64_t max_tame_steps = steps_to_cross_w + max_wild_steps + 1024ULL;
     if (max_tame_steps > 65536ULL) max_tame_steps = 65536ULL;
@@ -691,24 +907,23 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
         trap_table[x_key] = { tame_dist, tame_pt.x };
 
         uint32_t j = (uint32_t)(tame_pt.x.bits64[0] & (K_JUMPS - 1));
-        tame_pt = secp->AddDirect(tame_pt, jump_P[j]);
+        tame_pt = SafeAddAffine(secp, tame_pt, jump_P[j]);
         tame_dist.ModAddK1order(&jump_d[j]);
     }
 
-    // Multi-path Wild walk (up to 4 independent jump offsets to guarantee >99.99% collision on test window)
     for (int attempt = 0; attempt < 4; ++attempt) {
         Point wild_pt = target_Q;
         Int wild_dist;
         wild_dist.SetInt32(0);
 
         if (attempt == 1) {
-            wild_pt = secp->AddDirect(wild_pt, jump_P[1]);
+            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[1]);
             wild_dist.ModAddK1order(&jump_d[1]);
         } else if (attempt == 2) {
-            wild_pt = secp->AddDirect(wild_pt, jump_P[2]);
+            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[2]);
             wild_dist.ModAddK1order(&jump_d[2]);
         } else if (attempt == 3) {
-            wild_pt = secp->AddDirect(wild_pt, jump_P[3]);
+            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[3]);
             wild_dist.ModAddK1order(&jump_d[3]);
         }
 
@@ -719,7 +934,6 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
                 Int dt = it->second.dist;
                 Int dw = wild_dist;
 
-                // Candidate 1: k1 = (r_min + dt - dw) mod n
                 Int k1;
                 k1.Set((Int*)&r_min);
                 k1.ModAddK1order(&dt);
@@ -731,7 +945,6 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
                     return true;
                 }
 
-                // Candidate 2: k2 = -(r_min + dt + dw) mod n
                 Int k2;
                 k2.Set((Int*)&r_min);
                 k2.ModAddK1order(&dt);
@@ -746,7 +959,7 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
             }
 
             uint32_t j = (uint32_t)(wild_pt.x.bits64[0] & (K_JUMPS - 1));
-            wild_pt = secp->AddDirect(wild_pt, jump_P[j]);
+            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[j]);
             wild_dist.ModAddK1order(&jump_d[j]);
         }
     }
@@ -754,7 +967,6 @@ static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const In
     return false;
 }
 
-// Verification runner
 static void RunVerification(Secp256K1 *secp) {
     std::cout << "========================================================\n";
     std::cout << "[*] Canonical Pollard's Kangaroo Cryptographic Engine Verification\n";
@@ -770,7 +982,7 @@ static void RunVerification(Secp256K1 *secp) {
         std::cout << "[+] Point doubling 2*G = 2G verification: [PASS]\n";
     }
 
-    std::string catalog_url = g_state.server_url + "?action=verify";
+    std::string catalog_url = BuildApiUrl(g_state.server_url, "action=verify");
     std::string catalog_resp = HttpGet(catalog_url);
 
     struct TestPuzzleItem {
@@ -803,7 +1015,8 @@ static void RunVerification(Secp256K1 *secp) {
     }
 
     int solved_count = 0;
-    for (const auto &puzzle : catalog) {
+    for (size_t idx = 0; idx < catalog.size(); ++idx) {
+        const TestPuzzleItem &puzzle = catalog[idx];
         int p_id = puzzle.id;
         Point target_Q;
         bool is_compressed = false;
@@ -819,7 +1032,7 @@ static void RunVerification(Secp256K1 *secp) {
 
         Int solved_key;
         if (SolveKangarooEngine(secp, target_Q, r_min, r_max, solved_key)) {
-            std::string sub_url = g_state.server_url + "?action=verify";
+            std::string sub_url = BuildApiUrl(g_state.server_url, "action=verify");
             std::string sub_body = "{\"id\":" + std::to_string(p_id) + ",\"solved_key\":\"" + solved_key.GetBase16() + "\"}";
             std::string sub_resp = HttpPostJson(sub_url, sub_body);
             if (sub_resp.find("\"PASS\"") != std::string::npos) {
@@ -836,6 +1049,8 @@ static void RunVerification(Secp256K1 *secp) {
 }
 
 int main(int argc, char **argv) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
@@ -859,7 +1074,17 @@ int main(int argc, char **argv) {
         } else if (std::strcmp(argv[i], "-gpu") == 0) {
             g_state.use_gpu = true;
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
-                g_state.gpu_device_id = std::atoi(argv[++i]);
+                std::string list_str = argv[++i];
+                size_t start = 0;
+                while (start < list_str.size()) {
+                    size_t comma = list_str.find(',', start);
+                    std::string tok = (comma == std::string::npos) ? list_str.substr(start) : list_str.substr(start, comma - start);
+                    if (!tok.empty()) {
+                        g_state.gpu_device_ids.push_back(std::atoi(tok.c_str()));
+                    }
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
             }
         }
     }
@@ -871,180 +1096,265 @@ int main(int argc, char **argv) {
 
     if (g_state.verify_mode) {
         RunVerification(&secp);
+        curl_global_cleanup();
         return 0;
     }
 
-    JumpTable jt;
-    jt.init(&secp);
+    // Fetch dynamic task configuration from Master Coordinator with startup retry
+    std::string task_url = BuildApiUrl(g_state.server_url, "action=get_task&worker_id=" + g_state.worker_id);
+    std::string task_resp;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        task_resp = HttpGet(task_url);
+        if (!task_resp.empty()) break;
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
+
+    if (!task_resp.empty() && task_resp.find("\"BINGO\"") != std::string::npos) {
+        curl_global_cleanup();
+        return 0;
+    }
+
+    std::string srv_min = CleanHex(ExtractJsonField(task_resp, "range_min"));
+    std::string srv_max = CleanHex(ExtractJsonField(task_resp, "range_max"));
+    std::string srv_pub = CleanHex(ExtractJsonField(task_resp, "target_pubkey"));
+    std::string srv_dp_bits = ExtractJsonField(task_resp, "dp_mask_bits");
+    std::string srv_batch = ExtractJsonField(task_resp, "batch_limit");
+    std::string srv_task = ExtractJsonField(task_resp, "task_type");
+
+    std::string active_min_hex = (!task_resp.empty() && srv_min != "0") ? srv_min : RANGE_MIN_HEX;
+    std::string active_max_hex = (!task_resp.empty() && srv_max != "0") ? srv_max : RANGE_MAX_HEX;
+    std::string active_pub_hex = (!task_resp.empty() && (srv_pub.size() == 66 || srv_pub.size() == 130)) ? srv_pub : TARGET_PUBKEY_HEX;
+
+    int active_dp_bits = DEFAULT_DP_BITS;
+    if (!srv_dp_bits.empty()) {
+        int parsed_bits = std::atoi(srv_dp_bits.c_str());
+        if (parsed_bits >= 8 && parsed_bits <= 60) {
+            active_dp_bits = parsed_bits;
+        }
+    }
+
+    size_t batch_limit = DEFAULT_BATCH_LIMIT;
+    if (!srv_batch.empty()) {
+        int parsed_batch = std::atoi(srv_batch.c_str());
+        if (parsed_batch >= 100 && parsed_batch <= 4000) {
+            batch_limit = (size_t)parsed_batch;
+        }
+    }
 
     Int range_min, range_max;
-    range_min.SetBase16((char*)RANGE_MIN_HEX);
-    range_max.SetBase16((char*)RANGE_MAX_HEX);
+    range_min.SetBase16((char*)active_min_hex.c_str());
+    range_max.SetBase16((char*)active_max_hex.c_str());
+    if (!range_max.IsGreater(&range_min)) {
+        range_min.SetBase16((char*)RANGE_MIN_HEX);
+        range_max.SetBase16((char*)RANGE_MAX_HEX);
+    }
 
     Point target_pub;
     bool is_compressed = false;
-    secp.ParsePublicKeyHex(TARGET_PUBKEY_HEX, target_pub, is_compressed);
+    if (!secp.ParsePublicKeyHex(active_pub_hex, target_pub, is_compressed)) {
+        secp.ParsePublicKeyHex(TARGET_PUBKEY_HEX, target_pub, is_compressed);
+    }
 
-    std::string task_url = g_state.server_url + "?action=get_task&worker_id=" + g_state.worker_id;
-    std::string task_resp = HttpGet(task_url);
-    bool is_wild_mode = (task_resp.find("\"WILD\"") != std::string::npos);
+    Int range_width(&range_max);
+    range_width.Sub(&range_min);
 
-    std::vector<std::thread> workers;
+    JumpTable jt;
+    jt.init(&secp, range_width);
 
+    bool is_wild_mode = (srv_task == "WILD");
+
+    // Resolve active GPU device list (auto-detect all CUDA GPUs when -gpu is given without IDs)
+    std::vector<int> active_gpus;
 #ifdef USE_CUDA
     if (g_state.use_gpu) {
-        // Launch real CUDA GPU Worker
-        workers.emplace_back(WorkerGpuThread, g_state.gpu_device_id, &secp, &jt, DEFAULT_DP_BITS, is_wild_mode, range_min, range_max, target_pub);
+        if (!g_state.gpu_device_ids.empty()) {
+            active_gpus = g_state.gpu_device_ids;
+        } else {
+            int dev_count = 0;
+            if (cudaGetDeviceCount(&dev_count) == cudaSuccess && dev_count > 0) {
+                for (int d = 0; d < dev_count; ++d) {
+                    active_gpus.push_back(d);
+                }
+            } else {
+                active_gpus.push_back(0);
+            }
+        }
     }
 #endif
 
-    // Launch CPU threads if not in pure GPU mode or if threads requested
     if (!g_state.use_gpu || g_state.num_threads > 0) {
         if (g_state.num_threads <= 0) {
             g_state.num_threads = (int)std::thread::hardware_concurrency();
             if (g_state.num_threads <= 0) g_state.num_threads = 4;
         }
-        for (int i = 0; i < g_state.num_threads; ++i) {
-            if (is_wild_mode) {
-                workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub, range_min, range_max);
-            } else {
-                workers.emplace_back(WorkerTameThread, i, &secp, &jt, DEFAULT_DP_BITS, range_min, range_max);
-            }
-        }
     }
 
-    auto last_report_time = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+
+    auto launch_all_workers = [&](bool wild_mode) {
+#ifdef USE_CUDA
+        if (g_state.use_gpu) {
+            for (size_t g = 0; g < active_gpus.size(); ++g) {
+                workers.emplace_back(WorkerGpuThread, active_gpus[g], &secp, &jt, active_dp_bits, wild_mode, range_min, range_max, target_pub);
+            }
+        }
+#endif
+        if (!g_state.use_gpu || g_state.num_threads > 0) {
+            for (int i = 0; i < g_state.num_threads; ++i) {
+                if (wild_mode) {
+                    workers.emplace_back(WorkerWildThread, i, &secp, &jt, active_dp_bits, target_pub, range_min, range_max);
+                } else {
+                    workers.emplace_back(WorkerTameThread, i, &secp, &jt, active_dp_bits, range_min, range_max);
+                }
+            }
+        }
+    };
+
+    launch_all_workers(is_wild_mode);
+
+    auto last_send_time = std::chrono::steady_clock::now();
+    auto last_rate_time = last_send_time;
     uint64_t last_steps = 0;
+    double cached_hashrate_mhs = 0.0;
 
     while (g_state.running) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         auto now = std::chrono::steady_clock::now();
-        double elapsed_sec = std::chrono::duration<double>(now - last_report_time).count();
+        double since_send = std::chrono::duration<double>(now - last_send_time).count();
 
-        if (elapsed_sec >= 15.0) {
+        size_t queued_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            queued_count = g_state.dp_queue.size();
+        }
+
+        // Flush immediately when queue hits batch_limit (~1,000 DPs) OR every 15s heartbeat
+        if (queued_count < batch_limit && since_send < 15.0) {
+            continue;
+        }
+
+        last_send_time = now;
+
+        double rate_elapsed = std::chrono::duration<double>(now - last_rate_time).count();
+        if (rate_elapsed >= 3.0) {
             uint64_t cur_steps = g_state.total_steps.load();
-            double hashrate_mhs = ((cur_steps - last_steps) / elapsed_sec) / 1000000.0;
+            cached_hashrate_mhs = ((cur_steps - last_steps) / rate_elapsed) / 1000000.0;
             last_steps = cur_steps;
-            last_report_time = now;
+            last_rate_time = now;
+        }
 
-            std::vector<DPRecord> batch;
+        std::vector<DPRecord> batch;
+        {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            if (!g_state.dp_queue.empty()) {
+                size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                batch.assign(
+                    std::make_move_iterator(g_state.dp_queue.begin()),
+                    std::make_move_iterator(g_state.dp_queue.begin() + take)
+                );
+                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+            }
+        }
+
+        std::string hw_info;
+        if (g_state.use_gpu) {
+            hw_info = "NVIDIA CUDA (" + std::to_string(active_gpus.empty() ? 1 : active_gpus.size()) + "x GPU)";
+            if (g_state.num_threads > 0) {
+                hw_info += " + " + std::to_string(g_state.num_threads) + " CPU Cores";
+            }
+        } else {
+            hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
+        }
+
+        std::string hr_str;
+        {
+            std::ostringstream hr_ss;
+            hr_ss << std::fixed << std::setprecision(2) << cached_hashrate_mhs << " MH/s";
+            hr_str = hr_ss.str();
+        }
+
+        std::vector<uint8_t> packet;
+        packet.reserve(16 + g_state.worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
+
+        packet.push_back('D'); packet.push_back('P'); packet.push_back('K'); packet.push_back('G');
+
+        uint16_t ver_be = htons(1);
+        packet.insert(packet.end(), (uint8_t*)&ver_be, (uint8_t*)&ver_be + 2);
+
+        uint16_t wid_len_be = htons((uint16_t)g_state.worker_id.size());
+        packet.insert(packet.end(), (uint8_t*)&wid_len_be, (uint8_t*)&wid_len_be + 2);
+        packet.insert(packet.end(), g_state.worker_id.begin(), g_state.worker_id.end());
+
+        uint16_t hw_len_be = htons((uint16_t)hw_info.size());
+        packet.insert(packet.end(), (uint8_t*)&hw_len_be, (uint8_t*)&hw_len_be + 2);
+        packet.insert(packet.end(), hw_info.begin(), hw_info.end());
+
+        uint16_t hr_len_be = htons((uint16_t)hr_str.size());
+        packet.insert(packet.end(), (uint8_t*)&hr_len_be, (uint8_t*)&hr_len_be + 2);
+        packet.insert(packet.end(), hr_str.begin(), hr_str.end());
+
+        uint32_t count_be = htonl((uint32_t)batch.size());
+        packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
+
+        uint8_t dp_buf[64];
+        for (size_t i = 0; i < batch.size(); ++i) {
+            HexToBin32(batch[i].x_hex, dp_buf);
+            HexToBin32(batch[i].dist_hex, dp_buf + 32);
+            packet.insert(packet.end(), dp_buf, dp_buf + 64);
+        }
+
+        std::string action = is_wild_mode ? "check_wild" : "submit_tame";
+        std::string submit_url = BuildApiUrl(g_state.server_url, "action=" + action);
+        std::string post_resp = HttpPostBinary(submit_url, packet.data(), packet.size());
+
+        bool success = (!post_resp.empty() && (post_resp.find("\"status\":\"OK\"") != std::string::npos ||
+                                               post_resp.find("\"status\":\"CONTINUE\"") != std::string::npos ||
+                                               post_resp.find("\"BINGO\"") != std::string::npos));
+        if (!success) {
+            if (!post_resp.empty() && post_resp.find("\"status\":\"ERROR\"") != std::string::npos) {
+                std::cerr << "[-] Server permanently rejected batch: " << post_resp
+                          << " - Dropping batch to avoid infinite loop.\n";
+            } else {
+                if (!batch.empty()) {
+                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                    if (g_state.dp_queue.size() + batch.size() <= MAX_RETRY_QUEUE_DPS) {
+                        g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            continue;
+        }
+
+        if (post_resp.find("\"BINGO\"") != std::string::npos) {
+            g_state.running = false;
+            break;
+        }
+
+        // Bidirectional dynamic phase transition: TAME <-> WILD
+        std::string next_task = ExtractJsonField(post_resp, "task_type");
+        bool want_wild = (next_task == "WILD") ? true : ((next_task == "TAME") ? false : is_wild_mode);
+
+        if (want_wild != is_wild_mode) {
+            g_state.running = false;
+            for (size_t i = 0; i < workers.size(); ++i) {
+                if (workers[i].joinable()) workers[i].join();
+            }
+            workers.clear();
             {
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                if (!g_state.dp_queue.empty()) {
-                    batch.swap(g_state.dp_queue);
-                }
+                g_state.dp_queue.clear();
             }
-
-            std::string hw_info;
-            if (g_state.use_gpu) {
-                hw_info = "NVIDIA CUDA GPU #" + std::to_string(g_state.gpu_device_id) + " (Active CUDA Kernel)";
-                if (g_state.num_threads > 0) {
-                    hw_info += " + " + std::to_string(g_state.num_threads) + " CPU Cores";
-                }
-            } else {
-                hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
-            }
-
-            std::string hr_str;
-            {
-                std::ostringstream hr_ss;
-                hr_ss << std::fixed << std::setprecision(2) << hashrate_mhs << " MH/s";
-                hr_str = hr_ss.str();
-            }
-
-            // High-Performance Native Binary DPKG packet serialization (64 bytes/DP raw binary)
-            std::vector<uint8_t> packet;
-            packet.reserve(16 + g_state.worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
-
-            // Magic: "DPKG" (4 bytes)
-            packet.push_back('D'); packet.push_back('P'); packet.push_back('K'); packet.push_back('G');
-
-            uint16_t ver_be = htons(1);
-            packet.insert(packet.end(), (uint8_t*)&ver_be, (uint8_t*)&ver_be + 2);
-
-            uint16_t wid_len_be = htons((uint16_t)g_state.worker_id.size());
-            packet.insert(packet.end(), (uint8_t*)&wid_len_be, (uint8_t*)&wid_len_be + 2);
-            packet.insert(packet.end(), g_state.worker_id.begin(), g_state.worker_id.end());
-
-            uint16_t hw_len_be = htons((uint16_t)hw_info.size());
-            packet.insert(packet.end(), (uint8_t*)&hw_len_be, (uint8_t*)&hw_len_be + 2);
-            packet.insert(packet.end(), hw_info.begin(), hw_info.end());
-
-            uint16_t hr_len_be = htons((uint16_t)hr_str.size());
-            packet.insert(packet.end(), (uint8_t*)&hr_len_be, (uint8_t*)&hr_len_be + 2);
-            packet.insert(packet.end(), hr_str.begin(), hr_str.end());
-
-            uint32_t count_be = htonl((uint32_t)batch.size());
-            packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
-
-            uint8_t dp_buf[64];
-            for (size_t i = 0; i < batch.size(); ++i) {
-                HexToBin32(batch[i].x_hex, dp_buf);
-                HexToBin32(batch[i].dist_hex, dp_buf + 32);
-                packet.insert(packet.end(), dp_buf, dp_buf + 64);
-            }
-
-            std::string action = is_wild_mode ? "check_wild" : "submit_tame";
-            std::string submit_url = g_state.server_url + "?action=" + action;
-            std::string post_resp = HttpPostBinary(submit_url, packet.data(), packet.size());
-
-            // Network retry safeguard: Differentiate transient network drop vs permanent server error
-            bool success = (!post_resp.empty() && (post_resp.find("\"status\":\"OK\"") != std::string::npos ||
-                                                   post_resp.find("\"status\":\"CONTINUE\"") != std::string::npos ||
-                                                   post_resp.find("\"BINGO\"") != std::string::npos));
-            if (!success) {
-                // If server explicitly returned an ERROR (format rejected / invalid payload), DO NOT retry
-                // to prevent infinite retry storm and memory leak (poison-pill packet)
-                if (!post_resp.empty() && post_resp.find("\"status\":\"ERROR\"") != std::string::npos) {
-                    std::cerr << "[-] Server permanently rejected batch: " << post_resp
-                              << " - Dropping batch to avoid infinite loop.\n";
-                } else {
-                    // Transient network failure (timeout / unreachable): retry with safety cap (max 5,000 DPs in queue)
-                    if (!batch.empty()) {
-                        std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                        if (g_state.dp_queue.size() < 5000) {
-                            g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
-                        }
-                    }
-                }
-            }
-
-            if (is_wild_mode && post_resp.find("\"BINGO\"") != std::string::npos) {
-                g_state.running = false;
-                break;
-            }
-
-            // Seamless dynamic transition from TAME to WILD when target_dp threshold reached
-            if (!is_wild_mode && post_resp.find("\"task_type\":\"WILD\"") != std::string::npos) {
-                g_state.running = false;
-                for (auto &t : workers) {
-                    if (t.joinable()) t.join();
-                }
-                workers.clear();
-                {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    g_state.dp_queue.clear();
-                }
-                is_wild_mode = true;
-                g_state.running = true;
-
-#ifdef USE_CUDA
-                if (g_state.use_gpu) {
-                    workers.emplace_back(WorkerGpuThread, g_state.gpu_device_id, &secp, &jt, DEFAULT_DP_BITS, is_wild_mode, range_min, range_max, target_pub);
-                }
-#endif
-                if (!g_state.use_gpu || g_state.num_threads > 0) {
-                    for (int i = 0; i < g_state.num_threads; ++i) {
-                        workers.emplace_back(WorkerWildThread, i, &secp, &jt, DEFAULT_DP_BITS, target_pub, range_min, range_max);
-                    }
-                }
-            }
+            is_wild_mode = want_wild;
+            g_state.running = true;
+            launch_all_workers(is_wild_mode);
         }
     }
 
-    for (auto &t : workers) {
-        if (t.joinable()) t.join();
+    for (size_t i = 0; i < workers.size(); ++i) {
+        if (workers[i].joinable()) workers[i].join();
     }
 
+    curl_global_cleanup();
     return 0;
 }

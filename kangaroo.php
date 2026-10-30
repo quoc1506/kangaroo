@@ -9,9 +9,28 @@ error_reporting(0);
 ini_set("display_errors", "0");
 date_default_timezone_set("UTC");
 
-@umask(0000);
+@umask(0077);
 if (function_exists("posix_setrlimit")) {
     @posix_setrlimit(POSIX_RLIMIT_NOFILE, 65535, 65535);
+}
+
+define("PHP_GUARD", "<?" . "php http_response_code(403); exit('403 Forbidden'); ?" . ">\n");
+
+function protect_storage_dir($dir) {
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0700, true);
+        @chmod($dir, 0700);
+    }
+    $ht = $dir . "/.htaccess";
+    if (!file_exists($ht)) {
+        @file_put_contents($ht, "Require all denied\nDeny from all\n");
+        @chmod($ht, 0600);
+    }
+    $idx = $dir . "/index.php";
+    if (!file_exists($idx)) {
+        @file_put_contents($idx, PHP_GUARD);
+        @chmod($idx, 0600);
+    }
 }
 
 // Hỗ trợ cô lập nhiều hệ thống / đa puzzle trên cùng server:
@@ -22,29 +41,20 @@ if (empty($instance_clean)) {
     $instance_clean = "puzzle140";
 }
 
-$base_data_dir = __DIR__ . "/data";
-if (!is_dir($base_data_dir)) {
-    @mkdir($base_data_dir, 0777, true);
-    @chmod($base_data_dir, 0777);
-}
-if (!file_exists($base_data_dir . "/.htaccess")) {
-    file_put_contents($base_data_dir . "/.htaccess", "Require all denied\nDeny from all\n");
-}
+$custom_data_root = getenv("KANGAROO_DATA_DIR");
+$base_data_dir = (!empty($custom_data_root)) ? rtrim($custom_data_root, "/") : (__DIR__ . "/data");
+protect_storage_dir($base_data_dir);
 
 $data_dir = $base_data_dir . "/" . $instance_clean;
-if (!is_dir($data_dir)) {
-    @mkdir($data_dir, 0777, true);
-    @chmod($data_dir, 0777);
-}
+protect_storage_dir($data_dir);
 
 $db_path = $data_dir . "/system_" . $instance_clean . ".db";
-$vault_path = $data_dir . "/.solution_vault.dat";
+$vault_path = $data_dir . "/.solution_vault.php";
+$legacy_vault_path = $data_dir . "/.solution_vault.dat";
+$admin_token_file = $data_dir . "/.admin_token.php";
 
 $shards_dir = $data_dir . "/shards";
-if (!is_dir($shards_dir)) {
-    @mkdir($shards_dir, 0777, true);
-    @chmod($shards_dir, 0777);
-}
+protect_storage_dir($shards_dir);
 
 function get_shard_db($shard_byte) {
     global $shards_dir;
@@ -52,30 +62,34 @@ function get_shard_db($shard_byte) {
     $idx = is_int($shard_byte) ? ($shard_byte & 0xFF) : ord($shard_byte);
     $hex = str_pad(dechex($idx), 2, "0", STR_PAD_LEFT);
     if (isset($shard_handles[$hex])) {
-        return $shard_handles[$hex];
+        // Refresh LRU order
+        $sdb = $shard_handles[$hex];
+        unset($shard_handles[$hex]);
+        $shard_handles[$hex] = $sdb;
+        return $sdb;
     }
     // Bể kết nối LRU: Giới hạn tối đa 24 shard mở đồng thời (tương đương ~72 file descriptors).
-    // Tự động giải phóng shard cũ nhất. Không bao giờ vượt qua giới hạn ulimit mặc định (1024) của bất kỳ VPS nào!
     if (count($shard_handles) >= 24) {
         $oldest_key = array_key_first($shard_handles);
         $old_db = $shard_handles[$oldest_key];
-        @$old_db->close();
+        try { $old_db->close(); } catch (Throwable $_) {}
         unset($shard_handles[$oldest_key]);
     }
     $path = $shards_dir . "/traps_" . $hex . ".db";
     $exists = file_exists($path);
     $sdb = new SQLite3($path);
+    $sdb->enableExceptions(true);
     $sdb->busyTimeout(20000);
     if (!$exists) {
         $sdb->exec("PRAGMA page_size = 8192;");
-        @chmod($path, 0666);
+        @chmod($path, 0600);
     }
     $sdb->exec("PRAGMA journal_mode = WAL;");
     $sdb->exec("PRAGMA synchronous = NORMAL;");
     $sdb->exec("PRAGMA auto_vacuum = INCREMENTAL;");
-    $sdb->exec("PRAGMA wal_autocheckpoint = 1000;"); // Tự động dọn sạch file WAL khi đạt 1000 trang (~8MB), không cần cronjob
-    $sdb->exec("PRAGMA cache_size = -4096;"); // 4 MB cache per active shard
-    $sdb->exec("PRAGMA mmap_size = 67108864;"); // 64 MB memory-mapped I/O
+    $sdb->exec("PRAGMA wal_autocheckpoint = 1000;");
+    $sdb->exec("PRAGMA cache_size = -4096;");
+    $sdb->exec("PRAGMA mmap_size = 67108864;");
     $sdb->exec("PRAGMA temp_store = MEMORY;");
     $sdb->exec("CREATE TABLE IF NOT EXISTS tame_traps (
         dp_x BLOB PRIMARY KEY,
@@ -86,18 +100,20 @@ function get_shard_db($shard_byte) {
 }
 
 define("SECP_N", "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
-define("SPACE_WIDTH_140", "6.968e41"); // 2^139 = 696800000000000000000000000000000000000000
+define("SPACE_WIDTH_140", 6.968e41); // 2^139
 
 try {
     $db = new SQLite3($db_path);
+    @chmod($db_path, 0600);
+    $db->enableExceptions(true);
     $db->busyTimeout(20000);
     $db->exec("PRAGMA journal_mode = WAL;");
     $db->exec("PRAGMA synchronous = NORMAL;");
-    $db->exec("PRAGMA cache_size = -131072;"); // 128 MB in-memory page cache
-    $db->exec("PRAGMA mmap_size = 536870912;"); // 512 MB memory-mapped I/O
+    $db->exec("PRAGMA wal_autocheckpoint = 1000;");
+    $db->exec("PRAGMA cache_size = -131072;");
+    $db->exec("PRAGMA mmap_size = 536870912;");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
-    // Compact Binary BLOB Schema WITHOUT ROWID (64-byte payload per trap)
     $db->exec("
         CREATE TABLE IF NOT EXISTS system_settings (
             setting_key TEXT PRIMARY KEY,
@@ -121,7 +137,7 @@ try {
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_steps', '0');
         INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
     ");
-} catch (Exception $e) {
+} catch (Throwable $e) {
     http_response_code(500);
     header("Content-Type: application/json");
     echo json_encode(["status" => "ERROR", "message" => "Database initialization failed"]);
@@ -129,18 +145,144 @@ try {
 }
 
 function get_setting($db, $key, $default = "") {
-    $stmt = $db->prepare("SELECT setting_value FROM system_settings WHERE setting_key = :k LIMIT 1;");
-    $stmt->bindValue(":k", $key, SQLITE3_TEXT);
-    $res = $stmt->execute();
-    $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
-    return $row ? $row["setting_value"] : $default;
+    for ($attempt = 0; $attempt < 3; $attempt++) {
+        try {
+            $stmt = $db->prepare("SELECT setting_value FROM system_settings WHERE setting_key = :k LIMIT 1;");
+            $stmt->bindValue(":k", $key, SQLITE3_TEXT);
+            $res = $stmt->execute();
+            $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+            $stmt->close();
+            return $row ? $row["setting_value"] : $default;
+        } catch (Throwable $ex) {
+            usleep(10000 * ($attempt + 1));
+        }
+    }
+    return $default;
 }
 
 function set_setting($db, $key, $value) {
-    $stmt = $db->prepare("INSERT OR REPLACE INTO system_settings (setting_key, setting_value) VALUES (:k, :v);");
-    $stmt->bindValue(":k", $key, SQLITE3_TEXT);
-    $stmt->bindValue(":v", (string)$value, SQLITE3_TEXT);
-    $stmt->execute();
+    for ($attempt = 0; $attempt < 5; $attempt++) {
+        try {
+            $stmt = $db->prepare("INSERT OR REPLACE INTO system_settings (setting_key, setting_value) VALUES (:k, :v);");
+            $stmt->bindValue(":k", $key, SQLITE3_TEXT);
+            $stmt->bindValue(":v", (string)$value, SQLITE3_TEXT);
+            $stmt->execute();
+            $stmt->close();
+            return true;
+        } catch (Throwable $ex) {
+            usleep(15000 * ($attempt + 1));
+        }
+    }
+    return false;
+}
+
+function increment_setting_int($db, $key, $delta) {
+    if ($delta == 0) {
+        return intval(get_setting($db, $key, "0"));
+    }
+    for ($attempt = 0; $attempt < 5; $attempt++) {
+        try {
+            $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+            $stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                VALUES (:k, CAST(:d AS TEXT))
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
+            $stmt->bindValue(":k", $key, SQLITE3_TEXT);
+            $stmt->bindValue(":d", (int)$delta, SQLITE3_INTEGER);
+            $stmt->execute();
+            $stmt->close();
+
+            $q = $db->prepare("SELECT setting_value FROM system_settings WHERE setting_key = :k LIMIT 1;");
+            $q->bindValue(":k", $key, SQLITE3_TEXT);
+            $res = $q->execute();
+            $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+            $q->close();
+            $db->exec("COMMIT;");
+            return $row ? intval($row["setting_value"]) : 0;
+        } catch (Throwable $ex) {
+            try { $db->exec("ROLLBACK;"); } catch (Throwable $_) {}
+            usleep(15000 * ($attempt + 1));
+        }
+    }
+    return intval(get_setting($db, $key, "0"));
+}
+
+function increment_setting_float($db, $key, $delta) {
+    if ($delta <= 0.0) {
+        return floatval(get_setting($db, $key, "0"));
+    }
+    for ($attempt = 0; $attempt < 5; $attempt++) {
+        try {
+            $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+            $stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                VALUES (:k, CAST(:d AS TEXT))
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = CAST(CAST(setting_value AS REAL) + :d AS TEXT);");
+            $stmt->bindValue(":k", $key, SQLITE3_TEXT);
+            $stmt->bindValue(":d", (float)$delta, SQLITE3_FLOAT);
+            $stmt->execute();
+            $stmt->close();
+
+            $q = $db->prepare("SELECT setting_value FROM system_settings WHERE setting_key = :k LIMIT 1;");
+            $q->bindValue(":k", $key, SQLITE3_TEXT);
+            $res = $q->execute();
+            $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+            $q->close();
+            $db->exec("COMMIT;");
+            return $row ? floatval($row["setting_value"]) : 0.0;
+        } catch (Throwable $ex) {
+            try { $db->exec("ROLLBACK;"); } catch (Throwable $_) {}
+            usleep(15000 * ($attempt + 1));
+        }
+    }
+    return floatval(get_setting($db, $key, "0"));
+}
+
+function get_or_create_admin_token($db, $admin_token_file) {
+    $env_tok = getenv("ADMIN_TOKEN");
+    if (!empty($env_tok)) {
+        return trim($env_tok);
+    }
+    $stored = get_setting($db, "admin_token", "");
+    if (!empty($stored)) {
+        if (!file_exists($admin_token_file)) {
+            @file_put_contents($admin_token_file, PHP_GUARD . "ADMIN_TOKEN=" . $stored . "\n", LOCK_EX);
+            @chmod($admin_token_file, 0600);
+        }
+        return $stored;
+    }
+    try {
+        $generated = bin2hex(random_bytes(16));
+    } catch (Throwable $_) {
+        $generated = hash("sha256", uniqid((string)mt_rand(), true));
+        $generated = substr($generated, 0, 32);
+    }
+    set_setting($db, "admin_token", $generated);
+    @file_put_contents($admin_token_file, PHP_GUARD . "ADMIN_TOKEN=" . $generated . "\n", LOCK_EX);
+    @chmod($admin_token_file, 0600);
+    return $generated;
+}
+
+$expected_admin_token = get_or_create_admin_token($db, $admin_token_file);
+
+function get_space_width_float($range_min_hex, $range_max_hex) {
+    if (extension_loaded("gmp")) {
+        $cmin = preg_replace('/^0[xX]/', '', trim($range_min_hex));
+        $cmax = preg_replace('/^0[xX]/', '', trim($range_max_hex));
+        if (!empty($cmin) && !empty($cmax)) {
+            $gmin = gmp_init($cmin, 16);
+            $gmax = gmp_init($cmax, 16);
+            $gw = gmp_sub($gmax, $gmin);
+            if (gmp_cmp($gw, 0) > 0) {
+                $str = gmp_strval($gw, 10);
+                $val = (float)$str;
+                if ($val > 0 && !is_infinite($val)) {
+                    return $val;
+                }
+            }
+        }
+    }
+    return SPACE_WIDTH_140;
 }
 
 function secp256k1_point_add($p1, $p2, $prime) {
@@ -150,13 +292,11 @@ function secp256k1_point_add($p1, $p2, $prime) {
     list($x2, $y2) = $p2;
     if (gmp_cmp($x1, $x2) == 0) {
         if (gmp_cmp($y1, $y2) != 0) return null; // point at infinity
-        // Point doubling: lambda = (3 * x1^2) / (2 * y1) mod p
         $num = gmp_mod(gmp_mul(gmp_init(3), gmp_powm($x1, gmp_init(2), $prime)), $prime);
         $den = gmp_invert(gmp_mod(gmp_mul(gmp_init(2), $y1), $prime), $prime);
         if ($den === false) return null;
         $lambda = gmp_mod(gmp_mul($num, $den), $prime);
     } else {
-        // Point addition: lambda = (y2 - y1) / (x2 - x1) mod p
         $num = gmp_mod(gmp_sub($y2, $y1), $prime);
         if (gmp_sign($num) < 0) $num = gmp_add($num, $prime);
         $den_raw = gmp_mod(gmp_sub($x2, $x1), $prime);
@@ -165,10 +305,8 @@ function secp256k1_point_add($p1, $p2, $prime) {
         if ($den === false) return null;
         $lambda = gmp_mod(gmp_mul($num, $den), $prime);
     }
-    // x3 = lambda^2 - x1 - x2 mod p
     $x3 = gmp_mod(gmp_sub(gmp_sub(gmp_powm($lambda, gmp_init(2), $prime), $x1), $x2), $prime);
     if (gmp_sign($x3) < 0) $x3 = gmp_add($x3, $prime);
-    // y3 = lambda * (x1 - x3) - y1 mod p
     $y3 = gmp_mod(gmp_sub(gmp_mul($lambda, gmp_sub($x1, $x3)), $y1), $prime);
     if (gmp_sign($y3) < 0) $y3 = gmp_add($y3, $prime);
     return [$x3, $y3];
@@ -204,10 +342,10 @@ function secp256k1_pubkey_from_privkey($priv_hex) {
 function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex, $target_pubkey_hex = "") {
     if (extension_loaded("gmp")) {
         $n = gmp_init(SECP_N, 16);
-        $min = gmp_init($range_min_hex, 16);
-        $max = gmp_init($range_max_hex, 16);
-        $dt = gmp_init($tame_dist_hex, 16);
-        $dw = gmp_init($wild_dist_hex, 16);
+        $min = gmp_init(preg_replace('/^0[xX]/', '', trim($range_min_hex)) ?: "0", 16);
+        $max = gmp_init(preg_replace('/^0[xX]/', '', trim($range_max_hex)) ?: "0", 16);
+        $dt = gmp_init(preg_replace('/^0[xX]/', '', trim($tame_dist_hex)) ?: "0", 16);
+        $dw = gmp_init(preg_replace('/^0[xX]/', '', trim($wild_dist_hex)) ?: "0", 16);
 
         // Candidate 1: k1 = (dt - dw) mod n
         $diff1 = gmp_sub($dt, $dw);
@@ -259,40 +397,42 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
     }
 }
 
-/**
- * Calculate dynamic hit probability based on Birthday Paradox / Kangaroo Walk
- * Space W = 2^139 ≈ 6.968e41
- * Each DP represents 2^23 steps (≈ 8,388,608 steps)
- */
-
 function parse_incoming_dp_payload() {
     $raw = file_get_contents("php://input");
     if (empty($raw)) return null;
 
-    if (strlen($raw) >= 16) {
+    $len = strlen($raw);
+    if ($len >= 16) {
         $magic = substr($raw, 0, 4);
         if ($magic === "DPKG" || $magic === "KGDP") {
             $hdr = unpack("nver/nwid_len", substr($raw, 4, 4));
+            if (!$hdr) return null;
             $pos = 8;
+            if ($pos + $hdr["wid_len"] + 2 > $len) return null;
             $wid = substr($raw, $pos, $hdr["wid_len"]);
             $pos += $hdr["wid_len"];
 
             $hw_hdr = unpack("nhw_len", substr($raw, $pos, 2));
+            if (!$hw_hdr) return null;
             $pos += 2;
+            if ($pos + $hw_hdr["hw_len"] + 2 > $len) return null;
             $hw = substr($raw, $pos, $hw_hdr["hw_len"]);
             $pos += $hw_hdr["hw_len"];
 
             $hr_hdr = unpack("nhr_len", substr($raw, $pos, 2));
+            if (!$hr_hdr) return null;
             $pos += 2;
+            if ($pos + $hr_hdr["hr_len"] + 4 > $len) return null;
             $hr = substr($raw, $pos, $hr_hdr["hr_len"]);
             $pos += $hr_hdr["hr_len"];
 
             $cnt_hdr = unpack("Ncount", substr($raw, $pos, 4));
+            if (!$cnt_hdr) return null;
             $pos += 4;
             $count = $cnt_hdr["count"];
 
             $dps = [];
-            for ($i = 0; $i < $count && ($pos + 64) <= strlen($raw); ++$i) {
+            for ($i = 0; $i < $count && ($pos + 64) <= $len; ++$i) {
                 $bin_x = substr($raw, $pos, 32);
                 $pos += 32;
                 $bin_dist = substr($raw, $pos, 32);
@@ -318,13 +458,16 @@ function parse_incoming_dp_payload() {
     return null;
 }
 
-function calculate_hit_probability($total_traps, $wild_steps = 0) {
-    $dp_step = pow(2, 23); // 8388608
-    $w = 6.968e41; // 2^139
+/**
+ * Calculate dynamic hit probability based on Centered Wild [-W/2, +W/2] Kangaroo Walk
+ * Average range overlap factor across [A, A+W] with centered Wild is 0.75 (minimum >= 0.50 everywhere)
+ */
+function calculate_hit_probability($total_traps, $wild_steps = 0, $dp_bits = 23, $space_w = SPACE_WIDTH_140) {
+    $dp_step = pow(2, max(1, (int)$dp_bits));
+    $w = ($space_w > 0) ? (float)$space_w : SPACE_WIDTH_140;
     $tame_steps = (float)$total_traps * $dp_step;
 
     if ($wild_steps <= 0) {
-        // Giai doan TAME: Chua co chuot Wild nao chay => Xac suat va cham thuc te = 0!
         return [
             "mode" => "TAME_ONLY",
             "prob_numeric" => 0.0,
@@ -335,8 +478,8 @@ function calculate_hit_probability($total_traps, $wild_steps = 0) {
             "wild_steps_scientific" => "0"
         ];
     } else {
-        // Giai doan WILD: Co chuot Wild dang chay => Xac suat va cham thuc te P = 1 - exp(- (T * W) / (2 * Space))
-        $exponent = ($tame_steps * (float)$wild_steps) / (2.0 * $w);
+        // Centered [-W/2, +W/2] Wild distribution yields 0.75 average overlap across [range_min, range_max]
+        $exponent = (0.75 * $tame_steps * (float)$wild_steps) / $w;
         $prob = 1.0 - exp(-$exponent);
         return [
             "mode" => "WILD_ACTIVE",
@@ -355,16 +498,15 @@ $action = isset($_GET["action"]) ? $_GET["action"] : "";
 // API 1: GET TASK
 if ($action === "get_task") {
     header("Content-Type: application/json");
-    $worker_id = isset($_GET["worker_id"]) ? $_GET["worker_id"] : "anon_node";
-    $hardware = isset($_GET["hardware"]) ? $_GET["hardware"] : "Node";
-
     $tame_count = intval(get_setting($db, "total_tame_traps", "0"));
     $target_dp = intval(get_setting($db, "target_dp", "50000000"));
+    $is_solved = (file_exists($vault_path) || file_exists($legacy_vault_path));
 
     $task_type = ($tame_count >= $target_dp) ? "WILD" : "TAME";
 
     echo json_encode([
-        "status" => "OK",
+        "status" => $is_solved ? "BINGO" : "OK",
+        "stop" => $is_solved,
         "task_type" => $task_type,
         "current_traps" => $tame_count,
         "target_traps" => $target_dp,
@@ -373,7 +515,7 @@ if ($action === "get_task") {
         "target_pubkey" => get_setting($db, "target_pubkey"),
         "dp_mask_bits" => intval(get_setting($db, "dp_mask_bits", "23")),
         "batch_limit" => 1000,
-        "heartbeat_sec" => ($task_type === "WILD") ? 30 : 60
+        "heartbeat_sec" => ($task_type === "WILD") ? 15 : 30
     ]);
     exit;
 }
@@ -381,6 +523,12 @@ if ($action === "get_task") {
 // API 2 & 3: SUBMIT TAME & CHECK WILD
 if ($action === "submit_tame" || $action === "check_wild") {
     header("Content-Type: application/json");
+
+    if (file_exists($vault_path) || file_exists($legacy_vault_path)) {
+        echo json_encode(["status" => "BINGO", "stop" => true]);
+        exit;
+    }
+
     $payload = parse_incoming_dp_payload();
 
     if (!$payload || !isset($payload["dp_list"]) || !is_array($payload["dp_list"])) {
@@ -388,47 +536,60 @@ if ($action === "submit_tame" || $action === "check_wild") {
         exit;
     }
 
-    $worker_id = isset($payload["worker_id"]) ? $payload["worker_id"] : "anon";
-    $hardware = isset($payload["hardware"]) ? $payload["hardware"] : "Node";
-    $hashrate = isset($payload["hashrate"]) ? $payload["hashrate"] : "0.00 MH/s";
+    $worker_id = substr((string)($payload["worker_id"] ?? "anon"), 0, 128);
+    $hardware = substr((string)($payload["hardware"] ?? "Node"), 0, 160);
+    $hashrate = substr((string)($payload["hashrate"] ?? "0.00 MH/s"), 0, 64);
     $dp_list = $payload["dp_list"];
     $batch_size = count($dp_list);
     $current_mode = ($action === "check_wild") ? "WILD" : "TAME";
 
-    // Update worker status
-    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                            ON CONFLICT(worker_id) DO UPDATE SET
-                                hardware = :hw,
-                                hashrate = :hr,
-                                mode = :mode,
-                                total_dps = total_dps + :dps,
-                                last_seen = CURRENT_TIMESTAMP;");
-    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
-    $w_stmt->execute();
+    // Update worker status with lock retry
+    for ($w_att = 0; $w_att < 4; $w_att++) {
+        try {
+            $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                    VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                    ON CONFLICT(worker_id) DO UPDATE SET
+                                        hardware = :hw,
+                                        hashrate = :hr,
+                                        mode = :mode,
+                                        total_dps = total_dps + :dps,
+                                        last_seen = CURRENT_TIMESTAMP;");
+            $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+            $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+            $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+            $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+            $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+            $w_stmt->execute();
+            $w_stmt->close();
+            break;
+        } catch (Throwable $ex) {
+            usleep(10000 * ($w_att + 1));
+        }
+    }
 
     if ($action === "submit_tame") {
-        $saved = 0;
         $shard_groups = [];
 
         foreach ($dp_list as $dp) {
             $bin_x = $dp["bin_x"];
             $bin_dist = $dp["bin_dist"];
-            // Shard theo byte đuôi (LSB, bin_x[31]) để phân bố ngẫu nhiên đều 256 shards (tránh 23-bit DP 0 ở đầu)
+            // Shard theo byte đuôi (LSB, bin_x[31]) để phân bố ngẫu nhiên đều 256 shards
             $shard_idx = ord($bin_x[31]);
-            $packed_dist = (strlen($bin_dist) == 32) ? substr($bin_dist, -18) : $bin_dist;
+            // Nén không mất mát: cắt byte 0x00 dư ở đầu (18 byte cho Puzzle #140, hỗ trợ đầy đủ tới 256-bit)
+            $packed_dist = ltrim($bin_dist, "\0");
+            if ($packed_dist === "") {
+                $packed_dist = "\0";
+            }
             $shard_groups[$shard_idx][] = ["x" => $bin_x, "dist" => $packed_dist];
-            $saved++;
         }
 
-        // Write directly to the corresponding 256 shard databases in data/shards/ with retry
+        $actual_inserted = 0;
+
         foreach ($shard_groups as $shard_idx => $group) {
             $sdb = get_shard_db($shard_idx);
             for ($attempt = 0; $attempt < 5; $attempt++) {
+                $shard_added = 0;
+                $sins = null;
                 try {
                     $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
                     $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES (:x, :dist);");
@@ -436,27 +597,44 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         $sins->bindValue(":x", $item["x"], SQLITE3_BLOB);
                         $sins->bindValue(":dist", $item["dist"], SQLITE3_BLOB);
                         $sins->execute();
+                        $sins->reset();
+                        $shard_added += $sdb->changes();
                     }
+                    $sins->close();
+                    $sins = null;
                     $sdb->exec("COMMIT;");
+                    $actual_inserted += $shard_added;
                     break;
-                } catch (Exception $ex) {
-                    @$sdb->exec("ROLLBACK;");
-                    usleep(15000 * ($attempt + 1));
+                } catch (Throwable $ex) {
+                    if ($sins) {
+                        try { $sins->close(); } catch (Throwable $_) {}
+                    }
+                    try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_) {}
+                    if ($attempt === 4) {
+                        if ($actual_inserted > 0) {
+                            increment_setting_int($db, "total_tame_traps", $actual_inserted);
+                        }
+                        http_response_code(503);
+                        echo json_encode(["status" => "BUSY", "message" => "Shard busy, retry"]);
+                        exit;
+                    }
+                    usleep(20000 * ($attempt + 1));
                 }
             }
         }
 
-        // Update cached total count in system.db
-        $prev_total = intval(get_setting($db, "total_tame_traps", "0"));
-        $total = $prev_total + $saved;
-        set_setting($db, "total_tame_traps", (string)$total);
+        // Atomic increment of total_tame_traps in system.db
+        $total = increment_setting_int($db, "total_tame_traps", $actual_inserted);
         $target_dp = intval(get_setting($db, "target_dp", "50000000"));
+        $dp_bits = intval(get_setting($db, "dp_mask_bits", "23"));
+        $space_w = get_space_width_float(get_setting($db, "range_min"), get_setting($db, "range_max"));
         $task_type = ($total >= $target_dp) ? "WILD" : "TAME";
-        $prob_info = calculate_hit_probability($total, 0);
+        $prob_info = calculate_hit_probability($total, 0, $dp_bits, $space_w);
 
         echo json_encode([
             "status" => "OK",
-            "accepted" => $saved,
+            "accepted" => $actual_inserted,
+            "received" => $batch_size,
             "total_traps" => $total,
             "task_type" => $task_type,
             "probability" => $prob_info["prob_scientific"]
@@ -465,10 +643,11 @@ if ($action === "submit_tame" || $action === "check_wild") {
     }
 
     if ($action === "check_wild") {
-        // Increment wild steps counter
-        $prev_wild = floatval(get_setting($db, "total_wild_steps", "0"));
-        $added_steps = ($batch_size > 0) ? ($batch_size * pow(2, 23)) : 50000000; // estimated batch steps
-        set_setting($db, "total_wild_steps", (string)($prev_wild + $added_steps));
+        $dp_bits = intval(get_setting($db, "dp_mask_bits", "23"));
+        $added_steps = ($batch_size > 0) ? ((float)$batch_size * pow(2, max(1, $dp_bits))) : 0.0;
+        if ($added_steps > 0.0) {
+            increment_setting_float($db, "total_wild_steps", $added_steps);
+        }
 
         $range_min = get_setting($db, "range_min");
         $range_max = get_setting($db, "range_max");
@@ -476,13 +655,25 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
         $shard_groups = [];
         foreach ($dp_list as $dp) {
-            // Shard theo byte đuôi (LSB, bin_x[31]) để khớp với bảng bẫy của tame_traps
             $shard_idx = ord($dp["bin_x"][31]);
             $shard_groups[$shard_idx][] = $dp;
         }
 
         foreach ($shard_groups as $shard_idx => $group) {
             $sdb = get_shard_db($shard_idx);
+            $schk = null;
+            for ($prep_att = 0; $prep_att < 3; $prep_att++) {
+                try {
+                    $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
+                    break;
+                } catch (Throwable $ex) {
+                    usleep(10000 * ($prep_att + 1));
+                }
+            }
+            if (!$schk) {
+                continue;
+            }
+
             foreach ($group as $dp) {
                 $bin_x = $dp["bin_x"];
                 $bin_dist = $dp["bin_dist"];
@@ -490,74 +681,96 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $row = false;
                 for ($attempt = 0; $attempt < 3; $attempt++) {
                     try {
-                        $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
+                        $schk->reset();
                         $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
                         $sres = $schk->execute();
                         $row = $sres ? $sres->fetchArray(SQLITE3_ASSOC) : false;
+                        if ($sres) {
+                            $sres->finalize();
+                        }
                         break;
-                    } catch (Exception $ex) {
+                    } catch (Throwable $ex) {
                         usleep(10000 * ($attempt + 1));
                     }
                 }
 
-            if ($row) {
-                // COLLISION DETECTED!
-                $raw_tame_dist = $row["total_distance"];
-                if (strlen($raw_tame_dist) < 32) {
-                    $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
+                if ($row) {
+                    $raw_tame_dist = $row["total_distance"];
+                    if (strlen($raw_tame_dist) < 32) {
+                        $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
+                    }
+                    $tame_dist_hex = bin2hex($raw_tame_dist);
+                    $wild_dist_hex = bin2hex($bin_dist);
+                    $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
+
+                    if (!empty($target_pubkey) && empty($cands["is_verified"])) {
+                        continue;
+                    }
+
+                    try { $schk->close(); } catch (Throwable $_) {}
+
+                    // Write to PHP-guarded server vault (0600, executes 403 exit even on Nginx if hit directly)
+                    $vault_data = json_encode([
+                        "instance" => $instance_clean,
+                        "timestamp_utc" => gmdate("Y-m-d H:i:s"),
+                        "worker_id" => $worker_id,
+                        "hardware" => $hardware,
+                        "collision_dp_x" => "0x" . bin2hex($bin_x),
+                        "candidate_1" => $cands["cand1"],
+                        "candidate_2" => $cands["cand2"],
+                        "candidate_1_in_range" => $cands["cand1_in_range"],
+                        "candidate_2_in_range" => $cands["cand2_in_range"],
+                        "is_verified" => $cands["is_verified"],
+                        "derived_pubkey" => $cands["derived_pubkey"],
+                        "verified_key" => $cands["verified_key"],
+                        "tame_distance" => "0x" . $tame_dist_hex,
+                        "wild_distance" => "0x" . $wild_dist_hex
+                    ], JSON_PRETTY_PRINT);
+
+                    $vault_file_content = PHP_GUARD . $vault_data . "\n";
+                    file_put_contents($vault_path, $vault_file_content, LOCK_EX);
+                    @chmod($vault_path, 0600);
+
+                    echo json_encode([
+                        "status" => "BINGO",
+                        "stop" => true
+                    ]);
+                    exit;
                 }
-                $tame_dist_hex = bin2hex($raw_tame_dist);
-                $wild_dist_hex = bin2hex($bin_dist);
-                $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
-
-                // Verification check: ensure pubkey matches target_pubkey
-                if (!empty($target_pubkey) && empty($cands["is_verified"])) {
-                    // False collision or unverified key - continue checking
-                    continue;
-                }
-
-                // Write to secure server vault (permissions 0600, never exposed in JSON response or UI)
-                $vault_data = json_encode([
-                    "puzzle" => "#140",
-                    "timestamp_utc" => gmdate("Y-m-d H:i:s"),
-                    "worker_id" => $worker_id,
-                    "hardware" => $hardware,
-                    "collision_dp_x" => "0x" . bin2hex($bin_x),
-                    "candidate_1" => $cands["cand1"],
-                    "candidate_2" => $cands["cand2"],
-                    "candidate_1_in_range" => $cands["cand1_in_range"],
-                    "candidate_2_in_range" => $cands["cand2_in_range"],
-                    "is_verified" => $cands["is_verified"],
-                    "derived_pubkey" => $cands["derived_pubkey"],
-                    "verified_key" => $cands["verified_key"],
-                    "tame_distance" => "0x" . $tame_dist_hex,
-                    "wild_distance" => "0x" . $wild_dist_hex
-                ], JSON_PRETTY_PRINT);
-
-                $vault_file_content = "<?php http_response_code(403); exit; ?>\n" . $vault_data;
-                file_put_contents($vault_path, $vault_file_content, LOCK_EX);
-                chmod($vault_path, 0600);
-
-                // Zero information leak: return only status BINGO and stop flag
-                echo json_encode([
-                    "status" => "BINGO",
-                    "stop" => true
-                ]);
-                exit;
             }
-        }
-    }
 
-        echo json_encode(["status" => "CONTINUE", "stop" => false, "checked" => $batch_size]);
+            try { $schk->close(); } catch (Throwable $_) {}
+        }
+
+        $total_traps = intval(get_setting($db, "total_tame_traps", "0"));
+        $target_dp = intval(get_setting($db, "target_dp", "50000000"));
+        $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
+
+        echo json_encode([
+            "status" => "CONTINUE",
+            "stop" => false,
+            "checked" => $batch_size,
+            "task_type" => $task_type
+        ]);
         exit;
     }
 }
 
-// API 4: SET TARGET DP
+// API 4: SET TARGET DP (Protected by ADMIN_TOKEN)
 if ($action === "set_target_dp") {
     header("Content-Type: application/json");
     $input = file_get_contents("php://input");
-    $payload = json_decode($input, true);
+    $payload = json_decode($input, true) ?: [];
+
+    $hdr_token = $_SERVER["HTTP_X_ADMIN_TOKEN"] ?? "";
+    $provided_token = trim((string)($payload["admin_token"] ?? $hdr_token));
+
+    if (empty($provided_token) || !hash_equals($expected_admin_token, $provided_token)) {
+        http_response_code(403);
+        echo json_encode(["status" => "ERROR", "message" => "Unauthorized: Invalid admin_token (check data/" . $instance_clean . "/.admin_token.php)"]);
+        exit;
+    }
+
     if (isset($payload["target_dp"])) {
         $val = intval($payload["target_dp"]);
         if ($val > 0) {
@@ -576,38 +789,47 @@ if ($action === "get_stats") {
     $total_traps = intval(get_setting($db, "total_tame_traps", "0"));
     $target_dp = intval(get_setting($db, "target_dp", "50000000"));
     $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
-    $prob = calculate_hit_probability($total_traps, $wild_steps);
+    $dp_bits = intval(get_setting($db, "dp_mask_bits", "23"));
+    $space_w = get_space_width_float(get_setting($db, "range_min"), get_setting($db, "range_max"));
+    $prob = calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w);
 
-    $workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
     $workers_list = [];
     $total_hashrate_mhs = 0.0;
     $online_count = 0;
     $now_ts = time();
 
-    while ($workers_res && ($w = $workers_res->fetchArray(SQLITE3_ASSOC))) {
-        $last_ts = strtotime($w["last_seen"] . " UTC");
-        $diff_sec = max(0, $now_ts - $last_ts);
-        $is_online = ($diff_sec <= 120);
-        $w["is_online"] = $is_online;
-        $w["diff_sec"] = $diff_sec;
+    try {
+        $workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
+        while ($workers_res && ($w = $workers_res->fetchArray(SQLITE3_ASSOC))) {
+            $last_ts = strtotime($w["last_seen"] . " UTC");
+            $diff_sec = max(0, $now_ts - $last_ts);
+            $is_online = ($diff_sec <= 120);
+            $w["is_online"] = $is_online;
+            $w["diff_sec"] = $diff_sec;
 
-        if ($is_online) {
-            $online_count++;
-            if (preg_match("/([\\d\\.]+)/", $w["hashrate"], $m)) {
-                $total_hashrate_mhs += floatval($m[1]);
+            if ($is_online) {
+                $online_count++;
+                if (preg_match("/([\d\.]+)/", $w["hashrate"], $m)) {
+                    $total_hashrate_mhs += floatval($m[1]);
+                }
             }
+            $workers_list[] = $w;
         }
-        $workers_list[] = $w;
-    }
+        if ($workers_res) {
+            $workers_res->finalize();
+        }
+    } catch (Throwable $_) {}
 
     $total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
     $shard_files = glob($shards_dir . "/traps_*.db*") ?: [];
     foreach ($shard_files as $sf) {
-        $total_bytes += filesize($sf);
+        $total_bytes += @filesize($sf);
     }
     $db_size_mb = round($total_bytes / (1024 * 1024), 2);
+    $vault_solved = (file_exists($vault_path) || file_exists($legacy_vault_path));
 
     echo json_encode([
+        "instance" => $instance_clean,
         "current_dp" => $total_traps,
         "current_dp_formatted" => number_format($total_traps),
         "target_dp" => $target_dp,
@@ -621,7 +843,7 @@ if ($action === "get_stats") {
         "database_size_mb" => $db_size_mb,
         "winning_probability" => $prob,
         "workers" => $workers_list,
-        "vault_solved" => file_exists($vault_path)
+        "vault_solved" => $vault_solved
     ]);
     exit;
 }
@@ -716,7 +938,7 @@ if ($action === "get_stats") {
 function get_verify_bounds($id, $vec) {
     $min = preg_replace('/^0[xX]/', '', $vec["min"]);
     $max = preg_replace('/^0[xX]/', '', $vec["max"]);
-    return [ltrim($min, '0'), ltrim($max, '0')];
+    return [ltrim($min, '0') ?: '0', ltrim($max, '0') ?: '0'];
 }
 
 // API: DYNAMIC RANDOMIZED VERIFICATION SUITE (action=verify_random)
@@ -755,13 +977,10 @@ if ($action === "verify_random") {
     }
 }
 
-// API 6: UNIFIED VERIFICATION ENDPOINT (action=verify, backwards compatible with legacy aliases)
-// GET: Returns public catalog of all 83 puzzles (or single puzzle if ?id= is given) - zero private keys
-// POST: Validates solved key against Server Ground Truth
+// API 6: UNIFIED VERIFICATION ENDPOINT
 if ($action === "verify" || $action === "get_verify_puzzle" || $action === "check_puzzle_status" || $action === "verify_solution") {
     header("Content-Type: application/json");
 
-    // POST / Solution Verification
     if ($_SERVER["REQUEST_METHOD"] === "POST" || $action === "verify_solution") {
         $input = file_get_contents("php://input");
         $payload = json_decode($input, true);
@@ -781,7 +1000,6 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
         exit;
     }
 
-    // Legacy status check
     if ($action === "check_puzzle_status") {
         $id = isset($_GET["id"]) ? intval($_GET["id"]) : 0;
         if (isset($VERIFY_PUZZLES[$id])) {
@@ -792,7 +1010,6 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
         exit;
     }
 
-    // Single puzzle GET query
     if (isset($_GET["id"]) && intval($_GET["id"]) > 0) {
         $id = intval($_GET["id"]);
         if (isset($VERIFY_PUZZLES[$id])) {
@@ -813,7 +1030,6 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
         exit;
     }
 
-    // Default GET: Return all 83 public puzzles with clean hex strings (no 0x) and zero private keys
     $catalog = [];
     foreach ($VERIFY_PUZZLES as $id => $vec) {
         list($min_clean, $max_clean) = get_verify_bounds($id, $vec);
@@ -837,38 +1053,45 @@ if ($action === "verify" || $action === "get_verify_puzzle" || $action === "chec
 // Web Dashboard
 $total_traps = intval(get_setting($db, "total_tame_traps", "0"));
 $target_dp = intval(get_setting($db, "target_dp", "50000000"));
-$vault_exists = file_exists($vault_path);
+$vault_exists = (file_exists($vault_path) || file_exists($legacy_vault_path));
 
 $total_bytes = file_exists($db_path) ? filesize($db_path) : 0;
 $shard_files = glob($shards_dir . "/traps_*.db*") ?: [];
 foreach ($shard_files as $sf) {
-    $total_bytes += filesize($sf);
+    $total_bytes += @filesize($sf);
 }
 $db_size_mb = round($total_bytes / (1024 * 1024), 2);
 $wild_steps = floatval(get_setting($db, "total_wild_steps", "0"));
-$prob_info = calculate_hit_probability($total_traps, $wild_steps);
+$dp_bits = intval(get_setting($db, "dp_mask_bits", "23"));
+$space_w = get_space_width_float(get_setting($db, "range_min"), get_setting($db, "range_max"));
+$prob_info = calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w);
 
-$workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
 $workers = [];
 $total_hashrate_mhs = 0.0;
 $active_workers_count = 0;
 $now_ts = time();
 
-while ($workers_res && ($w = $workers_res->fetchArray(SQLITE3_ASSOC))) {
-    $last_ts = strtotime($w["last_seen"] . " UTC");
-    $diff_sec = max(0, $now_ts - $last_ts);
-    $is_online = ($diff_sec <= 120);
-    $w["is_online"] = $is_online;
-    $w["diff_sec"] = $diff_sec;
+try {
+    $workers_res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
+    while ($workers_res && ($w = $workers_res->fetchArray(SQLITE3_ASSOC))) {
+        $last_ts = strtotime($w["last_seen"] . " UTC");
+        $diff_sec = max(0, $now_ts - $last_ts);
+        $is_online = ($diff_sec <= 120);
+        $w["is_online"] = $is_online;
+        $w["diff_sec"] = $diff_sec;
 
-    if ($is_online) {
-        $active_workers_count++;
-        if (preg_match("/([\\d\\.]+)/", $w["hashrate"], $m)) {
-            $total_hashrate_mhs += floatval($m[1]);
+        if ($is_online) {
+            $active_workers_count++;
+            if (preg_match("/([\d\.]+)/", $w["hashrate"], $m)) {
+                $total_hashrate_mhs += floatval($m[1]);
+            }
         }
+        $workers[] = $w;
     }
-    $workers[] = $w;
-}
+    if ($workers_res) {
+        $workers_res->finalize();
+    }
+} catch (Throwable $_) {}
 
 $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2));
 ?>
@@ -877,7 +1100,7 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kangaroo Master Coordinator - Bitcoin Puzzle #140</title>
+    <title>Kangaroo Master Coordinator - <?= htmlspecialchars($instance_clean) ?></title>
     <style>
         * { box-sizing: border-box; }
         body { background: #0b1120; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; margin: 0; padding: 24px; }
@@ -893,7 +1116,6 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #334155; font-size: 13px; }
         th { color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-        .prob-box { background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px; padding: 16px; margin-top: 10px; }
         .progress-bar-bg { background: #334155; border-radius: 4px; height: 6px; margin: 8px 0; overflow: hidden; }
         .progress-bar-fill { background: #38bdf8; height: 100%; border-radius: 4px; transition: width 0.3s; }
         .pulse-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #34d399; }
@@ -901,9 +1123,13 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
         .btn-toggle:hover { background: #475569; color: #fff; }
     </style>
     <script>
-        // Smooth In-Place AJAX Data Polling (Zero Screen Flickering, Zero Page Reload)
+        const INSTANCE_ID = <?= json_encode($instance_clean) ?>;
         let autoRefresh = true;
         let secondsLeft = 10;
+
+        function apiUrl(action) {
+            return "?instance=" + encodeURIComponent(INSTANCE_ID) + "&action=" + encodeURIComponent(action);
+        }
 
         function toggleAutoRefresh() {
             autoRefresh = !autoRefresh;
@@ -915,11 +1141,10 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
 
         async function fetchStatsSilently() {
             try {
-                const res = await fetch("?action=get_stats");
+                const res = await fetch(apiUrl("get_stats"));
                 if (!res.ok) return;
                 const data = await res.json();
 
-                // 1. Update Core Metric Elements without page reload
                 const elTraps = document.getElementById("val-traps");
                 if (elTraps) elTraps.innerText = data.current_dp_formatted;
 
@@ -949,14 +1174,23 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
                     }
                 }
 
-                // 2. Hashrate & Workers
+                const elVaultBadge = document.getElementById("val-vault-badge");
+                if (elVaultBadge) {
+                    if (data.vault_solved) {
+                        elVaultBadge.className = "badge badge-green";
+                        elVaultBadge.innerText = "BINGO SOLVED";
+                    } else {
+                        elVaultBadge.className = "badge badge-amber";
+                        elVaultBadge.innerText = "ĐANG SĂN";
+                    }
+                }
+
                 const elHashrate = document.getElementById("val-hashrate");
                 if (elHashrate) elHashrate.innerText = data.total_hashrate_mhs;
 
                 const elWorkersCount = document.getElementById("val-workers-count");
                 if (elWorkersCount) elWorkersCount.innerText = data.active_workers_count + " Online (" + data.total_workers_count + " tổng)";
 
-                // 3. Probability & Odds
                 const elProb = document.getElementById("val-prob");
                 if (elProb && data.winning_probability) elProb.innerText = data.winning_probability.prob_percent;
 
@@ -966,41 +1200,47 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
                 const elProbSci = document.getElementById("val-prob-sci");
                 if (elProbSci && data.winning_probability) elProbSci.innerText = data.winning_probability.prob_scientific;
 
-                // 4. DB Size
                 const elDbSize = document.getElementById("val-dbsize");
                 if (elDbSize) elDbSize.innerText = data.database_size_mb;
 
-                // 5. Workers Table Rows
                 if (Array.isArray(data.workers)) {
                     const tbody = document.getElementById("workers-tbody");
                     if (tbody) {
-                        let html = "";
-                        for (const w of data.workers) {
-                            const isOnline = w.is_online;
-                            const modeBadge = (w.mode === "WILD") ? "badge-green" : "badge-amber";
-                            const statusBadge = isOnline ? "badge-green" : "badge-gray";
-                            const statusText = isOnline ? "ONLINE" : "OFFLINE";
-                            html += `<tr>
-                                <td style="color: #38bdf8; font-weight: 600; font-family: monospace;">${escapeHtml(w.worker_id)}</td>
-                                <td>${escapeHtml(w.hardware || "Node")}</td>
-                                <td style="color: #34d399; font-weight: 600;">${escapeHtml(w.hashrate || "0.00 MH/s")}</td>
-                                <td><span class="badge ${modeBadge}">${escapeHtml(w.mode)}</span></td>
-                                <td>${Number(w.total_dps || 0).toLocaleString()}</td>
-                                <td style="color: #94a3b8; font-size: 12px;">${escapeHtml(w.last_seen)}</td>
-                                <td><span class="badge ${statusBadge}" style="font-size: 11px;">${statusText}</span></td>
-                            </tr>`;
+                        if (data.workers.length === 0) {
+                            tbody.innerHTML = '<tr><td colspan="7" style="color: #64748b; text-align: center; padding: 16px;">Chưa có worker nào kết nối. Khởi chạy với: <code>bash run.sh</code></td></tr>';
+                        } else {
+                            let html = "";
+                            for (const w of data.workers) {
+                                const isOnline = w.is_online;
+                                const modeBadge = (w.mode === "WILD") ? "badge-green" : "badge-amber";
+                                const statusBadge = isOnline ? "badge-green" : "badge-gray";
+                                const statusText = isOnline ? "ONLINE" : "OFFLINE";
+                                html += `<tr>
+                                    <td style="color: #38bdf8; font-weight: 600; font-family: monospace;">${escapeHtml(w.worker_id)}</td>
+                                    <td>${escapeHtml(w.hardware || "Node")}</td>
+                                    <td style="color: #34d399; font-weight: 600;">${escapeHtml(w.hashrate || "0.00 MH/s")}</td>
+                                    <td><span class="badge ${modeBadge}">${escapeHtml(w.mode)}</span></td>
+                                    <td>${Number(w.total_dps || 0).toLocaleString()}</td>
+                                    <td style="color: #94a3b8; font-size: 12px;">${escapeHtml(w.last_seen)}</td>
+                                    <td><span class="badge ${statusBadge}" style="font-size: 11px;">${statusText}</span></td>
+                                </tr>`;
+                            }
+                            tbody.innerHTML = html;
                         }
-                        tbody.innerHTML = html;
                     }
                 }
-            } catch (e) {
-                // Ignore transient network errors
-            }
+            } catch (e) {}
         }
 
         function escapeHtml(str) {
-            return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
         }
+
+        window.addEventListener("DOMContentLoaded", function() {
+            const savedTok = sessionStorage.getItem("kangaroo_admin_token");
+            const tokInput = document.getElementById("admin_token_input");
+            if (savedTok && tokInput) tokInput.value = savedTok;
+        });
 
         setInterval(function() {
             if (!autoRefresh) return;
@@ -1020,10 +1260,10 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
         <div>
             <h2 style="margin: 0; color: #38bdf8; font-size: 22px;">Kangaroo Master Coordinator</h2>
             <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
-                Secp256k1 Distributed Solver • Bitcoin Puzzle #140 [2^139 .. 2^140 - 1]
+                Secp256k1 Distributed Solver • Instance: <strong><?= htmlspecialchars($instance_clean) ?></strong>
             </div>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <span id="header-phase-badge" class="badge <?= ($total_traps < $target_dp) ? 'badge-amber' : 'badge-green' ?>">
                 <?= ($total_traps < $target_dp) ? 'GIAI ĐOẠN 1: TAME TRAPS (' . $progress_pct . '%)' : 'GIAI ĐOẠN 2: WILD HUNTING' ?>
             </span>
@@ -1033,9 +1273,7 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
         </div>
     </div>
 
-    <!-- Core Metrics Grid (4 Distinct, Non-overlapping Cards) -->
     <div class="grid">
-        <!-- Card 1: Collection Progress -->
         <div class="card">
             <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Tiến Độ Bẫy Tame</div>
             <div class="stat-val"><span id="val-traps"><?= number_format($total_traps) ?></span> <span id="val-target" style="font-size: 13px; font-weight: normal; color: #64748b;">/ <?= number_format($target_dp) ?> DPs</span></div>
@@ -1048,7 +1286,6 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
             </div>
         </div>
 
-        <!-- Card 2: Cluster Performance -->
         <div class="card">
             <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Hashrate Cụm Máy Trạm</div>
             <div class="stat-val" style="color: #34d399;"><span id="val-hashrate"><?= number_format($total_hashrate_mhs, 2) ?></span> <span style="font-size: 13px; font-weight: normal; color: #64748b;">MH/s</span></div>
@@ -1057,11 +1294,10 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
                     <span class="pulse-dot"></span>
                     <span id="val-workers-count"><?= $active_workers_count ?> Online (<?= count($workers) ?> tổng)</span>
                 </span>
-                <span style="color: #64748b;">Heartbeat 30-60s</span>
+                <span style="color: #64748b;">Batch 1,000 DPs</span>
             </div>
         </div>
 
-        <!-- Card 3: Real Collision Probability -->
         <div class="card">
             <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Xác Suất Trúng Giải Hiện Thời</div>
             <div class="stat-val" style="color: #38bdf8;"><span id="val-prob"><?= $prob_info["prob_percent"] ?></span></div>
@@ -1071,49 +1307,63 @@ $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2)
             </div>
         </div>
 
-        <!-- Card 4: Database Storage & Vault -->
         <div class="card">
             <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Cơ Sở Dữ Liệu & Vault</div>
             <div class="stat-val"><span id="val-dbsize"><?= $db_size_mb ?></span> <span style="font-size: 13px; font-weight: normal; color: #64748b;">MB</span></div>
             <div style="font-size: 11px; margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
                 <span style="color: #64748b;">SQLite WAL BLOB</span>
                 <?php if ($vault_exists): ?>
-                    <span class="badge badge-green" style="font-size: 11px;">BINGO SOLVED</span>
+                    <span id="val-vault-badge" class="badge badge-green" style="font-size: 11px;">BINGO SOLVED</span>
                 <?php else: ?>
-                    <span class="badge badge-amber" style="font-size: 11px;">ĐANG SĂN</span>
+                    <span id="val-vault-badge" class="badge badge-amber" style="font-size: 11px;">ĐANG SĂN</span>
                 <?php endif; ?>
             </div>
         </div>
     </div>
 
-    <!-- Configuration & Target Controller -->
     <div class="card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
         <div>
             <div style="font-weight: 600; font-size: 14px; color: #cbd5e1;">Cấu Hình Ngưỡng Tame (Target DP)</div>
             <div style="font-size: 11px; color: #64748b; margin-top: 3px;">
-                Tự động chuyển từ giai đoạn TAME sang WILD khi số điểm bẫy đạt ngưỡng này.
+                Tự động điều phối 2 chiều TAME ↔ WILD. Yêu cầu Admin Token (xem <code>data/<?= htmlspecialchars($instance_clean) ?>/.admin_token.php</code>).
             </div>
+            <div id="target_dp_msg" style="font-size: 11px; margin-top: 4px; display: none;"></div>
         </div>
-        <form method="POST" action="?action=set_target_dp" onsubmit="event.preventDefault(); updateTargetDP();" style="display: flex; gap: 8px;">
-            <input type="number" id="target_dp_input" value="<?= $target_dp ?>" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 160px;" />
+        <form method="POST" onsubmit="event.preventDefault(); updateTargetDP();" style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <input type="password" id="admin_token_input" placeholder="Admin Token" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 170px;" />
+            <input type="number" id="target_dp_input" value="<?= $target_dp ?>" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 150px;" />
             <button type="submit" style="background: #0284c7; border: none; color: #fff; padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;">Cập nhật</button>
         </form>
     </div>
 
     <script>
-        function updateTargetDP() {
+        async function updateTargetDP() {
             const val = document.getElementById('target_dp_input').value;
-            fetch('?action=set_target_dp', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({target_dp: parseInt(val)})
-            }).then(() => {
+            const tok = document.getElementById('admin_token_input').value.trim();
+            const msgEl = document.getElementById('target_dp_msg');
+            if (tok) sessionStorage.setItem('kangaroo_admin_token', tok);
+            try {
+                const res = await fetch(apiUrl('set_target_dp'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({target_dp: parseInt(val, 10), admin_token: tok})
+                });
+                const out = await res.json();
+                if (msgEl) {
+                    msgEl.style.display = 'block';
+                    if (res.ok && out.status === 'SUCCESS') {
+                        msgEl.style.color = '#34d399';
+                        msgEl.innerText = 'Đã cập nhật Target DP = ' + Number(out.target_dp).toLocaleString();
+                    } else {
+                        msgEl.style.color = '#f87171';
+                        msgEl.innerText = out.message || 'Cập nhật thất bại';
+                    }
+                }
                 fetchStatsSilently();
-            });
+            } catch (e) {}
         }
     </script>
 
-    <!-- Active Compute Nodes (Workers) -->
     <div class="card">
         <h3 style="margin: 0 0 12px 0; font-size: 15px; color: #cbd5e1;">
             Danh Sách Compute Nodes (Workers)

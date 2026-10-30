@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  # 1. BUILD CPU DAEMON (Ubuntu 22.04 with AVX2/BMI2)
+  # 1. BUILD CPU DAEMON (Ubuntu 22.04 with AVX2/BMI2 & AVX-512 IFMA)
   build-cpu-linux:
     name: Build CPU Daemon (Linux x86_64 - JeanLucPons Core)
     runs-on: ubuntu-22.04
@@ -34,7 +34,7 @@ jobs:
         run: |
           mkdir -p bin
           # 1. Baseline AVX2 / BMI2 (Universal compatibility for all x86_64 CPUs)
-          g++ -O3 -mavx2 -mbmi2 -Wno-write-strings \
+          g++ -std=c++17 -O3 -mavx2 -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -49,7 +49,7 @@ jobs:
           chmod +x bin/sysd_linux_cpu_x86_64
 
           # 2. AVX-512 IFMA (Targeted for Intel Gen 12-14 with AVX512 / AMD Zen 4-5 / EPYC / Xeon)
-          g++ -O3 -mavx512f -mavx512dq -mavx512ifma -mbmi2 -Wno-write-strings \
+          g++ -std=c++17 -O3 -mavx512f -mavx512dq -mavx512ifma -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -101,7 +101,7 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -O3 -DUSE_CUDA -Xcompiler -Wno-write-strings \
+          nvcc -std=c++17 -O3 -DUSE_CUDA -Xcompiler -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -147,7 +147,7 @@ jobs:
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -O3 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
+          clang++ -std=c++17 -O3 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
