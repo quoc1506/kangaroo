@@ -1259,15 +1259,14 @@ try {
 
         $vec = $VERIFY_PUZZLES[$pid];
         list($w_u, $_) = u256_sub(u256_from_hex($vec["max"]), u256_from_hex($vec["min"]));
-        if (u256_cmp($w_u, u256_from_int(255)) <= 0) {
+        if (u256_cmp($w_u, u256_from_int(4095)) <= 0) {
             $v_dp_bits = 4;
-            $v_target_dp = 4;
-        } elseif (u256_cmp($w_u, u256_from_int(65535)) <= 0) {
-            $v_dp_bits = 4;
-            $v_target_dp = 16;
+            $v_target_dp = 24;
+            $v_batch = 24;
         } else {
-            $v_dp_bits = 6;
-            $v_target_dp = 48;
+            $v_dp_bits = 5;
+            $v_target_dp = 64;
+            $v_batch = 64;
         }
 
         set_setting($db, "verify_puzzle_id", (string)$pid);
@@ -1276,7 +1275,7 @@ try {
         set_setting($db, "target_pubkey", $vec["pub"]);
         set_setting($db, "dp_mask_bits", (string)$v_dp_bits);
         set_setting($db, "target_dp", (string)$v_target_dp);
-        set_setting($db, "batch_limit", "64");
+        set_setting($db, "batch_limit", (string)$v_batch);
         set_setting($db, "heartbeat_sec", "1");
         set_setting($db, "total_tame_traps", "0");
         set_setting($db, "total_wild_steps", "0");

@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -106,6 +107,7 @@ struct DaemonState {
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
     std::vector<DPRecord> dp_queue;
+    std::unordered_set<std::string> seen_dp_x;
     std::mutex queue_mutex;
 } g_state;
 
@@ -228,6 +230,17 @@ static void ThreadRandRange(Int &out, Int &max_inclusive, uint64_t salt = 0) {
     }
 }
 
+// Minimum 1024-scalar forward span prevents lockstep kangaroo clones on tiny puzzles (#1..#10)
+// while remaining 100% identical to range_width on all ranges >= 1024 (#11..#140).
+static void ComputeSpawnSpan(Int &range_width, Int &out_span) {
+    Int min_span;
+    min_span.SetInt32(1024);
+    out_span.Set(&range_width);
+    if (min_span.IsGreater(&out_span)) {
+        out_span.Set(&min_span);
+    }
+}
+
 class JumpTable {
 public:
     Int d[NB_JUMP];
@@ -240,10 +253,12 @@ public:
             std::cerr << "[-] Fatal: JumpTable::init requires non-negative range_width\n";
             std::exit(1);
         }
-        int w_bits = range_width.GetBitLength();
-        int max_bit = (w_bits >= 30) ? ((w_bits + 5) / 2) : std::max(3, (w_bits + 3) / 2);
+        Int eff_span;
+        ComputeSpawnSpan(range_width, eff_span);
+        int w_bits = eff_span.GetBitLength();
+        int max_bit = (w_bits >= 30) ? ((w_bits + 5) / 2) : std::max(5, (w_bits + 3) / 2);
         if (max_bit > 120) max_bit = 120;
-        int span = (max_bit > 15) ? 15 : max_bit;
+        int span = (max_bit > 16) ? 15 : (max_bit - 1);
         int min_bit = max_bit - span;
 
         for (int i = 0; i < NB_JUMP; ++i) {
@@ -253,7 +268,9 @@ public:
             int bit_rem = bit % 64;
             uint64_t val = (1ULL << bit_rem);
             d[i].SetQWord(qword_idx, val);
-            if (i > 0) d[i].bits64[0] |= 1ULL;
+            Int odd_offset;
+            odd_offset.SetInt32(2 * i + 1);
+            d[i].Add(&odd_offset);
             J[i] = secp->ComputePublicKey(&d[i]);
             Jx[i].Set(&J[i].x);
             Jy[i].Set(&J[i].y);
@@ -416,8 +433,13 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
         {
             std::lock_guard<std::mutex> lock(g_state.queue_mutex);
             if (g_state.dp_queue.size() < MAX_QUEUE_DPS) {
+                if (g_state.seen_dp_x.size() >= MAX_QUEUE_DPS) {
+                    g_state.seen_dp_x.clear();
+                }
                 for (size_t idx = 0; idx < local_recs.size(); ++idx) {
-                    g_state.dp_queue.push_back(std::move(local_recs[idx]));
+                    if (g_state.seen_dp_x.insert(local_recs[idx].x_hex).second) {
+                        g_state.dp_queue.push_back(std::move(local_recs[idx]));
+                    }
                 }
                 local_recs.clear();
                 return;
@@ -426,8 +448,13 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+    if (g_state.seen_dp_x.size() >= MAX_QUEUE_DPS) {
+        g_state.seen_dp_x.clear();
+    }
     for (size_t idx = 0; idx < local_recs.size(); ++idx) {
-        g_state.dp_queue.push_back(std::move(local_recs[idx]));
+        if (g_state.seen_dp_x.insert(local_recs[idx].x_hex).second) {
+            g_state.dp_queue.push_back(std::move(local_recs[idx]));
+        }
     }
     local_recs.clear();
 }
@@ -447,6 +474,8 @@ inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
 static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Int range_min, Int range_max) {
     Int range_width(&range_max);
     range_width.Sub(&range_min);
+    Int spawn_span;
+    ComputeSpawnSpan(range_width, spawn_span);
 
     const uint64_t rng_salt = (uint64_t)thread_id * 7919ULL + 0x517CC1B727220A95ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
@@ -464,7 +493,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     auto spawn_tame_kangaroo = [&](int g) {
         while (true) {
             Int k_start;
-            ThreadRandRange(k_start, range_width, rng_salt);
+            ThreadRandRange(k_start, spawn_span, rng_salt);
             k_start.Add(&range_min);
             if (k_start.IsZero()) continue;
 
@@ -496,7 +525,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
-            if (dx[g].IsZero()) {
+            while (dx[g].IsZero()) {
                 jmp[g] = (jmp[g] + 1) & (NB_JUMP - 1);
                 dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
             }
@@ -557,6 +586,8 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Point target_pub, Int range_min, Int range_max) {
     Int range_width(&range_max);
     range_width.Sub(&range_min);
+    Int spawn_span;
+    ComputeSpawnSpan(range_width, spawn_span);
 
     Int w_half(&range_width);
     w_half.ShiftR(1);
@@ -584,7 +615,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     auto spawn_wild_kangaroo = [&](int g) {
         while (true) {
             Int r_scalar;
-            ThreadRandRange(r_scalar, range_width, rng_salt);
+            ThreadRandRange(r_scalar, spawn_span, rng_salt);
 
             Point P;
             if (r_scalar.IsZero()) {
@@ -621,7 +652,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         for (int g = 0; g < CPU_GRP_SIZE; ++g) {
             jmp[g] = (uint32_t)(px[g].bits64[0] & (NB_JUMP - 1));
             dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
-            if (dx[g].IsZero()) {
+            while (dx[g].IsZero()) {
                 jmp[g] = (jmp[g] + 1) & (NB_JUMP - 1);
                 dx[g].ModSub(&px[g], &jt->Jx[jmp[g]]);
             }
@@ -694,6 +725,8 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
 
     Int range_width(&range_max);
     range_width.Sub(&range_min);
+    Int spawn_span;
+    ComputeSpawnSpan(range_width, spawn_span);
 
     int gridX = 0, gridY = 0;
     if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY) || gridX <= 0 || gridY <= 0) {
@@ -755,7 +788,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
         while (true) {
             if (is_wild) {
                 Int r_scalar;
-                ThreadRandRange(r_scalar, range_width, rng_salt);
+                ThreadRandRange(r_scalar, spawn_span, rng_salt);
                 Point P;
                 if (r_scalar.IsZero()) {
                     P = target_shifted;
@@ -770,7 +803,7 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
                 return;
             } else {
                 Int k_start;
-                ThreadRandRange(k_start, range_width, rng_salt);
+                ThreadRandRange(k_start, spawn_span, rng_salt);
                 k_start.Add(&range_min);
                 if (k_start.IsZero()) continue;
                 Point P = secp->ComputePublicKey(&k_start);
@@ -912,6 +945,7 @@ static bool SendBatchReliable(
     std::string action = is_wild_mode ? "check_wild" : "submit_tame";
     std::string submit_url = BuildApiUrl(session_url, "action=" + action);
 
+    int transient_503_retries = 0;
     while (true) {
         HttpResult res = HttpPostBinary(submit_url, packet.data(), packet.size());
         if (res.curl_code == CURLE_OK && res.http_code == 200) {
@@ -927,7 +961,18 @@ static bool SendBatchReliable(
             std::exit(1);
         }
 
+        if (!allow_retry_until_stopped && res.curl_code == CURLE_OK && res.http_code == 503 && transient_503_retries < 4) {
+            transient_503_retries++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 * transient_503_retries));
+            continue;
+        }
+
         if (!allow_retry_until_stopped || g_state.stop_signal.load()) {
+            if (res.curl_code != CURLE_OK) {
+                std::cerr << "[-] Transport error (" << action << "): " << curl_easy_strerror(res.curl_code) << "\n";
+            } else {
+                std::cerr << "[-] Server HTTP " << res.http_code << " (" << action << "): " << res.body << "\n";
+            }
             return false;
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -946,6 +991,7 @@ static int RunKangarooSession(
     {
         std::lock_guard<std::mutex> lock(g_state.queue_mutex);
         g_state.dp_queue.clear();
+        g_state.seen_dp_x.clear();
     }
     g_state.running = !g_state.stop_signal.load();
     if (!g_state.running.load()) {
@@ -1067,7 +1113,7 @@ static int RunKangarooSession(
     uint64_t last_steps = g_state.total_steps.load();
     double cached_hashrate_mhs = 0.0;
     int verify_batches_sent = 0;
-    const int poll_ms = is_verify ? 5 : 250;
+    const int poll_ms = is_verify ? 2 : 250;
 
     auto format_hashrate = [&](double mhs) -> std::string {
         std::ostringstream hr_ss;
@@ -1214,10 +1260,16 @@ static int RunKangarooSession(
                     g_state.running = false;
                     break;
                 }
+                {
+                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                    g_state.dp_queue.clear();
+                    g_state.seen_dp_x.clear();
+                }
             } else {
                 // Switching TAME -> WILD: server already committed target_dp Tame traps
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                 g_state.dp_queue.clear();
+                g_state.seen_dp_x.clear();
                 if (out_stats) out_stats->switched_to_wild = true;
             }
 
