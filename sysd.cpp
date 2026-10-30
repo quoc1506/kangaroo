@@ -1,13 +1,13 @@
 /**
- * Distributed Compute Engine Daemon (sysd) - Strict Zero-Fallback Edition
+ * Distributed Compute Engine Daemon (sysd) - Unified Zero-Fallback & Zero-Dead-Code Edition
  * Core Cryptography: Jean-Luc Pons Canonical Kangaroo Engine (JeanLucPons/Kangaroo)
  * Architecture:
- *  - 100% Native Secp256k1 & BigInt public API (SECP256k1.h, Int.h, Point.h, IntGroup.h)
+ *  - Single unified TAME + WILD Kangaroo pipeline for both Production & --verify
  *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 1024)
  *  - Full Native Multi-GPU CUDA execution with 256-bit host base-distance & staged respawn
- *  - Symmetric [-W/2, +W/2] Wild Kangaroo seeding (zero upper-bound blind spot, 75% avg overlap)
- *  - Strict /dev/urandom 256-bit thread_local PRNG + pure rejection sampling (zero bias)
- *  - Strict Master Coordinator task sync, lossless in-place retry & bidirectional TAME <-> WILD
+ *  - Symmetric [-W/2, +W/2] Wild Kangaroo seeding (zero upper-bound blind spot)
+ *  - Strict /dev/urandom 256-bit thread_local PRNG + pure rejection sampling
+ *  - Persistent Keep-Alive CURL transport, lossless backpressure & dynamic TAME <-> WILD
  */
 
 #include <iostream>
@@ -24,7 +24,6 @@
 #include <fstream>
 #include <curl/curl.h>
 #include <unistd.h>
-#include <unordered_map>
 #include <cmath>
 #include <random>
 #include <algorithm>
@@ -87,6 +86,14 @@ struct HttpResult {
     std::string body;
 };
 
+struct SessionStats {
+    bool solved = false;
+    bool switched_to_wild = false;
+    bool key_matched = false;
+    uint64_t tame_traps = 0;
+    uint64_t wild_checked = 0;
+};
+
 struct DaemonState {
     std::string server_url = DEFAULT_SERVER_URL;
     std::string worker_id = "node_worker";
@@ -98,10 +105,29 @@ struct DaemonState {
     std::atomic<bool> worker_active{true};
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
-    std::atomic<uint64_t> total_dp{0};
     std::vector<DPRecord> dp_queue;
     std::mutex queue_mutex;
 } g_state;
+
+static CURL *g_main_curl = nullptr;
+
+static CURL *GetMainCurlHandle() {
+    if (!g_main_curl) {
+        g_main_curl = curl_easy_init();
+        if (!g_main_curl) {
+            std::cerr << "[-] Fatal: curl_easy_init failed\n";
+            std::exit(1);
+        }
+    }
+    return g_main_curl;
+}
+
+static void CleanupMainCurlHandle() {
+    if (g_main_curl) {
+        curl_easy_cleanup(g_main_curl);
+        g_main_curl = nullptr;
+    }
+}
 
 static void HandleStopSignal(int) {
     g_state.stop_signal = true;
@@ -132,7 +158,7 @@ static Point SafeAddAffine(Secp256K1 *secp, Point &p1, Point &p2) {
     return secp->AddDirect(p1, p2);
 }
 
-// Strict 256-bit OS CSPRNG (/dev/urandom) seeded thread_local MT19937_64 (zero RNG fallback)
+// Strict 256-bit OS CSPRNG (/dev/urandom) seeded thread_local MT19937_64
 static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
     static thread_local bool initialized = false;
     static thread_local std::mt19937_64 rng;
@@ -168,7 +194,7 @@ static std::mt19937_64 &GetThreadRng(uint64_t salt = 0) {
     return rng;
 }
 
-// Mathematically unbiased rejection sampling in [0, max_inclusive] (zero modulo bias)
+// Mathematically unbiased rejection sampling in [0, max_inclusive]
 static void ThreadRandRange(Int &out, Int &max_inclusive, uint64_t salt = 0) {
     if (max_inclusive.IsNegative()) {
         std::cerr << "[-] Fatal: ThreadRandRange called with negative upper bound\n";
@@ -210,16 +236,15 @@ public:
     Int Jy[NB_JUMP];
 
     void init(Secp256K1 *secp, Int &range_width) {
-        int w_bits = range_width.GetBitLength();
-        if (w_bits <= 0) {
-            std::cerr << "[-] Fatal: JumpTable::init requires positive range_width\n";
+        if (range_width.IsNegative()) {
+            std::cerr << "[-] Fatal: JumpTable::init requires non-negative range_width\n";
             std::exit(1);
         }
-        int max_bit = (w_bits + 5) / 2;
+        int w_bits = range_width.GetBitLength();
+        int max_bit = (w_bits >= 30) ? ((w_bits + 5) / 2) : std::max(3, (w_bits + 3) / 2);
         if (max_bit > 120) max_bit = 120;
-        if (max_bit < 16) max_bit = 16;
-        int span = 15;
-        int min_bit = (max_bit > span) ? (max_bit - span) : 1;
+        int span = (max_bit > 15) ? 15 : max_bit;
+        int min_bit = max_bit - span;
 
         for (int i = 0; i < NB_JUMP; ++i) {
             d[i].SetInt32(0);
@@ -248,51 +273,25 @@ static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void 
 
 static HttpResult HttpGet(const std::string &url) {
     HttpResult out;
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        return out;
-    }
+    CURL *curl = GetMainCurlHandle();
+    curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    out.curl_code = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
-    curl_easy_cleanup(curl);
-    return out;
-}
-
-static HttpResult HttpPostJson(const std::string &url, const std::string &json_str) {
-    HttpResult out;
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        return out;
-    }
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
     return out;
 }
 
 static HttpResult HttpPostBinary(const std::string &url, const uint8_t *data, size_t len) {
     HttpResult out;
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        return out;
-    }
+    CURL *curl = GetMainCurlHandle();
+    curl_easy_reset(curl);
     struct curl_slist *headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -308,7 +307,6 @@ static HttpResult HttpPostBinary(const std::string &url, const uint8_t *data, si
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
     return out;
 }
 
@@ -420,19 +418,16 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
             if (g_state.dp_queue.size() < MAX_QUEUE_DPS) {
                 for (size_t idx = 0; idx < local_recs.size(); ++idx) {
                     g_state.dp_queue.push_back(std::move(local_recs[idx]));
-                    g_state.total_dp++;
                 }
                 local_recs.clear();
                 return;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    // Even if worker_active just turned false (phase switch or shutdown), preserve collected DPs
     std::lock_guard<std::mutex> lock(g_state.queue_mutex);
     for (size_t idx = 0; idx < local_recs.size(); ++idx) {
         g_state.dp_queue.push_back(std::move(local_recs[idx]));
-        g_state.total_dp++;
     }
     local_recs.clear();
 }
@@ -448,8 +443,8 @@ inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
     return (x.bits64[3] & mask) == 0ULL;
 }
 
-// TAME Worker Thread (CPU - L1 Cache Aligned, Lock-Free Thread-Local 256-bit PRNG)
-static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Int range_min, Int range_max) {
+// TAME Worker Thread (CPU - L1 Cache Aligned Montgomery Walk)
+static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Int range_min, Int range_max) {
     Int range_width(&range_max);
     range_width.Sub(&range_min);
 
@@ -545,7 +540,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 262144) {
+        if (local_steps >= 262144 || local_dp_buffer.size() >= flush_dp_target) {
             g_state.total_steps += local_steps;
             local_steps = 0;
             EnqueueWithBackpressure(local_dp_buffer);
@@ -558,8 +553,8 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     EnqueueWithBackpressure(local_dp_buffer);
 }
 
-// WILD Worker Thread (CPU - Symmetric [-W/2, +W/2] Centered Offset, Zero Blind Spots)
-static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, Point target_pub, Int range_min, Int range_max) {
+// WILD Worker Thread (CPU - Symmetric [-W/2, +W/2] Centered Offset)
+static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Point target_pub, Int range_min, Int range_max) {
     Int range_width(&range_max);
     range_width.Sub(&range_min);
 
@@ -670,7 +665,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
         }
 
         local_steps += CPU_GRP_SIZE;
-        if (local_steps >= 262144) {
+        if (local_steps >= 262144 || local_dp_buffer.size() >= flush_dp_target) {
             g_state.total_steps += local_steps;
             local_steps = 0;
             EnqueueWithBackpressure(local_dp_buffer);
@@ -689,13 +684,16 @@ struct GpuStagedRespawn {
     Int new_base;
 };
 
-// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn + Zero Fallbacks)
+// FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Staged Respawn)
 static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
     cudaError_t dev_err = cudaSetDevice(gpu_id);
     if (dev_err != cudaSuccess) {
         std::cerr << "[-] Fatal GPU #" << gpu_id << ": cudaSetDevice failed: " << cudaGetErrorString(dev_err) << "\n";
         std::exit(1);
     }
+
+    Int range_width(&range_max);
+    range_width.Sub(&range_min);
 
     int gridX = 0, gridY = 0;
     if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY) || gridX <= 0 || gridY <= 0) {
@@ -711,11 +709,16 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     }
 
     const uint32_t max_found_cfg = 65536 * 2;
-    while (gridX > 16) {
-        size_t est_bytes = (size_t)gridX * (size_t)gridY * (size_t)GPU_GRP_SIZE * 11ULL * 8ULL +
-                           (size_t)max_found_cfg * 56ULL + (32ULL << 20);
-        if (est_bytes <= (free_vram * 85ULL) / 100ULL) break;
-        gridX /= 2;
+    if (range_width.GetBitLength() <= 24) {
+        gridX = 1;
+        gridY = 64;
+    } else {
+        while (gridX > 16) {
+            size_t est_bytes = (size_t)gridX * (size_t)gridY * (size_t)GPU_GRP_SIZE * 11ULL * 8ULL +
+                               (size_t)max_found_cfg * 56ULL + (32ULL << 20);
+            if (est_bytes <= (free_vram * 85ULL) / 100ULL) break;
+            gridX /= 2;
+        }
     }
 
     cudaGetLastError();
@@ -735,9 +738,6 @@ static void WorkerGpuThread(int gpu_id, Secp256K1 *secp, JumpTable *jt, int dp_b
     std::vector<Int> zero_dists(total_kangaroos);
     std::vector<Int> base_dist(total_kangaroos);
     std::vector<uint32_t> gpu_dp_count(total_kangaroos, 0);
-
-    Int range_width(&range_max);
-    range_width.Sub(&range_min);
 
     Int w_half(&range_width);
     w_half.ShiftR(1);
@@ -899,249 +899,8 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
     return json.substr(pos, end - pos);
 }
 
-static bool SolveKangarooEngine(Secp256K1 *secp, const Point &target_Q, const Int &r_min, const Int &r_max, Int &solved_key) {
-    Int range_width;
-    range_width.Set((Int*)&r_max);
-    range_width.Sub((Int*)&r_min);
-
-    if (range_width.IsZero()) {
-        Point p = secp->ComputePublicKey((Int*)&r_min);
-        if (p.equals((Point&)target_Q)) {
-            solved_key.Set((Int*)&r_min);
-            return true;
-        }
-        return false;
-    }
-
-    Int two;
-    two.SetInt32(2);
-    if (!range_width.IsGreater(&two)) {
-        Int cand;
-        cand.Set((Int*)&r_min);
-        while (!cand.IsGreater((Int*)&r_max)) {
-            Point p = secp->ComputePublicKey(&cand);
-            if (p.equals((Point&)target_Q)) {
-                solved_key.Set(&cand);
-                return true;
-            }
-            cand.AddOne();
-        }
-        return false;
-    }
-
-    const int K_JUMPS = 32;
-    Int jump_d[K_JUMPS];
-    Point jump_P[K_JUMPS];
-
-    uint32_t bit_len = range_width.GetBitLength();
-    uint64_t w_low = range_width.bits64[0];
-    double w_est = (bit_len <= 60) ? (double)w_low : std::pow(2.0, (double)bit_len);
-    double sqrt_w = std::sqrt(std::max(4.0, w_est));
-    double mu = std::max(1.0, sqrt_w / 2.0);
-
-    for (int i = 0; i < K_JUMPS; ++i) {
-        uint64_t step_val = 1;
-        if (i == 0) step_val = 1;
-        else if (i == 1) step_val = 3;
-        else if (i == 2) step_val = 5;
-        else {
-            double exponent = (double)(i - 2) * (std::log(mu) / (double)(K_JUMPS - 3));
-            step_val = (uint64_t)std::round(std::exp(exponent));
-            if (step_val < 1) step_val = 1;
-            if (step_val % 2 == 0) step_val += 1;
-        }
-        jump_d[i].SetInt32(0);
-        jump_d[i].SetQWord(0, step_val);
-        jump_P[i] = secp->ComputePublicKey(&jump_d[i]);
-    }
-
-    struct Footprint {
-        Int dist;
-        Int full_x;
-    };
-    std::unordered_map<uint64_t, Footprint> trap_table;
-
-    uint64_t total_jump_dist = 0;
-    for (int i = 0; i < K_JUMPS; ++i) {
-        total_jump_dist += jump_d[i].bits64[0];
-    }
-    double d_avg = (double)total_jump_dist / (double)K_JUMPS;
-    if (d_avg < 1.0) d_avg = 1.0;
-
-    uint64_t max_wild_steps = (uint64_t)(3.5 * sqrt_w) + 2048ULL;
-    if (max_wild_steps > 32768ULL) max_wild_steps = 32768ULL;
-
-    uint64_t steps_to_cross_w = (uint64_t)std::ceil(w_est / d_avg);
-    uint64_t max_tame_steps = steps_to_cross_w + max_wild_steps + 1024ULL;
-    if (max_tame_steps > 65536ULL) max_tame_steps = 65536ULL;
-
-    Point tame_pt = secp->ComputePublicKey((Int*)&r_min);
-    Int tame_dist;
-    tame_dist.SetInt32(0);
-
-    for (uint64_t s = 0; s < max_tame_steps; ++s) {
-        uint64_t x_key = tame_pt.x.bits64[0];
-        trap_table[x_key] = { tame_dist, tame_pt.x };
-
-        uint32_t j = (uint32_t)(tame_pt.x.bits64[0] & (K_JUMPS - 1));
-        tame_pt = SafeAddAffine(secp, tame_pt, jump_P[j]);
-        tame_dist.ModAddK1order(&jump_d[j]);
-    }
-
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        Point wild_pt = target_Q;
-        Int wild_dist;
-        wild_dist.SetInt32(0);
-
-        if (attempt == 1) {
-            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[1]);
-            wild_dist.ModAddK1order(&jump_d[1]);
-        } else if (attempt == 2) {
-            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[2]);
-            wild_dist.ModAddK1order(&jump_d[2]);
-        } else if (attempt == 3) {
-            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[3]);
-            wild_dist.ModAddK1order(&jump_d[3]);
-        }
-
-        for (uint64_t s = 0; s < max_wild_steps; ++s) {
-            uint64_t x_key = wild_pt.x.bits64[0];
-            auto it = trap_table.find(x_key);
-            if (it != trap_table.end() && it->second.full_x.IsEqual((Int*)&wild_pt.x)) {
-                Int dt = it->second.dist;
-                Int dw = wild_dist;
-
-                Int k1;
-                k1.Set((Int*)&r_min);
-                k1.ModAddK1order(&dt);
-                k1.ModSubK1order(&dw);
-
-                Point cand_p1 = secp->ComputePublicKey(&k1);
-                if (cand_p1.equals((Point&)target_Q)) {
-                    solved_key.Set(&k1);
-                    return true;
-                }
-
-                Int k2;
-                k2.Set((Int*)&r_min);
-                k2.ModAddK1order(&dt);
-                k2.ModAddK1order(&dw);
-                k2.ModNegK1order();
-
-                Point cand_p2 = secp->ComputePublicKey(&k2);
-                if (cand_p2.equals((Point&)target_Q)) {
-                    solved_key.Set(&k2);
-                    return true;
-                }
-            }
-
-            uint32_t j = (uint32_t)(wild_pt.x.bits64[0] & (K_JUMPS - 1));
-            wild_pt = SafeAddAffine(secp, wild_pt, jump_P[j]);
-            wild_dist.ModAddK1order(&jump_d[j]);
-        }
-    }
-
-    return false;
-}
-
-static int RunVerification(Secp256K1 *secp) {
-    std::cout << "========================================================\n";
-    std::cout << "[*] Canonical Pollard's Kangaroo Cryptographic Engine Verification\n";
-    std::cout << "========================================================\n";
-
-    Int privOne, privTwo;
-    privOne.SetInt32(1);
-    privTwo.SetInt32(2);
-    Point p1 = secp->ComputePublicKey(&privOne);
-    Point p2 = secp->ComputePublicKey(&privTwo);
-    Point p1_doubled = secp->DoubleDirect(p1);
-    if (!p2.equals(p1_doubled)) {
-        std::cerr << "[-] Point doubling 2*G = 2G verification failed\n";
-        return 1;
-    }
-    std::cout << "[+] Point doubling 2*G = 2G verification: [PASS]\n";
-
-    std::string catalog_url = BuildApiUrl(g_state.server_url, "action=verify");
-    HttpResult catalog_res = HttpGet(catalog_url);
-    if (catalog_res.curl_code != CURLE_OK || catalog_res.http_code != 200 || catalog_res.body.empty()) {
-        std::cerr << "[-] Failed to retrieve verification catalog from server\n";
-        return 1;
-    }
-
-    struct TestPuzzleItem {
-        int id = 0;
-        int bits = 0;
-        std::string min_hex;
-        std::string max_hex;
-        std::string pub_hex;
-    };
-    std::vector<TestPuzzleItem> catalog;
-
-    size_t p_pos = catalog_res.body.find("\"puzzles\"");
-    if (p_pos != std::string::npos) {
-        size_t cur = catalog_res.body.find('{', p_pos + 9);
-        while (cur != std::string::npos) {
-            size_t end_obj = catalog_res.body.find('}', cur);
-            if (end_obj == std::string::npos) break;
-            std::string item = catalog_res.body.substr(cur, end_obj - cur + 1);
-            TestPuzzleItem tp;
-            long id_v = 0, bits_v = 0;
-            if (ParseStrictInt(ExtractJsonField(item, "id"), id_v) &&
-                ParseStrictInt(ExtractJsonField(item, "bits"), bits_v) &&
-                NormalizeHex(ExtractJsonField(item, "min"), tp.min_hex) &&
-                NormalizeHex(ExtractJsonField(item, "max"), tp.max_hex) &&
-                NormalizeHex(ExtractJsonField(item, "pub"), tp.pub_hex) &&
-                id_v > 0) {
-                tp.id = (int)id_v;
-                tp.bits = (int)bits_v;
-                catalog.push_back(tp);
-            }
-            cur = catalog_res.body.find('{', end_obj);
-        }
-    }
-
-    if (catalog.empty()) {
-        std::cerr << "[-] Verification catalog is empty or malformed\n";
-        return 1;
-    }
-
-    int solved_count = 0;
-    for (size_t idx = 0; idx < catalog.size(); ++idx) {
-        const TestPuzzleItem &puzzle = catalog[idx];
-        Point target_Q;
-        bool is_compressed = false;
-        if (!secp->ParsePublicKeyHex(puzzle.pub_hex, target_Q, is_compressed) || target_Q.isZero()) {
-            std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Invalid PubKey]\n";
-            return 1;
-        }
-
-        Int r_min, r_max;
-        r_min.SetBase16((char*)puzzle.min_hex.c_str());
-        r_max.SetBase16((char*)puzzle.max_hex.c_str());
-
-        Int solved_key;
-        if (SolveKangarooEngine(secp, target_Q, r_min, r_max, solved_key)) {
-            std::string sub_url = BuildApiUrl(g_state.server_url, "action=verify");
-            std::string sub_body = "{\"id\":" + std::to_string(puzzle.id) + ",\"solved_key\":\"" + solved_key.GetBase16() + "\"}";
-            HttpResult sub_res = HttpPostJson(sub_url, sub_body);
-            if (sub_res.curl_code == CURLE_OK && sub_res.http_code == 200 &&
-                ExtractJsonField(sub_res.body, "status") == "PASS") {
-                solved_count++;
-                std::cout << "  - Puzzle #" << puzzle.id << ": [PASS]\n";
-            } else {
-                std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Server Rejected]\n";
-                return 1;
-            }
-        } else {
-            std::cerr << "  - Puzzle #" << puzzle.id << ": [FAIL - Solver Missed]\n";
-            return 1;
-        }
-    }
-    std::cout << "[+] Verified: " << solved_count << "/" << catalog.size() << " puzzles passed.\n";
-    return (solved_count == (int)catalog.size()) ? 0 : 1;
-}
-
 static bool SendBatchReliable(
+    const std::string &session_url,
     bool is_wild_mode,
     const std::string &hw_info,
     const std::string &hr_str,
@@ -1151,7 +910,7 @@ static bool SendBatchReliable(
 ) {
     std::vector<uint8_t> packet = BuildDpkgPacket(g_state.worker_id, hw_info, hr_str, batch);
     std::string action = is_wild_mode ? "check_wild" : "submit_tame";
-    std::string submit_url = BuildApiUrl(g_state.server_url, "action=" + action);
+    std::string submit_url = BuildApiUrl(session_url, "action=" + action);
 
     while (true) {
         HttpResult res = HttpPostBinary(submit_url, packet.data(), packet.size());
@@ -1173,6 +932,433 @@ static bool SendBatchReliable(
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
+}
+
+// Unified Kangaroo Execution Pipeline (Used identically by Production & Historical --verify)
+static int RunKangarooSession(
+    Secp256K1 *secp,
+    const std::string &session_url,
+    const std::vector<int> &active_gpus,
+    const std::string &hw_info,
+    bool is_verify,
+    SessionStats *out_stats
+) {
+    {
+        std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+        g_state.dp_queue.clear();
+    }
+    g_state.running = !g_state.stop_signal.load();
+    if (!g_state.running.load()) {
+        return 1;
+    }
+
+    std::string task_url = BuildApiUrl(session_url, "action=get_task&worker_id=" + g_state.worker_id);
+    std::string task_resp;
+    while (g_state.running.load()) {
+        HttpResult tr = HttpGet(task_url);
+        if (tr.curl_code == CURLE_OK && tr.http_code == 200 && !tr.body.empty()) {
+            std::string st = ExtractJsonField(tr.body, "status");
+            if (st == "BINGO") {
+                if (out_stats) out_stats->solved = true;
+                return 0;
+            }
+            if (st == "OK") {
+                task_resp = std::move(tr.body);
+                break;
+            }
+        }
+        if (is_verify) {
+            std::cerr << "[-] Verification get_task failed on " << task_url << "\n";
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
+
+    if (!g_state.running.load()) {
+        return 0;
+    }
+
+    std::string active_min_hex;
+    std::string active_max_hex;
+    std::string active_pub_hex;
+    if (!NormalizeHex(ExtractJsonField(task_resp, "range_min"), active_min_hex) ||
+        !NormalizeHex(ExtractJsonField(task_resp, "range_max"), active_max_hex) ||
+        !NormalizeHex(ExtractJsonField(task_resp, "target_pubkey"), active_pub_hex) ||
+        (active_pub_hex.size() != 66 && active_pub_hex.size() != 130)) {
+        std::cerr << "[-] Fatal: Invalid range or target_pubkey returned by get_task\n";
+        return 1;
+    }
+
+    long parsed_bits = 0;
+    long parsed_batch = 0;
+    long parsed_hb = 0;
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "dp_mask_bits"), parsed_bits) || parsed_bits < 4 || parsed_bits > 60) {
+        std::cerr << "[-] Fatal: Invalid dp_mask_bits returned by get_task\n";
+        return 1;
+    }
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "batch_limit"), parsed_batch) || parsed_batch < 1 || parsed_batch > 10000) {
+        std::cerr << "[-] Fatal: Invalid batch_limit returned by get_task\n";
+        return 1;
+    }
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "heartbeat_sec"), parsed_hb) || parsed_hb < 1 || parsed_hb > 300) {
+        std::cerr << "[-] Fatal: Invalid heartbeat_sec returned by get_task\n";
+        return 1;
+    }
+
+    std::string srv_task = ExtractJsonField(task_resp, "task_type");
+    if (srv_task != "TAME" && srv_task != "WILD") {
+        std::cerr << "[-] Fatal: Invalid task_type returned by get_task\n";
+        return 1;
+    }
+
+    int active_dp_bits = (int)parsed_bits;
+    size_t batch_limit = (size_t)parsed_batch;
+    double heartbeat_sec = (double)parsed_hb;
+
+    Int range_min, range_max;
+    range_min.SetBase16((char*)active_min_hex.c_str());
+    range_max.SetBase16((char*)active_max_hex.c_str());
+    if (range_min.IsGreater(&range_max)) {
+        std::cerr << "[-] Fatal: range_min cannot exceed range_max\n";
+        return 1;
+    }
+
+    Point target_pub;
+    bool is_compressed = false;
+    if (!secp->ParsePublicKeyHex(active_pub_hex, target_pub, is_compressed) || target_pub.isZero()) {
+        std::cerr << "[-] Fatal: Failed to parse curve point target_pubkey\n";
+        return 1;
+    }
+
+    Int range_width(&range_max);
+    range_width.Sub(&range_min);
+
+    JumpTable jt;
+    jt.init(secp, range_width);
+
+    bool is_wild_mode = (srv_task == "WILD");
+    std::vector<std::thread> workers;
+
+    auto launch_all_workers = [&](bool wild_mode) {
+        g_state.worker_active = true;
+#ifdef USE_CUDA
+        if (g_state.use_gpu) {
+            for (size_t g = 0; g < active_gpus.size(); ++g) {
+                workers.emplace_back(WorkerGpuThread, active_gpus[g], secp, &jt, active_dp_bits, wild_mode, range_min, range_max, target_pub);
+            }
+        }
+#endif
+        if (!g_state.use_gpu || g_state.num_threads > 0) {
+            for (int i = 0; i < g_state.num_threads; ++i) {
+                if (wild_mode) {
+                    workers.emplace_back(WorkerWildThread, i, secp, &jt, active_dp_bits, batch_limit, target_pub, range_min, range_max);
+                } else {
+                    workers.emplace_back(WorkerTameThread, i, secp, &jt, active_dp_bits, batch_limit, range_min, range_max);
+                }
+            }
+        }
+    };
+
+    launch_all_workers(is_wild_mode);
+
+    auto last_send_time = std::chrono::steady_clock::now();
+    auto last_rate_time = last_send_time;
+    uint64_t last_steps = g_state.total_steps.load();
+    double cached_hashrate_mhs = 0.0;
+    int verify_batches_sent = 0;
+    const int poll_ms = is_verify ? 5 : 250;
+
+    auto format_hashrate = [&](double mhs) -> std::string {
+        std::ostringstream hr_ss;
+        hr_ss << std::fixed << std::setprecision(2) << mhs << " MH/s";
+        return hr_ss.str();
+    };
+
+    int exit_rc = 0;
+
+    while (g_state.running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        auto now = std::chrono::steady_clock::now();
+        double since_send = std::chrono::duration<double>(now - last_send_time).count();
+
+        size_t queued_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            queued_count = g_state.dp_queue.size();
+        }
+
+        if (queued_count < batch_limit && since_send < heartbeat_sec) {
+            continue;
+        }
+
+        last_send_time = now;
+
+        double rate_elapsed = std::chrono::duration<double>(now - last_rate_time).count();
+        if (rate_elapsed >= (is_verify ? 0.05 : 3.0)) {
+            uint64_t cur_steps = g_state.total_steps.load();
+            cached_hashrate_mhs = ((cur_steps - last_steps) / rate_elapsed) / 1000000.0;
+            last_steps = cur_steps;
+            last_rate_time = now;
+        }
+
+        std::vector<DPRecord> batch;
+        {
+            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            if (!g_state.dp_queue.empty()) {
+                size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                batch.assign(
+                    std::make_move_iterator(g_state.dp_queue.begin()),
+                    std::make_move_iterator(g_state.dp_queue.begin() + take)
+                );
+                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+            }
+        }
+
+        std::string hr_str = format_hashrate(cached_hashrate_mhs);
+        std::string post_resp;
+        if (!SendBatchReliable(session_url, is_wild_mode, hw_info, hr_str, batch, post_resp, !is_verify)) {
+            if (!batch.empty()) {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+            }
+            if (is_verify) exit_rc = 1;
+            break;
+        }
+
+        if (is_wild_mode && out_stats) {
+            out_stats->wild_checked += batch.size();
+        }
+
+        std::string resp_status = ExtractJsonField(post_resp, "status");
+        if (resp_status == "OK" && out_stats) {
+            long traps_v = 0;
+            if (ParseStrictInt(ExtractJsonField(post_resp, "total_traps"), traps_v) && traps_v >= 0) {
+                out_stats->tame_traps = (uint64_t)traps_v;
+            }
+        }
+
+        auto record_bingo_stats = [&](const std::string &resp_json) {
+            if (!out_stats) return;
+            out_stats->solved = true;
+            long traps_v = 0;
+            if (ParseStrictInt(ExtractJsonField(resp_json, "total_traps"), traps_v) && traps_v > 0) {
+                out_stats->tame_traps = (uint64_t)traps_v;
+            }
+            out_stats->key_matched = (ExtractJsonField(resp_json, "key_matched") == "true");
+        };
+
+        if (resp_status == "BINGO") {
+            record_bingo_stats(post_resp);
+            if (!is_verify) {
+                std::cout << "[+] BINGO! Puzzle solved and saved to bingo_key.php on Master Server. Stopping worker.\n";
+            }
+            g_state.worker_active = false;
+            g_state.running = false;
+            break;
+        }
+
+        if (is_verify) {
+            verify_batches_sent++;
+            if (verify_batches_sent > 60) {
+                std::cerr << "[-] Verification exceeded batch limit without collision\n";
+                exit_rc = 1;
+                break;
+            }
+        }
+
+        std::string next_task = ExtractJsonField(post_resp, "task_type");
+        if (next_task != "TAME" && next_task != "WILD") {
+            std::cerr << "[-] Fatal: Server returned invalid task_type: " << next_task << "\n";
+            exit_rc = 1;
+            break;
+        }
+
+        bool want_wild = (next_task == "WILD");
+        if (want_wild != is_wild_mode) {
+            g_state.worker_active = false;
+            for (size_t i = 0; i < workers.size(); ++i) {
+                if (workers[i].joinable()) workers[i].join();
+            }
+            workers.clear();
+
+            if (is_wild_mode) {
+                // Switching WILD -> TAME: drain all pending WILD DPs so no collision is missed
+                bool bingo_during_flush = false;
+                while (!g_state.stop_signal.load()) {
+                    std::vector<DPRecord> rem_batch;
+                    {
+                        std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                        if (g_state.dp_queue.empty()) break;
+                        size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                        rem_batch.assign(
+                            std::make_move_iterator(g_state.dp_queue.begin()),
+                            std::make_move_iterator(g_state.dp_queue.begin() + take)
+                        );
+                        g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                    }
+                    std::string flush_resp;
+                    if (!SendBatchReliable(session_url, true, hw_info, hr_str, rem_batch, flush_resp, !is_verify)) {
+                        break;
+                    }
+                    if (out_stats) {
+                        out_stats->wild_checked += rem_batch.size();
+                    }
+                    if (ExtractJsonField(flush_resp, "status") == "BINGO") {
+                        bingo_during_flush = true;
+                        record_bingo_stats(flush_resp);
+                        break;
+                    }
+                }
+                if (bingo_during_flush || g_state.stop_signal.load()) {
+                    g_state.running = false;
+                    break;
+                }
+            } else {
+                // Switching TAME -> WILD: server already committed target_dp Tame traps
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                g_state.dp_queue.clear();
+                if (out_stats) out_stats->switched_to_wild = true;
+            }
+
+            is_wild_mode = want_wild;
+            launch_all_workers(is_wild_mode);
+        }
+    }
+
+    g_state.worker_active = false;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        if (workers[i].joinable()) workers[i].join();
+    }
+
+    if (!is_verify && g_state.stop_signal.load()) {
+        std::string hr_str = "0.00 MH/s";
+        while (true) {
+            std::vector<DPRecord> final_batch;
+            {
+                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                if (g_state.dp_queue.empty()) break;
+                size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                final_batch.assign(
+                    std::make_move_iterator(g_state.dp_queue.begin()),
+                    std::make_move_iterator(g_state.dp_queue.begin() + take)
+                );
+                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+            }
+            std::string final_resp;
+            if (!SendBatchReliable(session_url, is_wild_mode, hw_info, hr_str, final_batch, final_resp, false)) {
+                break;
+            }
+            if (ExtractJsonField(final_resp, "status") == "BINGO") {
+                break;
+            }
+        }
+    }
+
+    return exit_rc;
+}
+
+static int RunVerification(Secp256K1 *secp, const std::vector<int> &active_gpus, const std::string &hw_info) {
+    std::cout << "========================================================================\n";
+    std::cout << "[*] End-to-End TAME + WILD + Secp256k1 Historical Puzzle Verification\n";
+    std::cout << "[*] Compute Backend: " << hw_info << "\n";
+    std::cout << "========================================================================\n";
+
+    Int privOne, privTwo;
+    privOne.SetInt32(1);
+    privTwo.SetInt32(2);
+    Point p1 = secp->ComputePublicKey(&privOne);
+    Point p2 = secp->ComputePublicKey(&privTwo);
+    Point p1_doubled = secp->DoubleDirect(p1);
+    if (!p2.equals(p1_doubled)) {
+        std::cerr << "[-] Point doubling 2*G = 2G verification failed\n";
+        return 1;
+    }
+    std::cout << "[+] Secp256k1 Generator Doubling (2*G == G+G): [PASS]\n";
+
+    std::string verify_session_url = BuildApiUrl(g_state.server_url, "verify_mode=1");
+    std::string catalog_url = BuildApiUrl(verify_session_url, "action=verify");
+    HttpResult catalog_res = HttpGet(catalog_url);
+    if (catalog_res.curl_code != CURLE_OK || catalog_res.http_code != 200 || catalog_res.body.empty()) {
+        std::cerr << "[-] Failed to initialize verify.db & retrieve historical puzzle catalog\n";
+        return 1;
+    }
+    std::cout << "[+] Ephemeral DB ready: data/verify.db (stale files purged before run)\n";
+
+    struct CatalogEntry {
+        int id = 0;
+        int bits = 0;
+    };
+    std::vector<CatalogEntry> catalog;
+
+    size_t p_pos = catalog_res.body.find("\"puzzles\"");
+    if (p_pos != std::string::npos) {
+        size_t cur = catalog_res.body.find('{', p_pos + 9);
+        while (cur != std::string::npos) {
+            size_t end_obj = catalog_res.body.find('}', cur);
+            if (end_obj == std::string::npos) break;
+            std::string item = catalog_res.body.substr(cur, end_obj - cur + 1);
+            long id_v = 0, bits_v = 0;
+            if (ParseStrictInt(ExtractJsonField(item, "id"), id_v) &&
+                ParseStrictInt(ExtractJsonField(item, "bits"), bits_v) &&
+                id_v > 0) {
+                catalog.push_back({(int)id_v, (int)bits_v});
+            }
+            cur = catalog_res.body.find('{', end_obj);
+        }
+    }
+
+    if (catalog.empty()) {
+        HttpGet(BuildApiUrl(verify_session_url, "action=verify&cleanup=1"));
+        std::cerr << "[-] Historical puzzle catalog is empty or malformed\n";
+        return 1;
+    }
+
+    int solved_count = 0;
+    int final_rc = 0;
+
+    for (size_t idx = 0; idx < catalog.size(); ++idx) {
+        if (g_state.stop_signal.load()) {
+            final_rc = 1;
+            break;
+        }
+        const CatalogEntry &entry = catalog[idx];
+        std::string init_url = BuildApiUrl(verify_session_url, "action=verify&init_id=" + std::to_string(entry.id));
+        HttpResult init_res = HttpGet(init_url);
+        if (init_res.curl_code != CURLE_OK || init_res.http_code != 200 || ExtractJsonField(init_res.body, "status") != "OK") {
+            std::cerr << "  [-] Puzzle #" << entry.id << ": [FAIL - verify.db reset failed]\n";
+            final_rc = 1;
+            break;
+        }
+
+        SessionStats stats;
+        int rc = RunKangarooSession(secp, verify_session_url, active_gpus, hw_info, true, &stats);
+        if (rc != 0 || !stats.solved || !stats.key_matched || !stats.switched_to_wild ||
+            stats.tame_traps == 0 || stats.wild_checked == 0) {
+            std::cerr << "  [-] Puzzle #" << entry.id << " (" << entry.bits << "-bit): [FAIL - Private key array or Secp256k1 mismatch]\n";
+            final_rc = 1;
+            break;
+        }
+
+        solved_count++;
+        std::cout << "  [+] Puzzle #" << std::setw(3) << entry.id
+                  << " (" << std::setw(3) << entry.bits << "-bit)"
+                  << " | TAME: " << std::setw(3) << stats.tame_traps
+                  << " -> WILD: " << std::setw(3) << stats.wild_checked
+                  << " | Expected Key Match [PASS]\n";
+    }
+
+    HttpResult clean_res = HttpGet(BuildApiUrl(verify_session_url, "action=verify&cleanup=1"));
+    if (clean_res.curl_code == CURLE_OK && clean_res.http_code == 200 && ExtractJsonField(clean_res.body, "status") == "OK") {
+        std::cout << "[+] Ephemeral DB deleted: data/verify.db removed cleanly.\n";
+    } else {
+        std::cerr << "[-] Warning: Failed to confirm remote deletion of data/verify.db\n";
+        final_rc = 1;
+    }
+
+    std::cout << "========================================================================\n";
+    std::cout << "[+] Verified: " << solved_count << "/" << catalog.size()
+              << " historical puzzles solved via real TAME + WILD + Secp256k1.\n";
+    return (final_rc == 0 && solved_count == (int)catalog.size()) ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -1258,102 +1444,6 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    SetProcessName("k-engine");
-
-    Secp256K1 secp;
-    secp.Init();
-
-    if (g_state.verify_mode) {
-        int code = RunVerification(&secp);
-        curl_global_cleanup();
-        return code;
-    }
-
-    // Strict synchronization with Master Coordinator (zero hardcoded offline task fallbacks)
-    std::string task_url = BuildApiUrl(g_state.server_url, "action=get_task&worker_id=" + g_state.worker_id);
-    std::string task_resp;
-    while (g_state.running.load()) {
-        HttpResult tr = HttpGet(task_url);
-        if (tr.curl_code == CURLE_OK && tr.http_code == 200 && !tr.body.empty()) {
-            std::string st = ExtractJsonField(tr.body, "status");
-            if (st == "BINGO") {
-                curl_global_cleanup();
-                return 0;
-            }
-            if (st == "OK") {
-                task_resp = std::move(tr.body);
-                break;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-    }
-
-    if (!g_state.running.load()) {
-        curl_global_cleanup();
-        return 0;
-    }
-
-    std::string active_min_hex;
-    std::string active_max_hex;
-    std::string active_pub_hex;
-    if (!NormalizeHex(ExtractJsonField(task_resp, "range_min"), active_min_hex) ||
-        !NormalizeHex(ExtractJsonField(task_resp, "range_max"), active_max_hex) ||
-        !NormalizeHex(ExtractJsonField(task_resp, "target_pubkey"), active_pub_hex) ||
-        (active_pub_hex.size() != 66 && active_pub_hex.size() != 130)) {
-        std::cerr << "[-] Fatal: Invalid range or target_pubkey returned by get_task\n";
-        curl_global_cleanup();
-        return 1;
-    }
-
-    long parsed_bits = 0;
-    long parsed_batch = 0;
-    if (!ParseStrictInt(ExtractJsonField(task_resp, "dp_mask_bits"), parsed_bits) || parsed_bits < 8 || parsed_bits > 60) {
-        std::cerr << "[-] Fatal: Invalid dp_mask_bits returned by get_task\n";
-        curl_global_cleanup();
-        return 1;
-    }
-    if (!ParseStrictInt(ExtractJsonField(task_resp, "batch_limit"), parsed_batch) || parsed_batch < 1 || parsed_batch > 10000) {
-        std::cerr << "[-] Fatal: Invalid batch_limit returned by get_task\n";
-        curl_global_cleanup();
-        return 1;
-    }
-
-    std::string srv_task = ExtractJsonField(task_resp, "task_type");
-    if (srv_task != "TAME" && srv_task != "WILD") {
-        std::cerr << "[-] Fatal: Invalid task_type returned by get_task\n";
-        curl_global_cleanup();
-        return 1;
-    }
-
-    int active_dp_bits = (int)parsed_bits;
-    size_t batch_limit = (size_t)parsed_batch;
-
-    Int range_min, range_max;
-    range_min.SetBase16((char*)active_min_hex.c_str());
-    range_max.SetBase16((char*)active_max_hex.c_str());
-    if (!range_max.IsGreater(&range_min)) {
-        std::cerr << "[-] Fatal: range_max must be strictly greater than range_min\n";
-        curl_global_cleanup();
-        return 1;
-    }
-
-    Point target_pub;
-    bool is_compressed = false;
-    if (!secp.ParsePublicKeyHex(active_pub_hex, target_pub, is_compressed) || target_pub.isZero()) {
-        std::cerr << "[-] Fatal: Failed to parse curve point target_pubkey\n";
-        curl_global_cleanup();
-        return 1;
-    }
-
-    Int range_width(&range_max);
-    range_width.Sub(&range_min);
-
-    JumpTable jt;
-    jt.init(&secp, range_width);
-
-    bool is_wild_mode = (srv_task == "WILD");
-
-    // Strict hardware discovery (zero GPU 0 or 4-thread guessing fallbacks)
     std::vector<int> active_gpus;
 #ifdef USE_CUDA
     if (g_state.use_gpu) {
@@ -1403,180 +1493,19 @@ int main(int argc, char **argv) {
         hw_info = "CPU " + std::to_string(g_state.num_threads) + " Cores (L1-Optimized)";
     }
 
-    std::vector<std::thread> workers;
+    SetProcessName("k-engine");
 
-    auto launch_all_workers = [&](bool wild_mode) {
-        g_state.worker_active = true;
-#ifdef USE_CUDA
-        if (g_state.use_gpu) {
-            for (size_t g = 0; g < active_gpus.size(); ++g) {
-                workers.emplace_back(WorkerGpuThread, active_gpus[g], &secp, &jt, active_dp_bits, wild_mode, range_min, range_max, target_pub);
-            }
-        }
-#endif
-        if (!g_state.use_gpu || g_state.num_threads > 0) {
-            for (int i = 0; i < g_state.num_threads; ++i) {
-                if (wild_mode) {
-                    workers.emplace_back(WorkerWildThread, i, &secp, &jt, active_dp_bits, target_pub, range_min, range_max);
-                } else {
-                    workers.emplace_back(WorkerTameThread, i, &secp, &jt, active_dp_bits, range_min, range_max);
-                }
-            }
-        }
-    };
+    Secp256K1 secp;
+    secp.Init();
 
-    launch_all_workers(is_wild_mode);
-
-    auto last_send_time = std::chrono::steady_clock::now();
-    auto last_rate_time = last_send_time;
-    uint64_t last_steps = 0;
-    double cached_hashrate_mhs = 0.0;
-
-    auto format_hashrate = [&](double mhs) -> std::string {
-        std::ostringstream hr_ss;
-        hr_ss << std::fixed << std::setprecision(2) << mhs << " MH/s";
-        return hr_ss.str();
-    };
-
-    while (g_state.running.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        auto now = std::chrono::steady_clock::now();
-        double since_send = std::chrono::duration<double>(now - last_send_time).count();
-
-        size_t queued_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-            queued_count = g_state.dp_queue.size();
-        }
-
-        if (queued_count < batch_limit && since_send < 15.0) {
-            continue;
-        }
-
-        last_send_time = now;
-
-        double rate_elapsed = std::chrono::duration<double>(now - last_rate_time).count();
-        if (rate_elapsed >= 3.0) {
-            uint64_t cur_steps = g_state.total_steps.load();
-            cached_hashrate_mhs = ((cur_steps - last_steps) / rate_elapsed) / 1000000.0;
-            last_steps = cur_steps;
-            last_rate_time = now;
-        }
-
-        std::vector<DPRecord> batch;
-        {
-            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-            if (!g_state.dp_queue.empty()) {
-                size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                batch.assign(
-                    std::make_move_iterator(g_state.dp_queue.begin()),
-                    std::make_move_iterator(g_state.dp_queue.begin() + take)
-                );
-                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
-            }
-        }
-
-        std::string hr_str = format_hashrate(cached_hashrate_mhs);
-        std::string post_resp;
-        if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, batch, post_resp, true)) {
-            // Interrupted by stop_signal; return batch to front for final flush
-            if (!batch.empty()) {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
-            }
-            break;
-        }
-
-        if (ExtractJsonField(post_resp, "status") == "BINGO") {
-            g_state.worker_active = false;
-            g_state.running = false;
-            break;
-        }
-
-        std::string next_task = ExtractJsonField(post_resp, "task_type");
-        if (next_task != "TAME" && next_task != "WILD") {
-            std::cerr << "[-] Fatal: Server returned invalid task_type: " << next_task << "\n";
-            g_state.worker_active = false;
-            g_state.running = false;
-            for (size_t i = 0; i < workers.size(); ++i) {
-                if (workers[i].joinable()) workers[i].join();
-            }
-            curl_global_cleanup();
-            return 1;
-        }
-
-        bool want_wild = (next_task == "WILD");
-        if (want_wild != is_wild_mode) {
-            g_state.worker_active = false;
-            for (size_t i = 0; i < workers.size(); ++i) {
-                if (workers[i].joinable()) workers[i].join();
-            }
-            workers.clear();
-
-            // Flush all remaining buffered DPs belonging to the old phase before switching
-            bool bingo_during_flush = false;
-            while (!g_state.stop_signal.load()) {
-                std::vector<DPRecord> rem_batch;
-                {
-                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                    if (g_state.dp_queue.empty()) break;
-                    size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                    rem_batch.assign(
-                        std::make_move_iterator(g_state.dp_queue.begin()),
-                        std::make_move_iterator(g_state.dp_queue.begin() + take)
-                    );
-                    g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
-                }
-                std::string flush_resp;
-                if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, rem_batch, flush_resp, true)) {
-                    break;
-                }
-                if (ExtractJsonField(flush_resp, "status") == "BINGO") {
-                    bingo_during_flush = true;
-                    break;
-                }
-            }
-
-            if (bingo_during_flush || g_state.stop_signal.load()) {
-                g_state.running = false;
-                break;
-            }
-
-            is_wild_mode = want_wild;
-            launch_all_workers(is_wild_mode);
-        }
+    int rc = 0;
+    if (g_state.verify_mode) {
+        rc = RunVerification(&secp, active_gpus, hw_info);
+    } else {
+        rc = RunKangarooSession(&secp, g_state.server_url, active_gpus, hw_info, false, nullptr);
     }
 
-    g_state.worker_active = false;
-    for (size_t i = 0; i < workers.size(); ++i) {
-        if (workers[i].joinable()) workers[i].join();
-    }
-
-    // Drain all remaining buffered DPs on graceful SIGINT/SIGTERM shutdown
-    if (g_state.stop_signal.load()) {
-        std::string hr_str = "0.00 MH/s";
-        while (true) {
-            std::vector<DPRecord> final_batch;
-            {
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                if (g_state.dp_queue.empty()) break;
-                size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                final_batch.assign(
-                    std::make_move_iterator(g_state.dp_queue.begin()),
-                    std::make_move_iterator(g_state.dp_queue.begin() + take)
-                );
-                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
-            }
-            std::string final_resp;
-            if (!SendBatchReliable(is_wild_mode, hw_info, hr_str, final_batch, final_resp, false)) {
-                break;
-            }
-            if (ExtractJsonField(final_resp, "status") == "BINGO") {
-                break;
-            }
-        }
-    }
-
+    CleanupMainCurlHandle();
     curl_global_cleanup();
-    return 0;
+    return rc;
 }

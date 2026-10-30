@@ -2,7 +2,7 @@
 /**
  * Central Master Coordination Server (100% Pure 64-bit PHP - Zero External Libraries)
  * SQLite3 WAL | 256-Shard Binary BLOB Storage (WITHOUT ROWID) | 1,000 DP Batch Pipeline
- * Native Pure-PHP 256-Bit BigInt & Secp256k1 Jacobian Verifier | Strict Zero-Fallback Architecture
+ * Native Pure-PHP 256-Bit BigInt & Secp256k1 Jacobian Verifier | Zero-Fallback & Zero-Dead-Code
  */
 
 error_reporting(0);
@@ -30,8 +30,6 @@ class DbBusyException extends RuntimeException {}
 
 /* ==========================================================================
  * 100% PURE PHP 256-BIT UNSIGNED ARITHMETIC & SECP256K1 ELLIPTIC CURVE ENGINE
- * Representation: 16 little-endian limbs of 16 bits each (0..0xFFFF)
- * Safe on standard 64-bit PHP (max accumulator < 7e10 << PHP_INT_MAX 9.22e18)
  * ========================================================================== */
 
 function u256_zero() {
@@ -81,11 +79,6 @@ function u256_to_hex($a) {
         $parts[] = sprintf("%04x", $a[$i]);
     }
     return implode("", $parts);
-}
-
-function u256_to_hex_trimmed($a) {
-    $h = ltrim(u256_to_hex($a), "0");
-    return ($h === "") ? "0" : $h;
 }
 
 function u256_is_zero($a) {
@@ -207,7 +200,6 @@ function fp_mul($a, $b, $P) {
         }
     }
 
-    // Fast Secp256k1 reduction: 2^256 == 2^32 + 977 (mod P)
     for ($i = 16; $i < 32; $i++) {
         $h = $t[$i];
         if ($h !== 0) {
@@ -318,7 +310,6 @@ function fp_inv($a, $P, $ONE) {
 }
 
 function fn_mod($a, $N) {
-    // Since N > 2^255, any 256-bit unsigned integer satisfies 0 <= a < 2^256 < 2*N
     if (u256_cmp($a, $N) >= 0) {
         list($r, $_) = u256_sub($a, $N);
         return $r;
@@ -447,19 +438,11 @@ function secp256k1_derive_pubkey_pair($priv_u256) {
     ];
 }
 
-function secp256k1_pubkey_from_privkey($priv_hex) {
-    $pair = secp256k1_derive_pubkey_pair(u256_from_hex($priv_hex));
-    if ($pair === null) {
-        throw new InvalidArgumentException("Zero scalar does not produce a finite public key");
-    }
-    return $pair["compressed"];
-}
-
 /**
  * Pure-PHP private key recovery & cryptographic curve verification:
  * k1 = (D_T - D_W) mod n
  * k2 = (-D_T - D_W) mod n
- * Strictly verifies k * G == target_pubkey on Secp256k1 (zero external libraries, zero fallbacks)
+ * Strictly verifies k * G == target_pubkey AND range_min <= k <= range_max
  */
 function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex, $target_pubkey_hex) {
     $params = secp256k1_params();
@@ -493,8 +476,8 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
     $pub1 = ($pair1 !== null) ? $pair1[$pub_fmt] : "";
     $pub2 = ($pair2 !== null) ? $pair2[$pub_fmt] : "";
 
-    $match1 = ($pub1 !== "" && hash_equals($target_clean, $pub1));
-    $match2 = ($pub2 !== "" && hash_equals($target_clean, $pub2));
+    $match1 = ($pub1 !== "" && hash_equals($target_clean, $pub1) && $c1_in_range);
+    $match2 = ($pub2 !== "" && hash_equals($target_clean, $pub2) && $c2_in_range);
     $is_verified = ($match1 || $match2);
 
     return [
@@ -511,11 +494,12 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
 function get_space_width_float($range_min_hex, $range_max_hex) {
     $min = u256_from_hex($range_min_hex);
     $max = u256_from_hex($range_max_hex);
-    if (u256_cmp($max, $min) <= 0) {
-        throw new RuntimeException("Invalid search range: range_max must be strictly greater than range_min");
+    if (u256_cmp($max, $min) < 0) {
+        throw new RuntimeException("Invalid search range: range_max cannot be less than range_min");
     }
     list($diff, $_) = u256_sub($max, $min);
-    $w = u256_to_float($diff);
+    list($cardinality, $carry) = u256_add($diff, u256_from_int(1));
+    $w = u256_to_float($cardinality) + ($carry > 0 ? pow(2.0, 256) : 0.0);
     if ($w <= 0.0 || is_infinite($w) || is_nan($w)) {
         throw new RuntimeException("Invalid search space width calculation");
     }
@@ -552,8 +536,21 @@ function protect_storage_dir($dir) {
     }
 }
 
+function purge_verify_db($base_data_dir) {
+    $suffixes = ["", "-wal", "-shm", "-journal"];
+    foreach ($suffixes as $sfx) {
+        $f = $base_data_dir . "/verify.db" . $sfx;
+        if (file_exists($f) && !unlink($f)) {
+            throw new RuntimeException("Unable to delete temporary verification file: verify.db" . $sfx);
+        }
+    }
+}
+
 function get_shard_db($shard_byte) {
-    global $shards_dir;
+    global $is_verify_mode, $db, $shards_dir;
+    if ($is_verify_mode) {
+        return $db;
+    }
     static $shard_handles = [];
     $idx = is_int($shard_byte) ? ($shard_byte & 0xFF) : ord($shard_byte);
     $hex = str_pad(dechex($idx), 2, "0", STR_PAD_LEFT);
@@ -865,7 +862,6 @@ function calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w
         ];
     }
 
-    // Centered [-W/2, +W/2] Wild distribution yields 0.75 average overlap across [range_min, range_max]
     $exponent = (0.75 * $tame_steps * (float)$wild_steps) / (float)$space_w;
     $prob = 1.0 - exp(-$exponent);
     return [
@@ -941,20 +937,33 @@ function calculate_database_size_mb($db_path, $shards_dir) {
 }
 
 try {
-    $env_instance = getenv("INSTANCE_ID");
-    if ($env_instance !== false && $env_instance !== "") {
-        $instance_clean = $env_instance;
-    } elseif (isset($_GET["instance"]) && $_GET["instance"] !== "") {
-        $instance_clean = (string)$_GET["instance"];
-    } else {
-        $instance_clean = "puzzle140";
-    }
+    $action = isset($_GET["action"]) ? (string)$_GET["action"] : "";
+    $is_verify_mode = ((isset($_GET["verify_mode"]) && $_GET["verify_mode"] === "1") || $action === "verify");
 
-    if (!preg_match('/^[a-zA-Z0-9_-]{1,64}$/', $instance_clean)) {
-        http_response_code(400);
-        header("Content-Type: application/json");
-        echo json_encode(["status" => "ERROR", "message" => "Invalid instance identifier"]);
-        exit;
+    if ($is_verify_mode) {
+        if (!in_array($action, ["verify", "get_task", "submit_tame", "check_wild"], true)) {
+            http_response_code(400);
+            header("Content-Type: application/json");
+            echo json_encode(["status" => "ERROR", "message" => "Unsupported action on ephemeral verify.db"]);
+            exit;
+        }
+        $instance_clean = "verify";
+    } else {
+        $env_instance = getenv("INSTANCE_ID");
+        if ($env_instance !== false && $env_instance !== "") {
+            $instance_clean = $env_instance;
+        } elseif (isset($_GET["instance"]) && $_GET["instance"] !== "") {
+            $instance_clean = (string)$_GET["instance"];
+        } else {
+            $instance_clean = "puzzle140";
+        }
+
+        if (!preg_match('/^[a-zA-Z0-9_-]{1,64}$/', $instance_clean) || $instance_clean === "verify") {
+            http_response_code(400);
+            header("Content-Type: application/json");
+            echo json_encode(["status" => "ERROR", "message" => "Invalid instance identifier"]);
+            exit;
+        }
     }
 
     $custom_data_root = getenv("KANGAROO_DATA_DIR");
@@ -963,15 +972,223 @@ try {
         : (__DIR__ . "/data");
     protect_storage_dir($base_data_dir);
 
-    $data_dir = $base_data_dir . "/" . $instance_clean;
-    protect_storage_dir($data_dir);
+    // Historical Bitcoin Puzzle Task Vectors (Range & Public Key dispatched to workers during --verify)
+    $VERIFY_PUZZLES = [
+        1 => ["bits" => 1, "min" => "0x1", "max" => "0x1", "pub" => "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"],
+        2 => ["bits" => 2, "min" => "0x2", "max" => "0x3", "pub" => "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"],
+        3 => ["bits" => 3, "min" => "0x4", "max" => "0x7", "pub" => "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"],
+        4 => ["bits" => 4, "min" => "0x8", "max" => "0xf", "pub" => "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01"],
+        5 => ["bits" => 5, "min" => "0x10", "max" => "0x1f", "pub" => "022b4ea0a797a443d293ef5cff444f4979f06acfebd7e86d277475656138385b6c"],
+        6 => ["bits" => 6, "min" => "0x20", "max" => "0x3f", "pub" => "02f16f804244e46e2a09232d4aff3b59976b98fac14328a2d1a32496b49998f247"],
+        7 => ["bits" => 7, "min" => "0x40", "max" => "0x7f", "pub" => "02497c83c39c76e56d070fb906bced44099de2d0e222575f22e4749682de46eeac"],
+        8 => ["bits" => 8, "min" => "0x80", "max" => "0xff", "pub" => "02cea8d97ae24caebb2bba4eff99c743dccac732be31e1b61434d667b8fad96201"],
+        9 => ["bits" => 9, "min" => "0x100", "max" => "0x1ff", "pub" => "02e5d533d0b1a50075ead13c9dc41a0ced9a7a2aa2b9c707eab739ff14eece9be5"],
+        10 => ["bits" => 10, "min" => "0x200", "max" => "0x3ff", "pub" => "023ee974a28918c2160a9624801f18bf9a87d6a62783323e3cbf138bf43f2192a4"],
+        11 => ["bits" => 11, "min" => "0x400", "max" => "0x7ff", "pub" => "02ffabca3b764a327a750bbb2ba1cb8329d43ec0b7dcd8f72855a9d30cf3020f54"],
+        12 => ["bits" => 12, "min" => "0x800", "max" => "0xfff", "pub" => "0397793072899a65e5fc4492212329168f4a54fa26b0c4550e15ad7d0226d8509f"],
+        13 => ["bits" => 13, "min" => "0x1000", "max" => "0x1fff", "pub" => "0367c20e869ae55d227911be17981d0af9cea7efeec164c05c8e8b85b61d61bf9e"],
+        14 => ["bits" => 14, "min" => "0x2000", "max" => "0x3fff", "pub" => "028117d4fd551c9ae74c9fdac45d87bb669bc7dc354b08de037c4a13780734653b"],
+        15 => ["bits" => 15, "min" => "0x4000", "max" => "0x7fff", "pub" => "02261bca3e2a7c2c82e525494354a59108e39eaa7fd08a177c295d8a366314146e"],
+        16 => ["bits" => 16, "min" => "0x8000", "max" => "0xffff", "pub" => "029dd84f27df2e2cc525c9a79d670722ae3d0e01858ce1f1d7551b9ed470b581b3"],
+        17 => ["bits" => 17, "min" => "0x10000", "max" => "0x1ffff", "pub" => "036fe572edaabc2194760b79c4eeffa42cef7b9cae47683a06109bf087ea33b21c"],
+        18 => ["bits" => 18, "min" => "0x20000", "max" => "0x3ffff", "pub" => "03068770e25d9777cf3b83f29d2c8375d28b995183000f58f3e6005f0216e2d1b9"],
+        19 => ["bits" => 19, "min" => "0x40000", "max" => "0x7ffff", "pub" => "036890f6d6ac6eb70f13d65671072c26acf2e5ff4470965490a24685bde04fe3f0"],
+        20 => ["bits" => 20, "min" => "0x80000", "max" => "0xc0000", "pub" => "0214d79b8da08f9e974625f5c6d6bb44e1b177a3f0c0081335b8ec7a6008a6bdd7"],
+        21 => ["bits" => 21, "min" => "0x10f1c3", "max" => "0x14f1c3", "pub" => "0245e3c2cea92189322a9983666850e12995029989d144307b76fe4911f5fc85e4"],
+        22 => ["bits" => 22, "min" => "0x2efb1e", "max" => "0x32fb1e", "pub" => "02e9bf1601428534d4fb5e0e1dd648d7dcf9c89476d3e1796f05b9f7782375edb4"],
+        23 => ["bits" => 23, "min" => "0x73edf3", "max" => "0x77edf3", "pub" => "03a803c681bfef7efc3ba0e9448a4963408c642b0bdefc265af7891651350112f7"],
+        24 => ["bits" => 24, "min" => "0x96afa9", "max" => "0x9aafa9", "pub" => "039206d4b5faa2b8773aabbd05818a15a13aa7eb20ebf07e6676f4a2f7cae38f35"],
+        25 => ["bits" => 25, "min" => "0x18cf824", "max" => "0x190f824", "pub" => "028b0191fdee249ae5e040a957fe710100de22e58fa00c1da45c34ec3b7080ae98"],
+        26 => ["bits" => 26, "min" => "0x22cfdee", "max" => "0x230fdee", "pub" => "0292c3385fbc03f4dfeffc7aaef6a342dc1eb762b30563b607d71d40cafdcdef80"],
+        27 => ["bits" => 27, "min" => "0x4ef2913", "max" => "0x4f32913", "pub" => "02c5180d9bd99c3bf5728931bcef733bf13a8635739d4df0923bf1105398673990"],
+        28 => ["bits" => 28, "min" => "0x957f392", "max" => "0x95bf392", "pub" => "02e4116fdffe090dd1a3df2dc491acf51ed461487ef7d14b19a0040d18e24dffe7"],
+        29 => ["bits" => 29, "min" => "0x15bccd0b", "max" => "0x15c0cd0b", "pub" => "03cf54b8940addeee711aee95f83d001d2bbfb33c8ad33f59c803cda7799fac94d"],
+        30 => ["bits" => 30, "min" => "0x2471dd4f", "max" => "0x2475dd4f", "pub" => "032244cbcd2812c5c175ae16e195cb3f80006ec4776c36b128f4511e0fb2d701ca"],
+        31 => ["bits" => 31, "min" => "0x5357262d", "max" => "0x535b262d", "pub" => "03e84ae7d43a1d5f921c43f64c2bd53064fb1b009715327366ad8fbaae79643136"],
+        32 => ["bits" => 32, "min" => "0x82f1336f", "max" => "0x82f5336f", "pub" => "02ebebe37513c6a17387146b28bf630ead6a95a07f6d509df621d36763fc97f1f1"],
+        33 => ["bits" => 33, "min" => "0x1d2265acc", "max" => "0x1d22a5acc", "pub" => "0349425b1b4859e3e88face6d3c80ba65f733e2e03b84c3dacf0ee87f14e8f4bb4"],
+        34 => ["bits" => 34, "min" => "0x35e065f2e", "max" => "0x35e0a5f2e", "pub" => "031002176a2c3c9cd8ac9d19f0f163dc814703b4bb98bb10a8302cfce8fa5104a6"],
+        35 => ["bits" => 35, "min" => "0x5b31d8ce9", "max" => "0x5b3218ce9", "pub" => "02a5b7321b12a4ae1b84a9c331668052954114aacb4d088382dcb89a0725589c19"],
+        36 => ["bits" => 36, "min" => "0xbab024454", "max" => "0xbab064454", "pub" => "0263244c3b892c6437bed2399cba0fe074b3d0f928cf5883bd88d439690d790e80"],
+        37 => ["bits" => 37, "min" => "0x17577432f9", "max" => "0x17577832f9", "pub" => "027d2c03c3ef0aec70f2c7e1e75454a5dfdd0e1adea670c1b3a4643c48ad0f1255"],
+        38 => ["bits" => 38, "min" => "0x22382dd1cd", "max" => "0x223831d1cd", "pub" => "03c060e1e3771cbeccb38e119c2414702f3f5181a89652538851d2e3886bdd70c6"],
+        39 => ["bits" => 39, "min" => "0x4b5f804f85", "max" => "0x4b5f844f85", "pub" => "022d77cd1467019a6bf28f7375d0949ce30e6b5815c2758b98a74c2700bc006543"],
+        40 => ["bits" => 40, "min" => "0xe9ae489564", "max" => "0xe9ae4c9564", "pub" => "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4"],
+        41 => ["bits" => 41, "min" => "0x15386991b8f", "max" => "0x153869d1b8f", "pub" => "03b357e68437da273dcf995a474a524439faad86fc9effc300183f714b0903468b"],
+        42 => ["bits" => 42, "min" => "0x2a221c2d77c", "max" => "0x2a221c6d77c", "pub" => "03eec88385be9da803a0d6579798d977a5d0c7f80917dab49cb73c9e3927142cb6"],
+        43 => ["bits" => 43, "min" => "0x6bd3b261502", "max" => "0x6bd3b2a1502", "pub" => "02a631f9ba0f28511614904df80d7f97a4f43f02249c8909dac92276ccf0bcdaed"],
+        44 => ["bits" => 44, "min" => "0x98d41ce2bb0", "max" => "0x98d41d22bb0", "pub" => "02067f4458a634fa16654bd3a2942bd0723e87914c909916c91303592eda523034"],
+        45 => ["bits" => 45, "min" => "0x186c8f931418", "max" => "0x186c8f971418", "pub" => "029823fb02ad69fca8cf6667c2a5f099494e41d6bc8cf432f3476cd1118577b92b"],
+        46 => ["bits" => 46, "min" => "0x248554286a43", "max" => "0x2485542c6a43", "pub" => "03c5e754951f498dea6effd25d9c7be419959b6400bee54f6963dd28ba552a8451"],
+        47 => ["bits" => 47, "min" => "0x5ec598f70e51", "max" => "0x5ec598fb0e51", "pub" => "03bfe1fc01bf9b2669dacc2e3ee3a14d50c370939fea6c53208368b001abcd1dd2"],
+        48 => ["bits" => 48, "min" => "0x91893c7fbdd9", "max" => "0x91893c83bdd9", "pub" => "0257aa20950f54381464d6525a8a1ed925b1878f94ae93296400b15c5d02aec502"],
+        49 => ["bits" => 49, "min" => "0x10f135b9ecada", "max" => "0x10f135ba2cada", "pub" => "039ed8fad048a0678b1af5772cfc5281ba0c5303857ee31e0f78cf9ce4c9efd196"],
+        50 => ["bits" => 50, "min" => "0x367f0f637efb1", "max" => "0x367f0f63befb1", "pub" => "021bc6c10fa1ef9cdf1b44930479cee11f00fe49e3d3946ded4920a58e74d2dca0"],
+        51 => ["bits" => 51, "min" => "0x4ecf8df1d2dea", "max" => "0x4ecf8df212dea", "pub" => "03084570b5eb4b5332f28b9a0695aef694701738509391c65d1d85b3cf4fbd30c9"],
+        52 => ["bits" => 52, "min" => "0x8d51fa0d39a29", "max" => "0x8d51fa0d79a29", "pub" => "02e39b170b44fa6b986e968c999123af23736adece4d2b7059b2763952308d3a71"],
+        53 => ["bits" => 53, "min" => "0x19942a1978b8a2", "max" => "0x19942a197cb8a2", "pub" => "0364eaf2096c4f6ee8c9f006cc8d5eeb505f613e2536174b2480ba7f51d4a19939"],
+        54 => ["bits" => 54, "min" => "0x3e1858a2d5957b", "max" => "0x3e1858a2d9957b", "pub" => "031cd7bd7e86571d586a9f4c11c1d159fc7855c095a517d9b03e1cd95234ca7c60"],
+        55 => ["bits" => 55, "min" => "0x4b7b3eebe7de39", "max" => "0x4b7b3eebebde39", "pub" => "03d98297eec59217cf0ad9d878e782ba0f6f7a7711d582fcaf3ded7e947fe57e7b"],
+        56 => ["bits" => 56, "min" => "0xb80c804245d894", "max" => "0xb80c804249d894", "pub" => "02e0848f882d14cf6e95e7a0910927109b3881aeae9dde7fd35abb62e4a2cfebe2"],
+        57 => ["bits" => 57, "min" => "0x1f3c39601d0141e", "max" => "0x1f3c39601d4141e", "pub" => "0396b44fdc216fc4d954289d99572b39a63466c21c9e00bbdc18dab8d803936271"],
+        58 => ["bits" => 58, "min" => "0x3a56cf9e423cde6", "max" => "0x3a56cf9e427cde6", "pub" => "02e1af2d4ab33d2be521ee8fc3a547fd1f3339df7eb76dcb9f599e29f6b073087e"],
+        59 => ["bits" => 59, "min" => "0x738356a9bc1b3e8", "max" => "0x738356a9bc5b3e8", "pub" => "02c8a2851cd5dd20b34bb718ef3ac34e2b1682eab00e48f78854fd28724d723f3b"],
+        60 => ["bits" => 60, "min" => "0x9e102281a14e276", "max" => "0x9e102281a18e276", "pub" => "03c7aa3bdeaf5c952ee65bc587f8afba33697c8c6cc1e90c64ba53832ab7e7c4e5"],
+        61 => ["bits" => 61, "min" => "0x109a7b7389257045", "max" => "0x109a7b7389297045", "pub" => "032d0084f4d1ae62a1f6c562d79ef6378073d2a4cffa393303a7790581f72e3764"],
+        62 => ["bits" => 62, "min" => "0x38b3010b991b5f2e", "max" => "0x38b3010b991f5f2e", "pub" => "034b3d0498ab02704f7cfa5ed4141471626d45aad542d9037ab0f221121929d559"],
+        63 => ["bits" => 63, "min" => "0x78a487922d96d02f", "max" => "0x78a487922d9ad02f", "pub" => "02379833cb0cc1077173a7fac48c463d3b4b2bca4eb66a6d12a16779d49da75b98"],
+        64 => ["bits" => 64, "min" => "0x9d4b66cad1b1fcad", "max" => "0x9d4b66cad1b5fcad", "pub" => "02a48be8fd5b64235965de5d4127b7c04d091daeddf3850db58a1c542c72d5266b"],
+        65 => ["bits" => 65, "min" => "0x1a838b13505af2edb", "max" => "0x1a838b13505b32edb", "pub" => "0230210c23b1a047bc9bdbb13448e67deddc108946de6de639bcc75d47c0216b1b"],
+        66 => ["bits" => 66, "min" => "0x2832ed74f2b5d959d", "max" => "0x2832ed74f2b61959d", "pub" => "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"],
+        67 => ["bits" => 67, "min" => "0x730fc235c193f7c3f", "max" => "0x730fc235c19437c3f", "pub" => "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"],
+        68 => ["bits" => 68, "min" => "0xbebb3940cd0f94008", "max" => "0xbebb3940cd0fd4008", "pub" => "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"],
+        69 => ["bits" => 69, "min" => "0x101d83275fb2b8fede", "max" => "0x101d83275fb2bcfede", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
+        70 => ["bits" => 70, "min" => "0x349b84b6431a69819f", "max" => "0x349b84b6431a6d819f", "pub" => "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"],
+        75 => ["bits" => 75, "min" => "0x4c5ce114686a1311959", "max" => "0x4c5ce114686a1351959", "pub" => "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"],
+        80 => ["bits" => 80, "min" => "0xea1a5c66dcc11b59d570", "max" => "0xea1a5c66dcc11b5dd570", "pub" => "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"],
+        85 => ["bits" => 85, "min" => "0x11720c4f018d51b8cd0e5e", "max" => "0x11720c4f018d51b8d10e5e", "pub" => "0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a"],
+        90 => ["bits" => 90, "min" => "0x2ce00bb2136a445c71c738e", "max" => "0x2ce00bb2136a445c720738e", "pub" => "035c38bd9ae4b10e8a250857006f3cfd98ab15a6196d9f4dfd25bc7ecc77d788d5"],
+        95 => ["bits" => 95, "min" => "0x527a792b183c7f64a0e62801", "max" => "0x527a792b183c7f64a0ea2801", "pub" => "02967a5905d6f3b420959a02789f96ab4c3223a2c4d2762f817b7895c5bc88a045"],
+        100 => ["bits" => 100, "min" => "0xaf55fc59c335c8ec67ed15d53", "max" => "0xaf55fc59c335c8ec67ed55d53", "pub" => "03d2063d40402f030d4cc71331468827aa41a8a09bd6fd801ba77fb64f8e67e617"],
+        105 => ["bits" => 105, "min" => "0x16f14fc2054cd87ee6396afdcbc", "max" => "0x16f14fc2054cd87ee6396b3dcbc", "pub" => "03bcf7ce887ffca5e62c9cabbdb7ffa71dc183c52c04ff4ee5ee82e0c55c39d77b"],
+        110 => ["bits" => 110, "min" => "0x35c0d7234df7deb0f20cf7055f4f", "max" => "0x35c0d7234df7deb0f20cf7095f4f", "pub" => "0309976ba5570966bf889196b7fdf5a0f9a1e9ab340556ec29f8bb60599616167d"],
+        115 => ["bits" => 115, "min" => "0x60f4d11574f5deee49961d95eebdb", "max" => "0x60f4d11574f5deee49961d962ebdb", "pub" => "0248d313b0398d4923cdca73b8cfa6532b91b96703902fc8b32fd438a3b7cd7f55"],
+        120 => ["bits" => 120, "min" => "0xb10f22572c497a836ea187f2df2e5a", "max" => "0xb10f22572c497a836ea187f2e32e5a", "pub" => "02ceb6cbbcdbdf5ef7150682150f4ce2c6f4807b349827dcdbdd1f2efa885a2630"],
+        125 => ["bits" => 125, "min" => "0x1c533b6bb7f0804e09960225e446ca76", "max" => "0x1c533b6bb7f0804e09960225e44aca76", "pub" => "0233709eb11e0d4439a729f21c2c443dedb727528229713f0065721ba8fa46f00e"],
+        130 => ["bits" => 130, "min" => "0x33e7665705359f04f28b88cf897c503cd", "max" => "0x33e7665705359f04f28b88cf897c903cd", "pub" => "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852"],
+        135 => ["bits" => 135, "min" => "0x6d9392a16883f90903d5f78da57aefe0ae", "max" => "0x6d9392a16883f90903d5f78da57af3e0ae", "pub" => "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"]
+    ];
 
-    $db_path = $data_dir . "/system_" . $instance_clean . ".db";
-    $vault_path = $data_dir . "/.solution_vault.php";
-    $admin_token_file = $data_dir . "/.admin_token.php";
+    // Dedicated Server-Only Historical Private Key Array for --verify Comparison (Never transmitted or printed)
+    $VERIFY_EXPECTED_KEYS = [
+        1 => "0x1",
+        2 => "0x3",
+        3 => "0x7",
+        4 => "0x8",
+        5 => "0x13",
+        6 => "0x35",
+        7 => "0x56",
+        8 => "0xda",
+        9 => "0x1da",
+        10 => "0x3bf",
+        11 => "0x485",
+        12 => "0xb48",
+        13 => "0x12d6",
+        14 => "0x3233",
+        15 => "0x6e96",
+        16 => "0xa32f",
+        17 => "0x1ebd2",
+        18 => "0x38d4c",
+        19 => "0x738b9",
+        20 => "0x98327",
+        21 => "0x117466",
+        22 => "0x316ba9",
+        23 => "0x76884b",
+        24 => "0x995dae",
+        25 => "0x18e8d53",
+        26 => "0x22ee9b5",
+        27 => "0x4f26019",
+        28 => "0x9599557",
+        29 => "0x15bf29f9",
+        30 => "0x24749666",
+        31 => "0x53580aa6",
+        32 => "0x82f2495b",
+        33 => "0x1d227914e",
+        34 => "0x35e076610",
+        35 => "0x5b31fba82",
+        36 => "0xbab042e8f",
+        37 => "0x1757756a93",
+        38 => "0x22382facd0",
+        39 => "0x4b5f8303e9",
+        40 => "0xe9ae4933d6",
+        41 => "0x153869acc5b",
+        42 => "0x2a221c58d8f",
+        43 => "0x6bd3b27c591",
+        44 => "0x98d41cf83bd",
+        45 => "0x186c8f95ca04",
+        46 => "0x2485542b6623",
+        47 => "0x5ec598f80993",
+        48 => "0x91893c8340d8",
+        49 => "0x10f135b9f91a6",
+        50 => "0x367f0f63b655f",
+        51 => "0x4ecf8df204859",
+        52 => "0x8d51fa0d4c9d3",
+        53 => "0x19942a1979b940",
+        54 => "0x3e1858a2d75a64",
+        55 => "0x4b7b3eebe8b9c6",
+        56 => "0xb80c8042466bc5",
+        57 => "0x1f3c39601d29319",
+        58 => "0x3a56cf9e4266158",
+        59 => "0x738356a9bc25557",
+        60 => "0x9e102281a17fa2b",
+        61 => "0x109a7b7389274945",
+        62 => "0x38b3010b991e4a64",
+        63 => "0x78a487922d99edbe",
+        64 => "0x9d4b66cad1b417e2",
+        65 => "0x1a838b13505b26867",
+        66 => "0x2832ed74f2b5e35ee",
+        67 => "0x730fc235c1942c1ae",
+        68 => "0xbebb3940cd0fc1491",
+        69 => "0x101d83275fb2bc7e0c",
+        70 => "0x349b84b6431a6c4ef1",
+        75 => "0x4c5ce114686a1336e07",
+        80 => "0xea1a5c66dcc11b5ad180",
+        85 => "0x11720c4f018d51b8cebba8",
+        90 => "0x2ce00bb2136a445c71e85bf",
+        95 => "0x527a792b183c7f64a0e8b1f4",
+        100 => "0xaf55fc59c335c8ec67ed24826",
+        105 => "0x16f14fc2054cd87ee6396b33df3",
+        110 => "0x35c0d7234df7deb0f20cf7062444",
+        115 => "0x60f4d11574f5deee49961d9609ac6",
+        120 => "0xb10f22572c497a836ea187f2e1fc23",
+        125 => "0x1c533b6bb7f0804e09960225e44877ac",
+        130 => "0x33e7665705359f04f28b88cf897c603c9",
+        135 => "0x6d9392a16883f90903d5f78da57af07eb2"
+    ];
 
-    $shards_dir = $data_dir . "/shards";
-    protect_storage_dir($shards_dir);
+    // API: EPHEMERAL verify.db LIFECYCLE (Purges verify.db before & after run; zero orphan directories/shards)
+    if ($action === "verify") {
+        header("Content-Type: application/json");
+
+        if (isset($_GET["cleanup"]) && $_GET["cleanup"] === "1") {
+            purge_verify_db($base_data_dir);
+            echo json_encode(["status" => "OK", "deleted" => "verify.db"]);
+            exit;
+        }
+
+        if (!isset($_GET["init_id"])) {
+            purge_verify_db($base_data_dir);
+            $catalog = [];
+            foreach ($VERIFY_PUZZLES as $pid => $vec) {
+                $catalog[] = [
+                    "id" => $pid,
+                    "bits" => $vec["bits"]
+                ];
+            }
+            echo json_encode([
+                "status" => "OK",
+                "db_file" => "verify.db",
+                "total" => count($catalog),
+                "puzzles" => $catalog
+            ]);
+            exit;
+        }
+    }
+
+    if ($is_verify_mode) {
+        $db_path = $base_data_dir . "/verify.db";
+        $vault_path = "";
+        $admin_token_file = "";
+        $shards_dir = "";
+    } else {
+        $data_dir = $base_data_dir . "/" . $instance_clean;
+        protect_storage_dir($data_dir);
+        $db_path = $data_dir . "/system_" . $instance_clean . ".db";
+        $vault_path = $data_dir . "/bingo_key.php";
+        $admin_token_file = $data_dir . "/.admin_token.php";
+        $shards_dir = $data_dir . "/shards";
+        protect_storage_dir($shards_dir);
+    }
 
     $db_existed = file_exists($db_path);
     $db = new SQLite3($db_path);
@@ -985,8 +1202,8 @@ try {
     $db->exec("PRAGMA journal_mode = WAL;");
     $db->exec("PRAGMA synchronous = NORMAL;");
     $db->exec("PRAGMA wal_autocheckpoint = 1000;");
-    $db->exec("PRAGMA cache_size = -131072;");
-    $db->exec("PRAGMA mmap_size = 536870912;");
+    $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-131072") . ";");
+    $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "536870912") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
     $db->exec("
@@ -1003,26 +1220,99 @@ try {
             total_dps INTEGER NOT NULL DEFAULT 0,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_steps', '0');
-        INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
     ");
 
-    $expected_admin_token = get_or_create_admin_token($db, $admin_token_file);
-    $action = isset($_GET["action"]) ? (string)$_GET["action"] : "";
+    if ($is_verify_mode) {
+        $db->exec("CREATE TABLE IF NOT EXISTS tame_traps (
+            dp_x BLOB PRIMARY KEY,
+            total_distance BLOB NOT NULL
+        ) WITHOUT ROWID;");
+    } else {
+        $db->exec("
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_steps', '0');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
+        ");
+    }
+
+    if ($action === "verify" && isset($_GET["init_id"])) {
+        header("Content-Type: application/json");
+        $pid = intval($_GET["init_id"]);
+        if (!isset($VERIFY_PUZZLES[$pid])) {
+            $db->close();
+            http_response_code(404);
+            echo json_encode(["status" => "ERROR", "message" => "Unknown historical puzzle id"]);
+            exit;
+        }
+
+        $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+        $db->exec("DELETE FROM tame_traps;");
+        $db->exec("DELETE FROM active_workers;");
+        $db->exec("DELETE FROM system_settings WHERE setting_key IN ('verify_solved', 'verify_puzzle_id');");
+        $db->exec("COMMIT;");
+
+        $vec = $VERIFY_PUZZLES[$pid];
+        list($w_u, $_) = u256_sub(u256_from_hex($vec["max"]), u256_from_hex($vec["min"]));
+        if (u256_cmp($w_u, u256_from_int(255)) <= 0) {
+            $v_dp_bits = 4;
+            $v_target_dp = 4;
+        } elseif (u256_cmp($w_u, u256_from_int(65535)) <= 0) {
+            $v_dp_bits = 4;
+            $v_target_dp = 16;
+        } else {
+            $v_dp_bits = 6;
+            $v_target_dp = 48;
+        }
+
+        set_setting($db, "verify_puzzle_id", (string)$pid);
+        set_setting($db, "range_min", $vec["min"]);
+        set_setting($db, "range_max", $vec["max"]);
+        set_setting($db, "target_pubkey", $vec["pub"]);
+        set_setting($db, "dp_mask_bits", (string)$v_dp_bits);
+        set_setting($db, "target_dp", (string)$v_target_dp);
+        set_setting($db, "batch_limit", "64");
+        set_setting($db, "heartbeat_sec", "1");
+        set_setting($db, "total_tame_traps", "0");
+        set_setting($db, "total_wild_steps", "0");
+        $db->close();
+
+        echo json_encode([
+            "status" => "OK",
+            "id" => $pid,
+            "bits" => $vec["bits"],
+            "dp_mask_bits" => $v_dp_bits,
+            "target_dp" => $v_target_dp
+        ]);
+        exit;
+    }
+
+    $expected_admin_token = $is_verify_mode ? "" : get_or_create_admin_token($db, $admin_token_file);
 
     // API 1: GET TASK
     if ($action === "get_task") {
         header("Content-Type: application/json");
         $tame_count = intval(get_required_setting($db, "total_tame_traps"));
         $target_dp = intval(get_required_setting($db, "target_dp"));
-        $is_solved = file_exists($vault_path);
+        $batch_lim = intval(get_required_setting($db, "batch_limit"));
+        $hb_base = intval(get_required_setting($db, "heartbeat_sec"));
+        $r_min = get_required_setting($db, "range_min");
+        $r_max = get_required_setting($db, "range_max");
+        $t_pub = get_required_setting($db, "target_pubkey");
+        $dp_b = intval(get_required_setting($db, "dp_mask_bits"));
+        $is_solved = $is_verify_mode
+            ? (find_setting_or_null($db, "verify_solved") === "1")
+            : file_exists($vault_path);
         $task_type = ($tame_count >= $target_dp) ? "WILD" : "TAME";
+
+        if ($is_verify_mode) {
+            $db->close();
+        }
 
         echo json_encode([
             "status" => $is_solved ? "BINGO" : "OK",
@@ -1030,12 +1320,12 @@ try {
             "task_type" => $task_type,
             "current_traps" => $tame_count,
             "target_traps" => $target_dp,
-            "range_min" => get_required_setting($db, "range_min"),
-            "range_max" => get_required_setting($db, "range_max"),
-            "target_pubkey" => get_required_setting($db, "target_pubkey"),
-            "dp_mask_bits" => intval(get_required_setting($db, "dp_mask_bits")),
-            "batch_limit" => 1000,
-            "heartbeat_sec" => ($task_type === "WILD") ? 15 : 30
+            "range_min" => $r_min,
+            "range_max" => $r_max,
+            "target_pubkey" => $t_pub,
+            "dp_mask_bits" => $dp_b,
+            "batch_limit" => $batch_lim,
+            "heartbeat_sec" => ($task_type === "WILD" && $hb_base > 15) ? 15 : $hb_base
         ]);
         exit;
     }
@@ -1044,13 +1334,22 @@ try {
     if ($action === "submit_tame" || $action === "check_wild") {
         header("Content-Type: application/json");
 
-        if (file_exists($vault_path)) {
+        $already_solved = $is_verify_mode
+            ? (find_setting_or_null($db, "verify_solved") === "1")
+            : file_exists($vault_path);
+        if ($already_solved) {
+            if ($is_verify_mode) {
+                $db->close();
+            }
             echo json_encode(["status" => "BINGO", "stop" => true]);
             exit;
         }
 
         $payload = parse_incoming_dp_payload();
         if ($payload === null) {
+            if ($is_verify_mode) {
+                $db->close();
+            }
             http_response_code(400);
             echo json_encode(["status" => "ERROR", "message" => "Malformed DPKG binary payload"]);
             exit;
@@ -1157,6 +1456,9 @@ try {
             $task_type = ($total >= $target_dp) ? "WILD" : "TAME";
             $prob_info = calculate_hit_probability($total, 0.0, $dp_bits, $space_w);
 
+            if ($is_verify_mode) {
+                $db->close();
+            }
             echo json_encode([
                 "status" => "OK",
                 "accepted" => $actual_inserted,
@@ -1236,32 +1538,63 @@ try {
                         }
 
                         $schk->close();
+                        $collision_dp_hex = "0x" . bin2hex($bin_x);
+                        $total_traps_now = intval(get_required_setting($db, "total_tame_traps"));
+
+                        $added_steps = ($batch_size > 0) ? ((float)$batch_size * pow(2.0, $dp_bits)) : 0.0;
+                        if ($added_steps > 0.0) {
+                            increment_setting_float($db, "total_wild_steps", $added_steps);
+                        }
+
+                        if ($is_verify_mode) {
+                            $active_pid = intval(get_required_setting($db, "verify_puzzle_id"));
+                            if (!isset($VERIFY_EXPECTED_KEYS[$active_pid])) {
+                                $db->close();
+                                throw new RuntimeException("Missing expected verification key for puzzle #" . $active_pid);
+                            }
+                            $expected_canonical = "0x" . u256_to_hex(u256_from_hex($VERIFY_EXPECTED_KEYS[$active_pid]));
+                            $key_matched = hash_equals($expected_canonical, $cands["verified_key"]);
+                            if (!$key_matched) {
+                                $db->close();
+                                http_response_code(500);
+                                echo json_encode([
+                                    "status" => "ERROR",
+                                    "key_matched" => false,
+                                    "message" => "Recovered private key mismatch against historical puzzle #" . $active_pid
+                                ]);
+                                exit;
+                            }
+                            set_setting($db, "verify_solved", "1");
+                            $db->close();
+                            echo json_encode([
+                                "status" => "BINGO",
+                                "stop" => true,
+                                "key_matched" => true,
+                                "total_traps" => $total_traps_now
+                            ]);
+                            exit;
+                        }
+
+                        $trimmed_priv = ltrim(substr($cands["verified_key"], 2), "0");
+                        $compact_priv = "0x" . ($trimmed_priv === "" ? "0" : $trimmed_priv);
 
                         $vault_data = json_encode([
+                            "status" => "BINGO",
                             "instance" => $instance_clean,
                             "timestamp_utc" => gmdate("Y-m-d H:i:s"),
                             "worker_id" => $worker_id,
                             "hardware" => $hardware,
-                            "collision_dp_x" => "0x" . bin2hex($bin_x),
-                            "candidate_1" => $cands["cand1"],
-                            "candidate_2" => $cands["cand2"],
-                            "candidate_1_in_range" => $cands["cand1_in_range"],
-                            "candidate_2_in_range" => $cands["cand2_in_range"],
-                            "is_verified" => true,
+                            "private_key" => $compact_priv,
+                            "private_key_padded" => $cands["verified_key"],
                             "derived_pubkey" => $cands["derived_pubkey"],
-                            "verified_key" => $cands["verified_key"],
+                            "collision_dp_x" => $collision_dp_hex,
                             "tame_distance" => "0x" . $tame_dist_hex,
                             "wild_distance" => "0x" . $wild_dist_hex
                         ], JSON_PRETTY_PRINT);
 
                         $vault_file_content = PHP_GUARD . $vault_data . "\n";
                         if (file_put_contents($vault_path, $vault_file_content, LOCK_EX) === false || !chmod($vault_path, 0600)) {
-                            throw new DbBusyException("Failed to persist verified solution vault; worker must retry");
-                        }
-
-                        $added_steps = ($batch_size > 0) ? ((float)$batch_size * pow(2.0, $dp_bits)) : 0.0;
-                        if ($added_steps > 0.0) {
-                            increment_setting_float($db, "total_wild_steps", $added_steps);
+                            throw new DbBusyException("Failed to persist bingo_key.php; worker must retry");
                         }
 
                         echo json_encode([
@@ -1283,6 +1616,10 @@ try {
             $total_traps = intval(get_required_setting($db, "total_tame_traps"));
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
+
+            if ($is_verify_mode) {
+                $db->close();
+            }
 
             echo json_encode([
                 "status" => "CONTINUE",
@@ -1356,219 +1693,6 @@ try {
             "winning_probability" => $prob,
             "workers" => $workers_list,
             "vault_solved" => $vault_solved
-        ]);
-        exit;
-    }
-
-    // Canonical 83 Bitcoin Puzzle Test Vectors (Server Ground Truth)
-    $VERIFY_PUZZLES = [
-        1 => ["bits" => 1, "min" => "0x1", "max" => "0x1", "key" => "0x1", "status" => "SOLVED", "pub" => "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"],
-        2 => ["bits" => 2, "min" => "0x2", "max" => "0x3", "key" => "0x3", "status" => "SOLVED", "pub" => "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"],
-        3 => ["bits" => 3, "min" => "0x4", "max" => "0x7", "key" => "0x7", "status" => "SOLVED", "pub" => "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"],
-        4 => ["bits" => 4, "min" => "0x8", "max" => "0xf", "key" => "0x8", "status" => "SOLVED", "pub" => "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01"],
-        5 => ["bits" => 5, "min" => "0x10", "max" => "0x1f", "key" => "0x13", "status" => "SOLVED", "pub" => "022b4ea0a797a443d293ef5cff444f4979f06acfebd7e86d277475656138385b6c"],
-        6 => ["bits" => 6, "min" => "0x20", "max" => "0x3f", "key" => "0x35", "status" => "SOLVED", "pub" => "02f16f804244e46e2a09232d4aff3b59976b98fac14328a2d1a32496b49998f247"],
-        7 => ["bits" => 7, "min" => "0x40", "max" => "0x7f", "key" => "0x56", "status" => "SOLVED", "pub" => "02497c83c39c76e56d070fb906bced44099de2d0e222575f22e4749682de46eeac"],
-        8 => ["bits" => 8, "min" => "0x80", "max" => "0xff", "key" => "0xda", "status" => "SOLVED", "pub" => "02cea8d97ae24caebb2bba4eff99c743dccac732be31e1b61434d667b8fad96201"],
-        9 => ["bits" => 9, "min" => "0x100", "max" => "0x1ff", "key" => "0x1da", "status" => "SOLVED", "pub" => "02e5d533d0b1a50075ead13c9dc41a0ced9a7a2aa2b9c707eab739ff14eece9be5"],
-        10 => ["bits" => 10, "min" => "0x200", "max" => "0x3ff", "key" => "0x3bf", "status" => "SOLVED", "pub" => "023ee974a28918c2160a9624801f18bf9a87d6a62783323e3cbf138bf43f2192a4"],
-        11 => ["bits" => 11, "min" => "0x400", "max" => "0x7ff", "key" => "0x485", "status" => "SOLVED", "pub" => "02ffabca3b764a327a750bbb2ba1cb8329d43ec0b7dcd8f72855a9d30cf3020f54"],
-        12 => ["bits" => 12, "min" => "0x800", "max" => "0xfff", "key" => "0xb48", "status" => "SOLVED", "pub" => "0397793072899a65e5fc4492212329168f4a54fa26b0c4550e15ad7d0226d8509f"],
-        13 => ["bits" => 13, "min" => "0x1000", "max" => "0x1fff", "key" => "0x12d6", "status" => "SOLVED", "pub" => "0367c20e869ae55d227911be17981d0af9cea7efeec164c05c8e8b85b61d61bf9e"],
-        14 => ["bits" => 14, "min" => "0x2000", "max" => "0x3fff", "key" => "0x3233", "status" => "SOLVED", "pub" => "028117d4fd551c9ae74c9fdac45d87bb669bc7dc354b08de037c4a13780734653b"],
-        15 => ["bits" => 15, "min" => "0x4000", "max" => "0x7fff", "key" => "0x6e96", "status" => "SOLVED", "pub" => "02261bca3e2a7c2c82e525494354a59108e39eaa7fd08a177c295d8a366314146e"],
-        16 => ["bits" => 16, "min" => "0x8000", "max" => "0xffff", "key" => "0xa32f", "status" => "SOLVED", "pub" => "029dd84f27df2e2cc525c9a79d670722ae3d0e01858ce1f1d7551b9ed470b581b3"],
-        17 => ["bits" => 17, "min" => "0x1d3d2", "max" => "0x203d2", "key" => "0x1ebd2", "status" => "SOLVED", "pub" => "036fe572edaabc2194760b79c4eeffa42cef7b9cae47683a06109bf087ea33b21c"],
-        18 => ["bits" => 18, "min" => "0x3754c", "max" => "0x3a54c", "key" => "0x38d4c", "status" => "SOLVED", "pub" => "03068770e25d9777cf3b83f29d2c8375d28b995183000f58f3e6005f0216e2d1b9"],
-        19 => ["bits" => 19, "min" => "0x720b9", "max" => "0x750b9", "key" => "0x738b9", "status" => "SOLVED", "pub" => "036890f6d6ac6eb70f13d65671072c26acf2e5ff4470965490a24685bde04fe3f0"],
-        20 => ["bits" => 20, "min" => "0x96b27", "max" => "0x99b27", "key" => "0x98327", "status" => "SOLVED", "pub" => "0214d79b8da08f9e974625f5c6d6bb44e1b177a3f0c0081335b8ec7a6008a6bdd7"],
-        21 => ["bits" => 21, "min" => "0x115c66", "max" => "0x118c66", "key" => "0x117466", "status" => "SOLVED", "pub" => "0245e3c2cea92189322a9983666850e12995029989d144307b76fe4911f5fc85e4"],
-        22 => ["bits" => 22, "min" => "0x3153a9", "max" => "0x3183a9", "key" => "0x316ba9", "status" => "SOLVED", "pub" => "02e9bf1601428534d4fb5e0e1dd648d7dcf9c89476d3e1796f05b9f7782375edb4"],
-        23 => ["bits" => 23, "min" => "0x76704b", "max" => "0x76a04b", "key" => "0x76884b", "status" => "SOLVED", "pub" => "03a803c681bfef7efc3ba0e9448a4963408c642b0bdefc265af7891651350112f7"],
-        24 => ["bits" => 24, "min" => "0x9945ae", "max" => "0x9975ae", "key" => "0x995dae", "status" => "SOLVED", "pub" => "039206d4b5faa2b8773aabbd05818a15a13aa7eb20ebf07e6676f4a2f7cae38f35"],
-        25 => ["bits" => 25, "min" => "0x18e7553", "max" => "0x18ea553", "key" => "0x18e8d53", "status" => "SOLVED", "pub" => "028b0191fdee249ae5e040a957fe710100de22e58fa00c1da45c34ec3b7080ae98"],
-        26 => ["bits" => 26, "min" => "0x22ed1b5", "max" => "0x22f01b5", "key" => "0x22ee9b5", "status" => "SOLVED", "pub" => "0292c3385fbc03f4dfeffc7aaef6a342dc1eb762b30563b607d71d40cafdcdef80"],
-        27 => ["bits" => 27, "min" => "0x4f24819", "max" => "0x4f27819", "key" => "0x4f26019", "status" => "SOLVED", "pub" => "02c5180d9bd99c3bf5728931bcef733bf13a8635739d4df0923bf1105398673990"],
-        28 => ["bits" => 28, "min" => "0x9597d57", "max" => "0x959ad57", "key" => "0x9599557", "status" => "SOLVED", "pub" => "02e4116fdffe090dd1a3df2dc491acf51ed461487ef7d14b19a0040d18e24dffe7"],
-        29 => ["bits" => 29, "min" => "0x15bf11f9", "max" => "0x15bf41f9", "key" => "0x15bf29f9", "status" => "SOLVED", "pub" => "03cf54b8940addeee711aee95f83d001d2bbfb33c8ad33f59c803cda7799fac94d"],
-        30 => ["bits" => 30, "min" => "0x24747e66", "max" => "0x2474ae66", "key" => "0x24749666", "status" => "SOLVED", "pub" => "032244cbcd2812c5c175ae16e195cb3f80006ec4776c36b128f4511e0fb2d701ca"],
-        31 => ["bits" => 31, "min" => "0x5357f2a6", "max" => "0x535822a6", "key" => "0x53580aa6", "status" => "SOLVED", "pub" => "03e84ae7d43a1d5f921c43f64c2bd53064fb1b009715327366ad8fbaae79643136"],
-        32 => ["bits" => 32, "min" => "0x82f2315b", "max" => "0x82f2615b", "key" => "0x82f2495b", "status" => "SOLVED", "pub" => "02ebebe37513c6a17387146b28bf630ead6a95a07f6d509df621d36763fc97f1f1"],
-        33 => ["bits" => 33, "min" => "0x1d227794e", "max" => "0x1d227a94e", "key" => "0x1d227914e", "status" => "SOLVED", "pub" => "0349425b1b4859e3e88face6d3c80ba65f733e2e03b84c3dacf0ee87f14e8f4bb4"],
-        34 => ["bits" => 34, "min" => "0x35e074e10", "max" => "0x35e077e10", "key" => "0x35e076610", "status" => "SOLVED", "pub" => "031002176a2c3c9cd8ac9d19f0f163dc814703b4bb98bb10a8302cfce8fa5104a6"],
-        35 => ["bits" => 35, "min" => "0x5b31fa282", "max" => "0x5b31fd282", "key" => "0x5b31fba82", "status" => "SOLVED", "pub" => "02a5b7321b12a4ae1b84a9c331668052954114aacb4d088382dcb89a0725589c19"],
-        36 => ["bits" => 36, "min" => "0xbab04168f", "max" => "0xbab04468f", "key" => "0xbab042e8f", "status" => "SOLVED", "pub" => "0263244c3b892c6437bed2399cba0fe074b3d0f928cf5883bd88d439690d790e80"],
-        37 => ["bits" => 37, "min" => "0x1757755293", "max" => "0x1757758293", "key" => "0x1757756a93", "status" => "SOLVED", "pub" => "027d2c03c3ef0aec70f2c7e1e75454a5dfdd0e1adea670c1b3a4643c48ad0f1255"],
-        38 => ["bits" => 38, "min" => "0x22382f94d0", "max" => "0x22382fc4d0", "key" => "0x22382facd0", "status" => "SOLVED", "pub" => "03c060e1e3771cbeccb38e119c2414702f3f5181a89652538851d2e3886bdd70c6"],
-        39 => ["bits" => 39, "min" => "0x4b5f82ebe9", "max" => "0x4b5f831be9", "key" => "0x4b5f8303e9", "status" => "SOLVED", "pub" => "022d77cd1467019a6bf28f7375d0949ce30e6b5815c2758b98a74c2700bc006543"],
-        40 => ["bits" => 40, "min" => "0xe9ae491bd6", "max" => "0xe9ae494bd6", "key" => "0xe9ae4933d6", "status" => "SOLVED", "pub" => "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4"],
-        41 => ["bits" => 41, "min" => "0x153869ab45b", "max" => "0x153869ae45b", "key" => "0x153869acc5b", "status" => "SOLVED", "pub" => "03b357e68437da273dcf995a474a524439faad86fc9effc300183f714b0903468b"],
-        42 => ["bits" => 42, "min" => "0x2a221c5758f", "max" => "0x2a221c5a58f", "key" => "0x2a221c58d8f", "status" => "SOLVED", "pub" => "03eec88385be9da803a0d6579798d977a5d0c7f80917dab49cb73c9e3927142cb6"],
-        43 => ["bits" => 43, "min" => "0x6bd3b27ad91", "max" => "0x6bd3b27dd91", "key" => "0x6bd3b27c591", "status" => "SOLVED", "pub" => "02a631f9ba0f28511614904df80d7f97a4f43f02249c8909dac92276ccf0bcdaed"],
-        44 => ["bits" => 44, "min" => "0x98d41cf6bbd", "max" => "0x98d41cf9bbd", "key" => "0x98d41cf83bd", "status" => "SOLVED", "pub" => "02067f4458a634fa16654bd3a2942bd0723e87914c909916c91303592eda523034"],
-        45 => ["bits" => 45, "min" => "0x186c8f95b204", "max" => "0x186c8f95e204", "key" => "0x186c8f95ca04", "status" => "SOLVED", "pub" => "029823fb02ad69fca8cf6667c2a5f099494e41d6bc8cf432f3476cd1118577b92b"],
-        46 => ["bits" => 46, "min" => "0x2485542b4e23", "max" => "0x2485542b7e23", "key" => "0x2485542b6623", "status" => "SOLVED", "pub" => "03c5e754951f498dea6effd25d9c7be419959b6400bee54f6963dd28ba552a8451"],
-        47 => ["bits" => 47, "min" => "0x5ec598f7f193", "max" => "0x5ec598f82193", "key" => "0x5ec598f80993", "status" => "SOLVED", "pub" => "03bfe1fc01bf9b2669dacc2e3ee3a14d50c370939fea6c53208368b001abcd1dd2"],
-        48 => ["bits" => 48, "min" => "0x91893c8328d8", "max" => "0x91893c8358d8", "key" => "0x91893c8340d8", "status" => "SOLVED", "pub" => "0257aa20950f54381464d6525a8a1ed925b1878f94ae93296400b15c5d02aec502"],
-        49 => ["bits" => 49, "min" => "0x10f135b9f79a6", "max" => "0x10f135b9fa9a6", "key" => "0x10f135b9f91a6", "status" => "SOLVED", "pub" => "039ed8fad048a0678b1af5772cfc5281ba0c5303857ee31e0f78cf9ce4c9efd196"],
-        50 => ["bits" => 50, "min" => "0x367f0f63b4d5f", "max" => "0x367f0f63b7d5f", "key" => "0x367f0f63b655f", "status" => "SOLVED", "pub" => "021bc6c10fa1ef9cdf1b44930479cee11f00fe49e3d3946ded4920a58e74d2dca0"],
-        51 => ["bits" => 51, "min" => "0x4ecf8df203059", "max" => "0x4ecf8df206059", "key" => "0x4ecf8df204859", "status" => "SOLVED", "pub" => "03084570b5eb4b5332f28b9a0695aef694701738509391c65d1d85b3cf4fbd30c9"],
-        52 => ["bits" => 52, "min" => "0x8d51fa0d4b1d3", "max" => "0x8d51fa0d4e1d3", "key" => "0x8d51fa0d4c9d3", "status" => "SOLVED", "pub" => "02e39b170b44fa6b986e968c999123af23736adece4d2b7059b2763952308d3a71"],
-        53 => ["bits" => 53, "min" => "0x19942a1979a140", "max" => "0x19942a1979d140", "key" => "0x19942a1979b940", "status" => "SOLVED", "pub" => "0364eaf2096c4f6ee8c9f006cc8d5eeb505f613e2536174b2480ba7f51d4a19939"],
-        54 => ["bits" => 54, "min" => "0x3e1858a2d74264", "max" => "0x3e1858a2d77264", "key" => "0x3e1858a2d75a64", "status" => "SOLVED", "pub" => "031cd7bd7e86571d586a9f4c11c1d159fc7855c095a517d9b03e1cd95234ca7c60"],
-        55 => ["bits" => 55, "min" => "0x4b7b3eebe8a1c6", "max" => "0x4b7b3eebe8d1c6", "key" => "0x4b7b3eebe8b9c6", "status" => "SOLVED", "pub" => "03d98297eec59217cf0ad9d878e782ba0f6f7a7711d582fcaf3ded7e947fe57e7b"],
-        56 => ["bits" => 56, "min" => "0xb80c80424653c5", "max" => "0xb80c80424683c5", "key" => "0xb80c8042466bc5", "status" => "SOLVED", "pub" => "02e0848f882d14cf6e95e7a0910927109b3881aeae9dde7fd35abb62e4a2cfebe2"],
-        57 => ["bits" => 57, "min" => "0x1f3c39601d27b19", "max" => "0x1f3c39601d2ab19", "key" => "0x1f3c39601d29319", "status" => "SOLVED", "pub" => "0396b44fdc216fc4d954289d99572b39a63466c21c9e00bbdc18dab8d803936271"],
-        58 => ["bits" => 58, "min" => "0x3a56cf9e4264958", "max" => "0x3a56cf9e4267958", "key" => "0x3a56cf9e4266158", "status" => "SOLVED", "pub" => "02e1af2d4ab33d2be521ee8fc3a547fd1f3339df7eb76dcb9f599e29f6b073087e"],
-        59 => ["bits" => 59, "min" => "0x738356a9bc23d57", "max" => "0x738356a9bc26d57", "key" => "0x738356a9bc25557", "status" => "SOLVED", "pub" => "02c8a2851cd5dd20b34bb718ef3ac34e2b1682eab00e48f78854fd28724d723f3b"],
-        60 => ["bits" => 60, "min" => "0x9e102281a17e22b", "max" => "0x9e102281a18122b", "key" => "0x9e102281a17fa2b", "status" => "SOLVED", "pub" => "03c7aa3bdeaf5c952ee65bc587f8afba33697c8c6cc1e90c64ba53832ab7e7c4e5"],
-        61 => ["bits" => 61, "min" => "0x109a7b7389273145", "max" => "0x109a7b7389276145", "key" => "0x109a7b7389274945", "status" => "SOLVED", "pub" => "032d0084f4d1ae62a1f6c562d79ef6378073d2a4cffa393303a7790581f72e3764"],
-        62 => ["bits" => 62, "min" => "0x38b3010b991e3264", "max" => "0x38b3010b991e6264", "key" => "0x38b3010b991e4a64", "status" => "SOLVED", "pub" => "034b3d0498ab02704f7cfa5ed4141471626d45aad542d9037ab0f221121929d559"],
-        63 => ["bits" => 63, "min" => "0x78a487922d99d5be", "max" => "0x78a487922d9a05be", "key" => "0x78a487922d99edbe", "status" => "SOLVED", "pub" => "02379833cb0cc1077173a7fac48c463d3b4b2bca4eb66a6d12a16779d49da75b98"],
-        64 => ["bits" => 64, "min" => "0x9d4b66cad1b3ffe2", "max" => "0x9d4b66cad1b42fe2", "key" => "0x9d4b66cad1b417e2", "status" => "SOLVED", "pub" => "02a48be8fd5b64235965de5d4127b7c04d091daeddf3850db58a1c542c72d5266b"],
-        65 => ["bits" => 65, "min" => "0x14041b63eb1ff1eee", "max" => "0x14041b63eb1ff4eee", "key" => "0x14041b63eb1ff36ee", "status" => "SOLVED", "pub" => "0242c14809aeb9bc755c7ce0108d681238d09b13c3ecd38aceda629ca97155ff22"],
-        66 => ["bits" => 66, "min" => "0x2832ed74f2b5e1dee", "max" => "0x2832ed74f2b5e4dee", "key" => "0x2832ed74f2b5e35ee", "status" => "SOLVED", "pub" => "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"],
-        67 => ["bits" => 67, "min" => "0x730fc235c1942a9ae", "max" => "0x730fc235c1942d9ae", "key" => "0x730fc235c1942c1ae", "status" => "SOLVED", "pub" => "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"],
-        68 => ["bits" => 68, "min" => "0xbebb3940cd0fbfc91", "max" => "0xbebb3940cd0fc2c91", "key" => "0xbebb3940cd0fc1491", "status" => "SOLVED", "pub" => "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"],
-        69 => ["bits" => 69, "min" => "0x101d83275fb2bc660c", "max" => "0x101d83275fb2bc960c", "key" => "0x101d83275fb2bc7e0c", "status" => "SOLVED", "pub" => "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"],
-        70 => ["bits" => 70, "min" => "0x349b84b6431a6c36f1", "max" => "0x349b84b6431a6c66f1", "key" => "0x349b84b6431a6c4ef1", "status" => "SOLVED", "pub" => "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"],
-        75 => ["bits" => 75, "min" => "0x4c5ce114686a1335607", "max" => "0x4c5ce114686a1338607", "key" => "0x4c5ce114686a1336e07", "status" => "SOLVED", "pub" => "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"],
-        80 => ["bits" => 80, "min" => "0xea1a5c66dcc11b5ab980", "max" => "0xea1a5c66dcc11b5ae980", "key" => "0xea1a5c66dcc11b5ad180", "status" => "SOLVED", "pub" => "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"],
-        85 => ["bits" => 85, "min" => "0x11720c4f018d51b8cea3a8", "max" => "0x11720c4f018d51b8ced3a8", "key" => "0x11720c4f018d51b8cebba8", "status" => "SOLVED", "pub" => "0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a"],
-        90 => ["bits" => 90, "min" => "0x2ce00bb2136a445c71e6dbf", "max" => "0x2ce00bb2136a445c71e9dbf", "key" => "0x2ce00bb2136a445c71e85bf", "status" => "SOLVED", "pub" => "035c38bd9ae4b10e8a250857006f3cfd98ab15a6196d9f4dfd25bc7ecc77d788d5"],
-        95 => ["bits" => 95, "min" => "0x527a792b183c7f64a0e899f4", "max" => "0x527a792b183c7f64a0e8c9f4", "key" => "0x527a792b183c7f64a0e8b1f4", "status" => "SOLVED", "pub" => "02967a5905d6f3b420959a02789f96ab4c3223a2c4d2762f817b7895c5bc88a045"],
-        100 => ["bits" => 100, "min" => "0xaf55fc59c335c8ec67ed23026", "max" => "0xaf55fc59c335c8ec67ed26026", "key" => "0xaf55fc59c335c8ec67ed24826", "status" => "SOLVED", "pub" => "03d2063d40402f030d4cc71331468827aa41a8a09bd6fd801ba77fb64f8e67e617"],
-        105 => ["bits" => 105, "min" => "0x123456789abcdef01234567710a", "max" => "0x123456789abcdef01234567a10a", "key" => "0x123456789abcdef01234567890a", "status" => "SOLVED", "pub" => "03be06c5a99c46dc1db993d5adfade8f3e5f623207c49a4f62351e120170000846"],
-        110 => ["bits" => 110, "min" => "0x35c0d7234df7deb0f20cf7060c44", "max" => "0x35c0d7234df7deb0f20cf7063c44", "key" => "0x35c0d7234df7deb0f20cf7062444", "status" => "SOLVED", "pub" => "0309976ba5570966bf889196b7fdf5a0f9a1e9ab340556ec29f8bb60599616167d"],
-        115 => ["bits" => 115, "min" => "0x60f4d11574f5deee49961d96082c6", "max" => "0x60f4d11574f5deee49961d960b2c6", "key" => "0x60f4d11574f5deee49961d9609ac6", "status" => "SOLVED", "pub" => "0248d313b0398d4923cdca73b8cfa6532b91b96703902fc8b32fd438a3b7cd7f55"],
-        120 => ["bits" => 120, "min" => "0xb10f22572c497a836ea187f2e1e423", "max" => "0xb10f22572c497a836ea187f2e21423", "key" => "0xb10f22572c497a836ea187f2e1fc23", "status" => "SOLVED", "pub" => "02ceb6cbbcdbdf5ef7150682150f4ce2c6f4807b349827dcdbdd1f2efa885a2630"],
-        125 => ["bits" => 125, "min" => "0x1abcdef0123456789abcdef012343e78", "max" => "0x1abcdef0123456789abcdef012346e78", "key" => "0x1abcdef0123456789abcdef012345678", "status" => "SOLVED", "pub" => "024a647807d06e545f64644e99e016134a1ee14efdf0346da96cecc032cd03f5f3"],
-        130 => ["bits" => 130, "min" => "0x2abcdef0123456789abcdef0123454f89", "max" => "0x2abcdef0123456789abcdef0123457f89", "key" => "0x2abcdef0123456789abcdef0123456789", "status" => "SOLVED", "pub" => "02a462e1df0903f29057b82a9cfdc3ccba6bffd9f4474341329ed153afb8b9169e"],
-        135 => ["bits" => 135, "min" => "0x6d9392a16883f90903d5f78da57af066b2", "max" => "0x6d9392a16883f90903d5f78da57af096b2", "key" => "0x6d9392a16883f90903d5f78da57af07eb2", "status" => "SOLVED", "pub" => "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"]
-    ];
-
-    // API: DYNAMIC RANDOMIZED VERIFICATION SUITE (action=verify_random) - 100% Pure PHP
-    if ($action === "verify_random") {
-        header("Content-Type: application/json");
-        $bits = isset($_GET["bits"]) ? intval($_GET["bits"]) : 22;
-        if ($bits < 14 || $bits > 28) {
-            http_response_code(400);
-            echo json_encode(["status" => "ERROR", "message" => "bits must be in [14, 28]"]);
-            exit;
-        }
-
-        $cand_keys = [16, 20, 22, 25, 30, 35, 40, 50, 60, 70];
-        $pid = isset($_GET["id"]) ? intval($_GET["id"]) : $cand_keys[random_int(0, count($cand_keys) - 1)];
-        if (!isset($VERIFY_PUZZLES[$pid])) {
-            http_response_code(400);
-            echo json_encode(["status" => "ERROR", "message" => "Unknown puzzle id"]);
-            exit;
-        }
-
-        $vec = $VERIFY_PUZZLES[$pid];
-        $k = u256_from_hex($vec["key"]);
-        $window_int = 1 << $bits;
-        $offset_int = random_int(0, $window_int);
-        $window_u = u256_from_int($window_int);
-        $offset_u = u256_from_int($offset_int);
-
-        if (u256_cmp($k, $offset_u) > 0) {
-            list($min_u, $_) = u256_sub($k, $offset_u);
-        } else {
-            $min_u = u256_from_int(1);
-        }
-        list($max_u, $_) = u256_add($min_u, $window_u);
-
-        echo json_encode([
-            "status" => "OK",
-            "puzzle_id" => $pid,
-            "bits" => $bits,
-            "window_size" => (string)$window_int,
-            "min" => u256_to_hex_trimmed($min_u),
-            "max" => u256_to_hex_trimmed($max_u),
-            "target_pubkey" => $vec["pub"],
-            "pub" => $vec["pub"]
-        ]);
-        exit;
-    }
-
-    // API 6: UNIFIED VERIFICATION ENDPOINT
-    if ($action === "verify" || $action === "get_verify_puzzle" || $action === "check_puzzle_status" || $action === "verify_solution") {
-        header("Content-Type: application/json");
-
-        if ($_SERVER["REQUEST_METHOD"] === "POST" || $action === "verify_solution") {
-            $input = file_get_contents("php://input");
-            $payload = is_string($input) ? json_decode($input, true) : null;
-            if (!is_array($payload) || !isset($payload["id"]) || !isset($payload["solved_key"])) {
-                http_response_code(400);
-                echo json_encode(["status" => "ERROR", "message" => "Missing id or solved_key"]);
-                exit;
-            }
-            $id = intval($payload["id"]);
-            if (!isset($VERIFY_PUZZLES[$id])) {
-                http_response_code(400);
-                echo json_encode(["status" => "ERROR", "message" => "Unknown puzzle id"]);
-                exit;
-            }
-
-            $expected_u = u256_from_hex($VERIFY_PUZZLES[$id]["key"]);
-            $submitted_u = u256_from_hex((string)$payload["solved_key"]);
-            $derived_pub = secp256k1_pubkey_from_privkey((string)$payload["solved_key"]);
-
-            if (u256_cmp($submitted_u, $expected_u) === 0 && hash_equals(strtolower($VERIFY_PUZZLES[$id]["pub"]), $derived_pub)) {
-                echo json_encode(["status" => "PASS", "puzzle_id" => $id, "verified" => true]);
-            } else {
-                echo json_encode(["status" => "FAIL", "puzzle_id" => $id, "verified" => false]);
-            }
-            exit;
-        }
-
-        if ($action === "check_puzzle_status") {
-            $id = isset($_GET["id"]) ? intval($_GET["id"]) : 0;
-            echo json_encode([
-                "status" => isset($VERIFY_PUZZLES[$id]) ? "PASS" : "FAIL",
-                "puzzle_id" => $id
-            ]);
-            exit;
-        }
-
-        if (isset($_GET["id"])) {
-            $id = intval($_GET["id"]);
-            if (!isset($VERIFY_PUZZLES[$id])) {
-                http_response_code(404);
-                echo json_encode(["status" => "ERROR", "message" => "Puzzle not found"]);
-                exit;
-            }
-            $vec = $VERIFY_PUZZLES[$id];
-            $min_clean = u256_to_hex_trimmed(u256_from_hex($vec["min"]));
-            $max_clean = u256_to_hex_trimmed(u256_from_hex($vec["max"]));
-            echo json_encode([
-                "status" => "OK",
-                "id" => $id,
-                "bits" => $vec["bits"],
-                "min" => $min_clean,
-                "max" => $max_clean,
-                "target_pubkey" => $vec["pub"],
-                "pub" => $vec["pub"]
-            ]);
-            exit;
-        }
-
-        $catalog = [];
-        foreach ($VERIFY_PUZZLES as $id => $vec) {
-            $catalog[] = [
-                "id" => $id,
-                "bits" => $vec["bits"],
-                "min" => u256_to_hex_trimmed(u256_from_hex($vec["min"])),
-                "max" => u256_to_hex_trimmed(u256_from_hex($vec["max"])),
-                "pub" => $vec["pub"],
-                "status" => "SOLVED"
-            ];
-        }
-        echo json_encode([
-            "status" => "OK",
-            "total" => count($catalog),
-            "puzzles" => $catalog
         ]);
         exit;
     }
@@ -1688,11 +1812,20 @@ try {
             if (elVaultBadge) {
                 if (data.vault_solved) {
                     elVaultBadge.className = "badge badge-green";
-                    elVaultBadge.innerText = "BINGO SOLVED";
+                    elVaultBadge.innerText = "BINGO (bingo_key.php)";
                 } else {
                     elVaultBadge.className = "badge badge-amber";
                     elVaultBadge.innerText = "ĐANG SĂN";
                 }
+            }
+
+            const elBingoBanner = document.getElementById("bingo-banner");
+            if (elBingoBanner) {
+                elBingoBanner.style.display = data.vault_solved ? "block" : "none";
+            }
+            if (data.vault_solved && elBadgePhase) {
+                elBadgePhase.className = "badge badge-green";
+                elBadgePhase.innerText = "BINGO — ĐÃ GIẢI XONG PUZZLE";
             }
 
             const elHashrate = document.getElementById("val-hashrate");
@@ -1776,12 +1909,21 @@ try {
             </div>
         </div>
         <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <span id="header-phase-badge" class="badge <?= ($total_traps < $target_dp) ? 'badge-amber' : 'badge-green' ?>">
-                <?= ($total_traps < $target_dp) ? 'GIAI ĐOẠN 1: TAME TRAPS (' . $progress_pct . '%)' : 'GIAI ĐOẠN 2: WILD HUNTING' ?>
+            <span id="header-phase-badge" class="badge <?= $vault_exists ? 'badge-green' : (($total_traps < $target_dp) ? 'badge-amber' : 'badge-green') ?>">
+                <?= $vault_exists ? 'BINGO — ĐÃ GIẢI XONG PUZZLE' : (($total_traps < $target_dp) ? 'GIAI ĐOẠN 1: TAME TRAPS (' . $progress_pct . '%)' : 'GIAI ĐOẠN 2: WILD HUNTING') ?>
             </span>
             <span class="badge badge-blue">Pure PHP + SQLite WAL</span>
             <button id="toggle-refresh-btn" onclick="toggleAutoRefresh()" class="btn-toggle">Tự động: BẬT</button>
             <span style="font-size: 11px; color: #94a3b8; margin-left: 2px;">Cập nhật trong: <strong id="countdown" style="color: #38bdf8;">10s</strong></span>
+        </div>
+    </div>
+
+    <div id="bingo-banner" class="card" style="display: <?= $vault_exists ? 'block' : 'none' ?>; background: #064e3b; border-color: #10b981; color: #ecfdf5;">
+        <div style="font-size: 16px; font-weight: 700; color: #34d399;">BINGO! ĐÃ TÌM RA PRIVATE KEY PUZZLE</div>
+        <div style="font-size: 13px; margin-top: 6px; color: #d1fae5;">
+            Private Key đã được xác thực Secp256k1 và lưu bảo mật trên server tại:
+            <code style="background: #022c22; padding: 3px 8px; border-radius: 4px; color: #6ee7b7;">data/<?= htmlspecialchars($instance_clean) ?>/bingo_key.php</code>
+            — Toàn bộ CPU/GPU Workers đã tự động dừng (không in/truyền key ra worker).
         </div>
     </div>
 
@@ -1825,7 +1967,7 @@ try {
             <div style="font-size: 11px; margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
                 <span style="color: #64748b;">256 Shards WITHOUT ROWID</span>
                 <?php if ($vault_exists): ?>
-                    <span id="val-vault-badge" class="badge badge-green" style="font-size: 11px;">BINGO SOLVED</span>
+                    <span id="val-vault-badge" class="badge badge-green" style="font-size: 11px;">BINGO (bingo_key.php)</span>
                 <?php else: ?>
                     <span id="val-vault-badge" class="badge badge-amber" style="font-size: 11px;">ĐANG SĂN</span>
                 <?php endif; ?>
