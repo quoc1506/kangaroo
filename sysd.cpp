@@ -1049,7 +1049,8 @@ static int RunKangarooSession(
         }
 #endif
         if (!g_state.use_gpu || g_state.num_threads > 0) {
-            for (int i = 0; i < g_state.num_threads; ++i) {
+            int session_threads = is_verify ? std::min(g_state.num_threads, 2) : g_state.num_threads;
+            for (int i = 0; i < session_threads; ++i) {
                 if (wild_mode) {
                     workers.emplace_back(WorkerWildThread, i, secp, &jt, active_dp_bits, batch_limit, target_pub, range_min, range_max);
                 } else {

@@ -176,29 +176,39 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_cpu_x86_64
-          path: bin/
+          path: /tmp/built_bins/
       - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_cpu_avx512
-          path: bin/
+          path: /tmp/built_bins/
       - uses: actions/download-artifact@v4
         with:
           name: sysd_linux_gpu_cuda
-          path: bin/
+          path: /tmp/built_bins/
       - uses: actions/download-artifact@v4
         with:
           name: sysd_darwin_all
-          path: bin/
+          path: /tmp/built_bins/
       - name: Commit and push binaries to branch
         run: |
+          test -s /tmp/built_bins/sysd_linux_cpu_x86_64
+          test -s /tmp/built_bins/sysd_linux_cpu_avx512
+          test -s /tmp/built_bins/sysd_linux_gpu_cuda
+          test -s /tmp/built_bins/sysd_darwin_all
+          git fetch origin ${{ github.ref_name }}
+          git checkout -B ${{ github.ref_name }} origin/${{ github.ref_name }}
+          mkdir -p bin
+          cp -f /tmp/built_bins/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_x86_64
+          cp -f /tmp/built_bins/sysd_linux_cpu_avx512 bin/sysd_linux_cpu_avx512
+          cp -f /tmp/built_bins/sysd_linux_gpu_cuda bin/sysd_linux_gpu_cuda
+          cp -f /tmp/built_bins/sysd_darwin_all bin/sysd_darwin_all
           chmod +x bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
-          if ! git diff --quiet -- bin/; then
+          if ! git diff --cached --quiet -- bin/; then
             git commit -m "build: compile sysd binaries [skip ci]"
-            git pull --rebase origin ${{ github.ref_name }}
             git push origin HEAD:${{ github.ref_name }}
           else
-            echo "No binary changes to commit"
+            echo "No staged binary changes to commit"
           fi
