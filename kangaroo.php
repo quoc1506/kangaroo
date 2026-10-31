@@ -1495,70 +1495,48 @@ function bloom_filter_test($shards_dir, $bin_x) {
                 }
             }
 
-            // TASK 2: Lossless Tame Trap Accumulator & Throttled Master DB Commit (Zero Contention)
-            $w_tame_meta = sys_get_temp_dir() . "/k_tmeta_" . md5($worker_id . "_" . $instance_clean);
-            $now_time = time();
-            $last_commit = 0;
-            $accum_worker_dps = $batch_size;
-            $accum_traps = $actual_inserted;
-            if (file_exists($w_tame_meta)) {
-                $meta_raw = @file_get_contents($w_tame_meta);
-                if ($meta_raw !== false && strpos($meta_raw, ":") !== false) {
-                    $parts = explode(":", $meta_raw);
-                    $last_commit = (int)($parts[0] ?? 0);
-                    $accum_worker_dps += (int)($parts[1] ?? 0);
-                    $accum_traps += (int)($parts[2] ?? 0);
-                }
-            }
-            $should_update_master = ($last_commit === 0 || ($now_time - $last_commit) >= 20);
-            if ($should_update_master) {
-                for ($att = 0; $att < 10; $att++) {
-                    $in_m_tx = false;
-                    try {
-                        $db->exec("BEGIN IMMEDIATE TRANSACTION;");
-                        $in_m_tx = true;
-                        $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                                VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                                ON CONFLICT(worker_id) DO UPDATE SET
-                                                    hardware = :hw,
-                                                    hashrate = :hr,
-                                                    mode = :mode,
-                                                    total_dps = total_dps + :dps,
-                                                    last_seen = CURRENT_TIMESTAMP;");
-                        $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":dps", $accum_worker_dps, SQLITE3_INTEGER);
-                        $w_stmt->execute();
-                        $w_stmt->close();
+            // Unified Immediate Atomic Commit (100% Identical for Verify & Production)
+            for ($att = 0; $att < 10; $att++) {
+                $in_m_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_m_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
 
-                        if ($accum_traps > 0) {
-                            $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                                                    VALUES ('total_tame_traps', :val)
-                                                    ON CONFLICT(setting_key) DO UPDATE SET
-                                                        setting_value = CAST(setting_value AS INTEGER) + :val;");
-                            $s_stmt->bindValue(":val", $accum_traps, SQLITE3_INTEGER);
-                            $s_stmt->execute();
-                            $s_stmt->close();
-                        }
-
-                        $db->exec("COMMIT;");
-                        $in_m_tx = false;
-                        @file_put_contents($w_tame_meta, $now_time . ":0:0", LOCK_EX);
-                        break;
-                    } catch (Throwable $ex) {
-                        if ($in_m_tx) {
-                            try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                        }
-                        if ($att === 9) {
-                            throw new DbBusyException("Master DB busy during tame atomic commit");
-                        }
-                        usleep((10000 + mt_rand(5000, 25000)) * ($att + 1));
+                    if ($actual_inserted > 0) {
+                        $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                                                VALUES ('total_tame_traps', :val)
+                                                ON CONFLICT(setting_key) DO UPDATE SET
+                                                    setting_value = CAST(setting_value AS INTEGER) + :val;");
+                        $s_stmt->bindValue(":val", $actual_inserted, SQLITE3_INTEGER);
+                        $s_stmt->execute();
+                        $s_stmt->close();
                     }
+
+                    $db->exec("COMMIT;");
+                    $in_m_tx = false;
+                    break;
+                } catch (Throwable $ex) {
+                    if ($in_m_tx) { try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
+                    if ($att === 9) {
+                        throw new DbBusyException("Master DB busy during tame atomic commit");
+                    }
+                    usleep((5000 + mt_rand(2000, 10000)) * ($att + 1));
                 }
-            } else {
-                @file_put_contents($w_tame_meta, $last_commit . ":" . $accum_worker_dps . ":" . $accum_traps, LOCK_EX);
             }
             $total_raw = find_setting_or_null($db, "total_tame_traps");
             $total = ($total_raw !== null) ? intval($total_raw) : 0;
@@ -1763,70 +1741,49 @@ function bloom_filter_test($shards_dir, $bin_x) {
             }
 
             // TASK 2: Throttled Master DB update to eliminate write lock contention
-            // TASK 1 & 2: Lossless Wild DP Accumulator & Throttled Master DB Commit
-            $w_meta_file = sys_get_temp_dir() . "/k_wmeta_" . md5($worker_id . "_" . $instance_clean);
-            $now_time = time();
-            $last_commit = 0;
-            $accumulated_dps = $batch_size;
-            if (file_exists($w_meta_file)) {
-                $meta_raw = @file_get_contents($w_meta_file);
-                if ($meta_raw !== false && strpos($meta_raw, ":") !== false) {
-                    list($lc, $acc) = explode(":", $meta_raw, 2);
-                    $last_commit = (int)$lc;
-                    $accumulated_dps += (int)$acc;
-                }
-            }
-            $should_update_worker = ($last_commit === 0 || ($now_time - $last_commit) >= 20);
-            if ($should_update_worker) {
-                for ($att = 0; $att < 10; $att++) {
-                    $in_m_tx = false;
-                    try {
-                        $db->exec("BEGIN IMMEDIATE TRANSACTION;");
-                        $in_m_tx = true;
-                        $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                                VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                                ON CONFLICT(worker_id) DO UPDATE SET
-                                                    hardware = :hw,
-                                                    hashrate = :hr,
-                                                    mode = :mode,
-                                                    total_dps = total_dps + :dps,
-                                                    last_seen = CURRENT_TIMESTAMP;");
-                        $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":dps", $accumulated_dps, SQLITE3_INTEGER);
-                        $w_stmt->execute();
-                        $w_stmt->close();
+            // Unified Immediate Atomic Commit (100% Identical for Verify & Production)
+            for ($att = 0; $att < 10; $att++) {
+                $in_m_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_m_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
 
-                        if ($accumulated_dps > 0) {
-                            $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                                                    VALUES ('total_wild_dps', :val)
-                                                    ON CONFLICT(setting_key) DO UPDATE SET
-                                                        setting_value = CAST(setting_value AS INTEGER) + :val;");
-                            $s_stmt->bindValue(":val", $accumulated_dps, SQLITE3_INTEGER);
-                            $s_stmt->execute();
-                            $s_stmt->close();
-                        }
-
-                        $db->exec("COMMIT;");
-                        $in_m_tx = false;
-                        @file_put_contents($w_meta_file, $now_time . ":0", LOCK_EX);
-                        break;
-                    } catch (Throwable $ex) {
-                        if ($in_m_tx) {
-                            try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                        }
-                        if ($att === 9) {
-                            throw new DbBusyException("Master DB busy during wild atomic commit");
-                        }
-                        usleep((10000 + mt_rand(5000, 25000)) * ($att + 1));
+                    if ($batch_size > 0) {
+                        $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                                                VALUES ('total_wild_dps', :val)
+                                                ON CONFLICT(setting_key) DO UPDATE SET
+                                                    setting_value = CAST(setting_value AS INTEGER) + :val;");
+                        $s_stmt->bindValue(":val", $batch_size, SQLITE3_INTEGER);
+                        $s_stmt->execute();
+                        $s_stmt->close();
                     }
-                }
-            } else {
-                @file_put_contents($w_meta_file, $last_commit . ":" . $accumulated_dps, LOCK_EX);
-            }
 
+                    $db->exec("COMMIT;");
+                    $in_m_tx = false;
+                    break;
+                } catch (Throwable $ex) {
+                    if ($in_m_tx) { try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
+                    if ($att === 9) {
+                        throw new DbBusyException("Master DB busy during wild atomic commit");
+                    }
+                    usleep((5000 + mt_rand(2000, 10000)) * ($att + 1));
+                }
+            }
             $total_traps = intval(get_required_setting($db, "total_tame_traps"));
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
