@@ -256,10 +256,10 @@ static void ComputeSpawnSpan(Int &range_width, Int &out_span) {
 
 class JumpTable {
 public:
-    Int d[NB_JUMP];
-    Point J[NB_JUMP];
-    Int Jx[NB_JUMP];
-    Int Jy[NB_JUMP];
+    alignas(64) Int d[NB_JUMP];
+    alignas(64) Point J[NB_JUMP];
+    alignas(64) Int Jx[NB_JUMP];
+    alignas(64) Int Jy[NB_JUMP];
 
     void init(Secp256K1 *secp, Int &range_width) {
         if (range_width.IsNegative()) {
@@ -310,9 +310,10 @@ static HttpResult HttpGet(const std::string &url) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     return out;
@@ -331,9 +332,10 @@ static HttpResult HttpPostBinary(const std::string &url, const uint8_t *data, si
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     curl_slist_free_all(headers);
@@ -989,12 +991,17 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         return;
     }
 
+    bool direct_gpu_dist = (range_max.GetBitLength() <= 120);
     Int zero_offset;
     zero_offset.SetInt32(0);
     gpu->SetWildOffset(&zero_offset);
 
     gpu->SetParams(dp_mask, jt->d, jt->Jx, jt->Jy);
-    gpu->SetKangaroos(px.data(), py.data(), zero_dists.data());
+    if (direct_gpu_dist) {
+        gpu->SetKangaroos(px.data(), py.data(), base_dist.data());
+    } else {
+        gpu->SetKangaroos(px.data(), py.data(), zero_dists.data());
+    }
     if (!gpu->callKernel()) {
         std::cerr << "[-] Fatal GPU #" << gpu_id << ": Initial CUDA kernel launch failed\n";
         cudaDeviceSynchronize();
@@ -1031,9 +1038,14 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                     continue;
                 }
 
-                Int real_dist(&base_dist[item.kIdx]);
-                Int d_walk((Int*)&item.d);
-                real_dist.ModAddK1order(&d_walk);
+                Int real_dist;
+                if (direct_gpu_dist) {
+                    real_dist.Set((Int*)&item.d);
+                } else {
+                    real_dist.Set(&base_dist[item.kIdx]);
+                    Int d_walk((Int*)&item.d);
+                    real_dist.ModAddK1order(&d_walk);
+                }
 
                 DPRecord rec;
                 IntToBin32(*(const Int*)&item.x, rec.x);
@@ -1051,15 +1063,32 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         }
 
         if (!respawn_indices.empty()) {
-            cudaDeviceSynchronize();
+            // TASK 4: Batch Precompute all respawn kangaroo states on CPU before PCIe dispatch
+            struct RespawnBatchItem {
+                uint64_t kIdx;
+                Point P;
+                Int base;
+            };
+            std::vector<RespawnBatchItem> batch_items;
+            batch_items.reserve(respawn_indices.size());
             for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
                 uint64_t kIdx = respawn_indices[idx];
-                Point new_P;
-                Int new_base;
-                make_kangaroo_state(new_P, new_base, rng_salt);
-                gpu->SetKangaroo(kIdx, &new_P.x, &new_P.y, &zero_int);
-                base_dist[kIdx].Set(&new_base);
-                gpu_dp_count[kIdx] = 0;
+                RespawnBatchItem item;
+                item.kIdx = kIdx;
+                make_kangaroo_state(item.P, item.base, rng_salt);
+                batch_items.push_back(std::move(item));
+            }
+
+            cudaDeviceSynchronize();
+            for (size_t idx = 0; idx < batch_items.size(); ++idx) {
+                const auto &item = batch_items[idx];
+                if (direct_gpu_dist) {
+                    gpu->SetKangaroo(item.kIdx, (Int*)&item.P.x, (Int*)&item.P.y, (Int*)&item.base);
+                } else {
+                    gpu->SetKangaroo(item.kIdx, (Int*)&item.P.x, (Int*)&item.P.y, &zero_int);
+                }
+                base_dist[item.kIdx].Set((Int*)&item.base);
+                gpu_dp_count[item.kIdx] = 0;
             }
             respawn_indices.clear();
         }
