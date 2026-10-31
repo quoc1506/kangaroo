@@ -1322,6 +1322,11 @@ function bloom_filter_record($shards_dir, array $bin_x_list) {
     $total_bytes = 4194304; // 4 MB = 33,554,432 bits
     $fp = @fopen($path, "c+b");
     if (!$fp) return;
+    if (!@flock($fp, LOCK_EX)) {
+        @fclose($fp);
+        return;
+    }
+    clearstatcache(true, $path);
     if (@filesize($path) < $total_bytes) {
         @ftruncate($fp, $total_bytes);
     }
@@ -1346,6 +1351,7 @@ function bloom_filter_record($shards_dir, array $bin_x_list) {
             }
         }
     }
+    ksort($byte_updates);
     foreach ($byte_updates as $offset => $mask) {
         fseek($fp, $offset);
         $current = ord(fread($fp, 1));
@@ -1354,6 +1360,8 @@ function bloom_filter_record($shards_dir, array $bin_x_list) {
             fwrite($fp, chr($current | $mask));
         }
     }
+    fflush($fp);
+    flock($fp, LOCK_UN);
     fclose($fp);
 }
 
@@ -1487,48 +1495,57 @@ function bloom_filter_test($shards_dir, $bin_x) {
                 }
             }
 
-            // TASK 2: Throttled Master DB update to eliminate write lock contention
-            $w_throttle_file = sys_get_temp_dir() . "/k_hb_" . md5($worker_id . "_" . $instance_clean);
+            // TASK 2: Lossless Tame Trap Accumulator & Throttled Master DB Commit (Zero Contention)
+            $w_tame_meta = sys_get_temp_dir() . "/k_tmeta_" . md5($worker_id . "_" . $instance_clean);
             $now_time = time();
-            $should_update_worker = (!file_exists($w_throttle_file) || ($now_time - @filemtime($w_throttle_file) >= 20));
-
-            if ($should_update_worker || $actual_inserted > 0) {
+            $last_commit = 0;
+            $accum_worker_dps = $batch_size;
+            $accum_traps = $actual_inserted;
+            if (file_exists($w_tame_meta)) {
+                $meta_raw = @file_get_contents($w_tame_meta);
+                if ($meta_raw !== false && strpos($meta_raw, ":") !== false) {
+                    $parts = explode(":", $meta_raw);
+                    $last_commit = (int)($parts[0] ?? 0);
+                    $accum_worker_dps += (int)($parts[1] ?? 0);
+                    $accum_traps += (int)($parts[2] ?? 0);
+                }
+            }
+            $should_update_master = ($last_commit === 0 || ($now_time - $last_commit) >= 20);
+            if ($should_update_master) {
                 for ($att = 0; $att < 10; $att++) {
                     $in_m_tx = false;
                     try {
                         $db->exec("BEGIN IMMEDIATE TRANSACTION;");
                         $in_m_tx = true;
-                        if ($should_update_worker) {
-                            $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                                    VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                                    ON CONFLICT(worker_id) DO UPDATE SET
-                                                        hardware = :hw,
-                                                        hashrate = :hr,
-                                                        mode = :mode,
-                                                        total_dps = total_dps + :dps,
-                                                        last_seen = CURRENT_TIMESTAMP;");
-                            $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                            $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                            $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                            $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                            $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
-                            $w_stmt->execute();
-                            $w_stmt->close();
-                            @touch($w_throttle_file);
-                        }
+                        $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                                VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                                ON CONFLICT(worker_id) DO UPDATE SET
+                                                    hardware = :hw,
+                                                    hashrate = :hr,
+                                                    mode = :mode,
+                                                    total_dps = total_dps + :dps,
+                                                    last_seen = CURRENT_TIMESTAMP;");
+                        $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                        $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                        $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                        $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                        $w_stmt->bindValue(":dps", $accum_worker_dps, SQLITE3_INTEGER);
+                        $w_stmt->execute();
+                        $w_stmt->close();
 
-                        if ($actual_inserted > 0) {
+                        if ($accum_traps > 0) {
                             $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
                                                     VALUES ('total_tame_traps', :val)
                                                     ON CONFLICT(setting_key) DO UPDATE SET
                                                         setting_value = CAST(setting_value AS INTEGER) + :val;");
-                            $s_stmt->bindValue(":val", $actual_inserted, SQLITE3_INTEGER);
+                            $s_stmt->bindValue(":val", $accum_traps, SQLITE3_INTEGER);
                             $s_stmt->execute();
                             $s_stmt->close();
                         }
 
                         $db->exec("COMMIT;");
                         $in_m_tx = false;
+                        @file_put_contents($w_tame_meta, $now_time . ":0:0", LOCK_EX);
                         break;
                     } catch (Throwable $ex) {
                         if ($in_m_tx) {
@@ -1540,6 +1557,8 @@ function bloom_filter_test($shards_dir, $bin_x) {
                         usleep((10000 + mt_rand(5000, 25000)) * ($att + 1));
                     }
                 }
+            } else {
+                @file_put_contents($w_tame_meta, $last_commit . ":" . $accum_worker_dps . ":" . $accum_traps, LOCK_EX);
             }
             $total_raw = find_setting_or_null($db, "total_tame_traps");
             $total = ($total_raw !== null) ? intval($total_raw) : 0;

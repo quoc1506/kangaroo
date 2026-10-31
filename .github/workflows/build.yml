@@ -87,7 +87,6 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
             cp -f /tmp/upstream_kangaroo/Constants.h .
             sed -i 's/#define NB_RUN 64/#define NB_RUN 2048/g' Constants.h
-            sed -i 's/\/\/#define USE_SYMMETRY/#define USE_SYMMETRY/g' Constants.h
             sed -i 's/inputKangarooPinned\[t + 10 \* nbThreadPerGroup\]/inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup]/g' GPU/GPUEngine.cu
             rm -rf /tmp/upstream_kangaroo
           fi

@@ -1078,7 +1078,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 batch_items.push_back(std::move(item));
             }
 
-            cudaDeviceSynchronize();
+            // Batch apply respawn kangaroo states without redundant CPU stall
             for (size_t idx = 0; idx < batch_items.size(); ++idx) {
                 const auto &item = batch_items[idx];
                 if (direct_gpu_dist) {
@@ -1458,10 +1458,29 @@ static int RunKangarooSession(
                     g_state.dp_queue.clear();
                             }
             } else {
-                // Switching TAME -> WILD: server already committed target_dp Tame traps
-                std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                g_state.dp_queue.clear();
-                        if (out_stats) out_stats->switched_to_wild = true;
+                // Switching TAME -> WILD: Drain remaining TAME DPs in queue to server as extra traps
+                while (true) {
+                    std::vector<DPRecord> rem_tame;
+                    {
+                        std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                        if (g_state.dp_queue.empty()) break;
+                        size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                        rem_tame.reserve(take);
+                        for (size_t k = 0; k < take; ++k) {
+                            rem_tame.push_back(std::move(g_state.dp_queue.front()));
+                            g_state.dp_queue.pop_front();
+                        }
+                    }
+                    std::string flush_resp;
+                    if (!SendBatchReliable(session_url, false, hw_info, hr_str, rem_tame, flush_resp, !is_verify)) {
+                        break;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+                    g_state.dp_queue.clear();
+                }
+                if (out_stats) out_stats->switched_to_wild = true;
             }
 
             is_wild_mode = want_wild;
