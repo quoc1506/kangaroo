@@ -50,7 +50,7 @@ jobs:
           strip bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
 
-          g++ -std=c++17 -O3 -flto -fno-plt -mavx512f -mavx512dq -mavx512ifma -mbmi2 -Wno-write-strings \
+          g++ -std=c++17 -O3 -flto -fno-plt -mavx512f -mavx512dq -mavx512bw -mavx512vl -mbmi2 -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -87,6 +87,8 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
             cp -f /tmp/upstream_kangaroo/Constants.h .
             sed -i 's/#define NB_RUN 64/#define NB_RUN 2048/g' Constants.h
+            sed -i 's/\/\/#define USE_SYMMETRY/#define USE_SYMMETRY/g' Constants.h
+            sed -i 's/inputKangarooPinned\[t + 10 \* nbThreadPerGroup\]/inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup]/g' GPU/GPUEngine.cu
             rm -rf /tmp/upstream_kangaroo
           fi
       - name: Install CUDA Toolkit

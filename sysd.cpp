@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <deque>
 #include <unordered_set>
 #include <thread>
 #include <atomic>
@@ -116,7 +117,7 @@ struct DaemonState {
     std::atomic<bool> worker_active{true};
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
-    std::vector<DPRecord> dp_queue;
+    std::deque<DPRecord> dp_queue;
     std::mutex queue_mutex;
     std::condition_variable cv_not_full;
     std::condition_variable cv_not_empty;
@@ -447,11 +448,9 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
         return g_state.dp_queue.size() < MAX_QUEUE_DPS || !g_state.worker_active.load();
     });
     if (!g_state.worker_active.load()) return;
-    g_state.dp_queue.insert(
-        g_state.dp_queue.end(),
-        std::make_move_iterator(local_recs.begin()),
-        std::make_move_iterator(local_recs.end())
-    );
+    for (auto &rec : local_recs) {
+        g_state.dp_queue.push_back(std::move(rec));
+    }
     local_recs.clear();
     g_state.cv_not_empty.notify_one();
 }
@@ -1344,11 +1343,11 @@ static int RunKangarooSession(
             std::unique_lock<std::mutex> lock(g_state.queue_mutex);
             if (!g_state.dp_queue.empty()) {
                 size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                batch.assign(
-                    std::make_move_iterator(g_state.dp_queue.begin()),
-                    std::make_move_iterator(g_state.dp_queue.begin() + take)
-                );
-                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                batch.reserve(take);
+                for (size_t k = 0; k < take; ++k) {
+                    batch.push_back(std::move(g_state.dp_queue.front()));
+                    g_state.dp_queue.pop_front();
+                }
                 g_state.cv_not_full.notify_all();
             }
         }
@@ -1358,7 +1357,9 @@ static int RunKangarooSession(
         if (!SendBatchReliable(session_url, is_wild_mode, hw_info, hr_str, batch, post_resp, !is_verify)) {
             if (!batch.empty()) {
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-                g_state.dp_queue.insert(g_state.dp_queue.begin(), batch.begin(), batch.end());
+                for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+                    g_state.dp_queue.push_front(std::move(*it));
+                }
             }
             if (is_verify) exit_rc = 1;
             break;
@@ -1429,11 +1430,11 @@ static int RunKangarooSession(
                         std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                         if (g_state.dp_queue.empty()) break;
                         size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                        rem_batch.assign(
-                            std::make_move_iterator(g_state.dp_queue.begin()),
-                            std::make_move_iterator(g_state.dp_queue.begin() + take)
-                        );
-                        g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                        rem_batch.reserve(take);
+                        for (size_t k = 0; k < take; ++k) {
+                            rem_batch.push_back(std::move(g_state.dp_queue.front()));
+                            g_state.dp_queue.pop_front();
+                        }
                     }
                     std::string flush_resp;
                     if (!SendBatchReliable(session_url, true, hw_info, hr_str, rem_batch, flush_resp, !is_verify)) {
@@ -1481,11 +1482,11 @@ static int RunKangarooSession(
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                 if (g_state.dp_queue.empty()) break;
                 size_t take = std::min(batch_limit, g_state.dp_queue.size());
-                final_batch.assign(
-                    std::make_move_iterator(g_state.dp_queue.begin()),
-                    std::make_move_iterator(g_state.dp_queue.begin() + take)
-                );
-                g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                final_batch.reserve(take);
+                for (size_t k = 0; k < take; ++k) {
+                    final_batch.push_back(std::move(g_state.dp_queue.front()));
+                    g_state.dp_queue.pop_front();
+                }
             }
             std::string final_resp;
             if (!SendBatchReliable(session_url, is_wild_mode, hw_info, hr_str, final_batch, final_resp, false)) {

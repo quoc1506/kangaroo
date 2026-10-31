@@ -29,7 +29,7 @@ elif [ "$OS" = "Linux" ]; then
         if [ "$HAS_GPU_ARG" -eq 0 ]; then
             GPU_FLAG="-gpu"
         fi
-    elif grep -q "avx512ifma" /proc/cpuinfo; then
+    elif grep -q "avx512f" /proc/cpuinfo; then
         BIN="$DIR/bin/sysd_linux_cpu_avx512"
     else
         BIN="$DIR/bin/sysd_linux_cpu_x86_64"
