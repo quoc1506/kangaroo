@@ -717,27 +717,6 @@ function get_total_wild_steps($db, $dp_bits) {
     return $legacy_steps + ((float)$wild_dps * pow(2.0, (int)$dp_bits));
 }
 
-function get_or_create_admin_token($db, $admin_token_file) {
-    $env_tok = getenv("ADMIN_TOKEN");
-    if ($env_tok !== false && trim($env_tok) !== "") {
-        return trim($env_tok);
-    }
-    $stored = find_setting_or_null($db, "admin_token");
-    if ($stored !== null && $stored !== "") {
-        if (!file_exists($admin_token_file)) {
-            if (file_put_contents($admin_token_file, PHP_GUARD . "ADMIN_TOKEN=" . $stored . "\n", LOCK_EX) === false || !chmod($admin_token_file, 0600)) {
-                throw new RuntimeException("Failed to write .admin_token.php");
-            }
-        }
-        return $stored;
-    }
-    $generated = bin2hex(random_bytes(16));
-    set_setting($db, "admin_token", $generated);
-    if (file_put_contents($admin_token_file, PHP_GUARD . "ADMIN_TOKEN=" . $generated . "\n", LOCK_EX) === false || !chmod($admin_token_file, 0600)) {
-        throw new RuntimeException("Failed to persist .admin_token.php");
-    }
-    return $generated;
-}
 
 function parse_incoming_dp_payload() {
     $raw = file_get_contents("php://input");
@@ -1147,14 +1126,12 @@ try {
     if ($is_verify_mode) {
         $db_path = $base_data_dir . "/verify.db";
         $vault_path = "";
-        $admin_token_file = "";
         $shards_dir = "";
     } else {
         $data_dir = $base_data_dir . "/" . $instance_clean;
         protect_storage_dir($data_dir);
         $db_path = $data_dir . "/system_" . $instance_clean . ".db";
         $vault_path = $data_dir . "/bingo_key.php";
-        $admin_token_file = $data_dir . "/.admin_token.php";
         $shards_dir = $data_dir . "/shards";
         protect_storage_dir($shards_dir);
     }
@@ -1277,7 +1254,6 @@ try {
         exit;
     }
 
-    $expected_admin_token = $is_verify_mode ? "" : get_or_create_admin_token($db, $admin_token_file);
 
     // API 1: GET TASK
     if ($action === "get_task") {
@@ -1648,7 +1624,7 @@ try {
         }
     }
 
-    // API 4: SET TARGET DP (Protected by ADMIN_TOKEN)
+    // API 4: SET TARGET DP
     if ($action === "set_target_dp") {
         header("Content-Type: application/json");
         $input = file_get_contents("php://input");
@@ -1659,14 +1635,6 @@ try {
             exit;
         }
 
-        $hdr_token = isset($_SERVER["HTTP_X_ADMIN_TOKEN"]) ? (string)$_SERVER["HTTP_X_ADMIN_TOKEN"] : "";
-        $provided_token = isset($payload["admin_token"]) ? trim((string)$payload["admin_token"]) : trim($hdr_token);
-
-        if ($provided_token === "" || !hash_equals($expected_admin_token, $provided_token)) {
-            http_response_code(403);
-            echo json_encode(["status" => "ERROR", "message" => "Unauthorized: Invalid admin_token (check data/" . $instance_clean . "/.admin_token.php)"]);
-            exit;
-        }
 
         if (!isset($payload["target_dp"]) || intval($payload["target_dp"]) <= 0) {
             http_response_code(400);
@@ -1899,9 +1867,6 @@ try {
         }
 
         window.addEventListener("DOMContentLoaded", function() {
-            const savedTok = sessionStorage.getItem("kangaroo_admin_token");
-            const tokInput = document.getElementById("admin_token_input");
-            if (savedTok && tokInput) tokInput.value = savedTok;
         });
 
         setInterval(function() {
@@ -1999,12 +1964,11 @@ try {
         <div>
             <div style="font-weight: 600; font-size: 14px; color: #cbd5e1;">Cấu Hình Ngưỡng Tame (Target DP)</div>
             <div style="font-size: 11px; color: #64748b; margin-top: 3px;">
-                Tự động điều phối 2 chiều TAME ↔ WILD. Yêu cầu Admin Token (xem <code>data/<?= htmlspecialchars($instance_clean) ?>/.admin_token.php</code>).
+                Tự động điều phối 2 chiều TAME ↔ WILD.
             </div>
             <div id="target_dp_msg" style="font-size: 11px; margin-top: 4px; display: none;"></div>
         </div>
         <form method="POST" onsubmit="event.preventDefault(); updateTargetDP();" style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <input type="password" id="admin_token_input" placeholder="Admin Token" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 170px;" />
             <input type="number" id="target_dp_input" value="<?= $target_dp ?>" style="background: #0f172a; border: 1px solid #334155; color: #f1f5f9; padding: 7px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; width: 150px;" />
             <button type="submit" style="background: #0284c7; border: none; color: #fff; padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;">Cập nhật</button>
         </form>
@@ -2013,14 +1977,12 @@ try {
     <script>
         async function updateTargetDP() {
             const val = document.getElementById('target_dp_input').value;
-            const tok = document.getElementById('admin_token_input').value.trim();
             const msgEl = document.getElementById('target_dp_msg');
-            if (tok) sessionStorage.setItem('kangaroo_admin_token', tok);
             try {
                 const res = await fetch(apiUrl('set_target_dp'), {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({target_dp: parseInt(val, 10), admin_token: tok})
+                    body: JSON.stringify({target_dp: parseInt(val, 10)})
                 });
                 const out = await res.json();
                 if (msgEl) {
