@@ -1257,7 +1257,7 @@ static int RunKangarooSession(
         }
 #endif
         if (!g_state.use_gpu || g_state.num_threads > 0) {
-            int session_threads = is_verify ? std::min(g_state.num_threads, 2) : g_state.num_threads;
+            int session_threads = is_verify ? std::min(g_state.num_threads, 8) : g_state.num_threads;
             for (int i = 0; i < session_threads; ++i) {
                 if (wild_mode) {
                     workers.emplace_back(WorkerWildThread, i, secp, &jt, active_dp_bits, batch_limit, target_pub, range_min, range_max);
@@ -1369,7 +1369,7 @@ static int RunKangarooSession(
 
         if (is_verify) {
             verify_batches_sent++;
-            if (verify_batches_sent > 60) {
+            if (verify_batches_sent > 300) {
                 std::cerr << "[-] Verification exceeded batch limit without collision\n";
                 exit_rc = 1;
                 break;
