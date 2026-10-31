@@ -318,6 +318,14 @@ function fn_mod($a, $N) {
     return $a;
 }
 
+function fn_add($a, $b, $N) {
+    list($r, $c) = u256_add($a, $b);
+    if ($c > 0 || u256_cmp($r, $N) >= 0) {
+        list($r, $_) = u256_sub($r, $N);
+    }
+    return $r;
+}
+
 function fn_sub($a, $b, $N) {
     if (u256_cmp($a, $b) >= 0) {
         list($r, $_) = u256_sub($a, $b);
