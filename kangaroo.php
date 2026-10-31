@@ -448,7 +448,6 @@ function secp256k1_derive_pubkey_pair($priv_u256) {
 function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $wild_dist_hex, $target_pubkey_hex) {
     $params = secp256k1_params();
     $N = $params["N"];
-
     $target_clean = strtolower(trim((string)$target_pubkey_hex));
     if (strncmp($target_clean, "0x", 2) === 0) {
         $target_clean = substr($target_clean, 2);
@@ -457,29 +456,40 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
         throw new InvalidArgumentException("Invalid target_pubkey format");
     }
     $pub_fmt = (strlen($target_clean) === 66) ? "compressed" : "uncompressed";
-
     $min = u256_from_hex($range_min_hex);
     $max = u256_from_hex($range_max_hex);
     $dt = fn_mod(u256_from_hex($tame_dist_hex), $N);
     $dw = fn_mod(u256_from_hex($wild_dist_hex), $N);
 
-    $k1 = fn_sub($dt, $dw, $N);
-    $k2 = fn_sub(fn_neg($dt, $N), $dw, $N);
+    // 4-way Equivalence Symmetry Candidates
+    $candidates = [
+        fn_sub($dt, $dw, $N),
+        fn_sub(fn_neg($dt, $N), $dw, $N),
+        fn_add($dt, $dw, $N),
+        fn_sub(fn_neg($dt, $N), fn_neg($dw, $N), $N)
+    ];
 
-    $c1_hex = "0x" . u256_to_hex($k1);
-    $c2_hex = "0x" . u256_to_hex($k2);
-    $c1_in_range = (u256_cmp($k1, $min) >= 0 && u256_cmp($k1, $max) <= 0);
-    $c2_in_range = (u256_cmp($k2, $min) >= 0 && u256_cmp($k2, $max) <= 0);
+    $verified_key = "";
+    $derived_pubkey = "";
+    $is_verified = false;
 
-    $pair1 = secp256k1_derive_pubkey_pair($k1);
-    $pair2 = secp256k1_derive_pubkey_pair($k2);
+    foreach ($candidates as $k_cand) {
+        $cand_in_range = (u256_cmp($k_cand, $min) >= 0 && u256_cmp($k_cand, $max) <= 0);
+        if (!$cand_in_range) continue;
+        $pair = secp256k1_derive_pubkey_pair($k_cand);
+        $pub = ($pair !== null) ? $pair[$pub_fmt] : "";
+        if ($pub !== "" && hash_equals($target_clean, $pub)) {
+            $is_verified = true;
+            $verified_key = "0x" . u256_to_hex($k_cand);
+            $derived_pubkey = $pub;
+            break;
+        }
+    }
 
-    $pub1 = ($pair1 !== null) ? $pair1[$pub_fmt] : "";
-    $pub2 = ($pair2 !== null) ? $pair2[$pub_fmt] : "";
-
-    $match1 = ($pub1 !== "" && hash_equals($target_clean, $pub1) && $c1_in_range);
-    $match2 = ($pub2 !== "" && hash_equals($target_clean, $pub2) && $c2_in_range);
-    $is_verified = ($match1 || $match2);
+    $c1_hex = "0x" . u256_to_hex($candidates[0]);
+    $c2_hex = "0x" . u256_to_hex($candidates[1]);
+    $c1_in_range = (u256_cmp($candidates[0], $min) >= 0 && u256_cmp($candidates[0], $max) <= 0);
+    $c2_in_range = (u256_cmp($candidates[1], $min) >= 0 && u256_cmp($candidates[1], $max) <= 0);
 
     return [
         "cand1" => $c1_hex,
@@ -487,8 +497,8 @@ function solve_candidate_keys($range_min_hex, $range_max_hex, $tame_dist_hex, $w
         "cand1_in_range" => $c1_in_range,
         "cand2_in_range" => $c2_in_range,
         "is_verified" => $is_verified,
-        "verified_key" => $match1 ? $c1_hex : ($match2 ? $c2_hex : ""),
-        "derived_pubkey" => $match1 ? $pub1 : ($match2 ? $pub2 : "")
+        "verified_key" => $verified_key,
+        "derived_pubkey" => $derived_pubkey
     ];
 }
 
@@ -1286,7 +1296,7 @@ try {
             "target_pubkey" => $t_pub,
             "dp_mask_bits" => $dp_b,
             "batch_limit" => $batch_lim,
-            "heartbeat_sec" => ($task_type === "WILD" && $hb_base > 15) ? 15 : $hb_base
+            "heartbeat_sec" => $hb_base
         ]);
         exit;
     }
@@ -1323,35 +1333,7 @@ try {
         $batch_size = count($dp_list);
         $current_mode = ($action === "check_wild") ? "WILD" : "TAME";
 
-        for ($w_att = 0; $w_att < 5; $w_att++) {
-            $w_stmt = null;
-            try {
-                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                        VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                        ON CONFLICT(worker_id) DO UPDATE SET
-                                            hardware = :hw,
-                                            hashrate = :hr,
-                                            mode = :mode,
-                                            total_dps = total_dps + :dps,
-                                            last_seen = CURRENT_TIMESTAMP;");
-                $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
-                $w_stmt->execute();
-                $w_stmt->close();
-                break;
-            } catch (Throwable $ex) {
-                if ($w_stmt) {
-                    $w_stmt->close();
-                }
-                if ($w_att === 4) {
-                    throw new DbBusyException("Worker registry busy");
-                }
-                usleep(15000 * ($w_att + 1));
-            }
-        }
+        // Note: Worker registry and counters are updated atomically in master transaction at end of request
 
         if ($action === "submit_tame") {
             $shard_groups = [];
@@ -1410,7 +1392,53 @@ try {
                 }
             }
 
-            $total = increment_setting_int($db, "total_tame_traps", $actual_inserted);
+            // Unified Atomic Master Transaction: worker registry + total_tame_traps
+            for ($att = 0; $att < 5; $att++) {
+                $in_m_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_m_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
+
+                    if ($actual_inserted > 0) {
+                        $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                                                VALUES ('total_tame_traps', :val)
+                                                ON CONFLICT(setting_key) DO UPDATE SET
+                                                    setting_value = CAST(setting_value AS INTEGER) + :val;");
+                        $s_stmt->bindValue(":val", $actual_inserted, SQLITE3_INTEGER);
+                        $s_stmt->execute();
+                        $s_stmt->close();
+                    }
+
+                    $db->exec("COMMIT;");
+                    $in_m_tx = false;
+                    break;
+                } catch (Throwable $ex) {
+                    if ($in_m_tx) {
+                        try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
+                    }
+                    if ($att === 4) {
+                        throw new DbBusyException("Master DB busy during tame atomic commit");
+                    }
+                    usleep(15000 * ($att + 1));
+                }
+            }
+            $total_raw = find_setting_or_null($db, "total_tame_traps");
+            $total = ($total_raw !== null) ? intval($total_raw) : 0;
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
             $space_w = get_space_width_float(get_required_setting($db, "range_min"), get_required_setting($db, "range_max"));
@@ -1465,52 +1493,54 @@ try {
                     }
                 }
 
-                $schk = null;
-                for ($prep_att = 0; $prep_att < 5; $prep_att++) {
-                    try {
-                        $schk = $sdb->prepare("SELECT total_distance FROM tame_traps WHERE dp_x = :x LIMIT 1;");
-                        break;
-                    } catch (Throwable $ex) {
-                        if ($prep_att === 4) {
-                            if ($in_read_tx) {
-                                try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                            }
-                            throw new DbBusyException("Wild lookup prepare busy on shard " . $shard_idx);
-                        }
-                        usleep(15000 * ($prep_att + 1));
-                    }
-                }
-
-                foreach ($group as $dp) {
-                    $bin_x = $dp["bin_x"];
-                    $bin_dist = $dp["bin_dist"];
-
-                    $row = false;
-                    for ($attempt = 0; $attempt < 5; $attempt++) {
-                        $sres = null;
+                $chunks = array_chunk($group, 50);
+                foreach ($chunks as $chunk) {
+                    $placeholders = implode(",", array_fill(0, count($chunk), "?"));
+                    $schk = null;
+                    for ($prep_att = 0; $prep_att < 5; $prep_att++) {
                         try {
-                            $schk->reset();
-                            $schk->bindValue(":x", $bin_x, SQLITE3_BLOB);
+                            $schk = $sdb->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
+                            break;
+                        } catch (Throwable $ex) {
+                            if ($prep_att === 4) {
+                                if ($in_read_tx) { try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
+                                throw new DbBusyException("Wild lookup prepare busy on shard " . $shard_idx);
+                            }
+                            usleep(15000 * ($prep_att + 1));
+                        }
+                    }
+
+                    $map_by_x = [];
+                    foreach ($chunk as $c_idx => $dp_item) {
+                        $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
+                        $map_by_x[$dp_item["bin_x"]] = $dp_item["bin_dist"];
+                    }
+
+                    $sres = null;
+                    $matched_rows = [];
+                    for ($attempt = 0; $attempt < 5; $attempt++) {
+                        try {
                             $sres = $schk->execute();
-                            $row = $sres->fetchArray(SQLITE3_ASSOC);
+                            while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
+                                $matched_rows[] = $row;
+                            }
                             $sres->finalize();
                             break;
                         } catch (Throwable $ex) {
-                            if ($sres) {
-                                $sres->finalize();
-                            }
+                            if ($sres) { $sres->finalize(); }
                             if ($attempt === 4) {
                                 $schk->close();
-                                if ($in_read_tx) {
-                                    try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                                }
+                                if ($in_read_tx) { try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
                                 throw new DbBusyException("Wild lookup execution busy on shard " . $shard_idx);
                             }
                             usleep(15000 * ($attempt + 1));
                         }
                     }
+                    $schk->close();
 
-                    if ($row !== false) {
+                    foreach ($matched_rows as $row) {
+                        $bin_x = $row["dp_x"];
+                        $bin_dist = $map_by_x[$bin_x];
                         $raw_tame_dist = $row["total_distance"];
                         if (strlen($raw_tame_dist) < 32) {
                             $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
@@ -1523,7 +1553,6 @@ try {
                             continue;
                         }
 
-                        $schk->close();
                         if ($in_read_tx) {
                             try { $sdb->exec("COMMIT;"); } catch (Throwable $_cm) {}
                             $in_read_tx = false;
@@ -1595,15 +1624,56 @@ try {
                     }
                 }
 
-                $schk->close();
                 if ($in_read_tx) {
                     try { $sdb->exec("COMMIT;"); } catch (Throwable $_cm) {}
                     $in_read_tx = false;
                 }
             }
 
-            if ($batch_size > 0) {
-                increment_setting_int($db, "total_wild_dps", $batch_size);
+            // Unified Atomic Master Transaction: worker registry + total_wild_dps
+            for ($att = 0; $att < 5; $att++) {
+                $in_m_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_m_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
+
+                    if ($batch_size > 0) {
+                        $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                                                VALUES ('total_wild_dps', :val)
+                                                ON CONFLICT(setting_key) DO UPDATE SET
+                                                    setting_value = CAST(setting_value AS INTEGER) + :val;");
+                        $s_stmt->bindValue(":val", $batch_size, SQLITE3_INTEGER);
+                        $s_stmt->execute();
+                        $s_stmt->close();
+                    }
+
+                    $db->exec("COMMIT;");
+                    $in_m_tx = false;
+                    break;
+                } catch (Throwable $ex) {
+                    if ($in_m_tx) {
+                        try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
+                    }
+                    if ($att === 4) {
+                        throw new DbBusyException("Master DB busy during wild atomic commit");
+                    }
+                    usleep(15000 * ($att + 1));
+                }
             }
 
             $total_traps = intval(get_required_setting($db, "total_tame_traps"));

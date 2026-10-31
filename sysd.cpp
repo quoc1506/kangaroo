@@ -19,6 +19,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -74,12 +75,21 @@
 #define NB_JUMP 32
 
 #define CPU_GRP_SIZE 1024
-#define MAX_QUEUE_DPS 100000
+#define MAX_QUEUE_DPS 500000
 
 struct DPRecord {
-    std::string x_hex;
-    std::string dist_hex;
+    uint8_t x[32];
+    uint8_t dist[32];
 };
+
+inline void IntToBin32(const Int &val, uint8_t *out) {
+    for (int i = 0; i < 4; ++i) {
+        uint64_t w = val.bits64[3 - i];
+        for (int b = 7; b >= 0; --b) {
+            out[i * 8 + (7 - b)] = (uint8_t)((w >> (b * 8)) & 0xFF);
+        }
+    }
+}
 
 struct HttpResult {
     CURLcode curl_code = CURLE_FAILED_INIT;
@@ -107,8 +117,9 @@ struct DaemonState {
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
     std::vector<DPRecord> dp_queue;
-    std::unordered_set<std::string> seen_dp_x;
     std::mutex queue_mutex;
+    std::condition_variable cv_not_full;
+    std::condition_variable cv_not_empty;
 } g_state;
 
 static CURL *g_main_curl = nullptr;
@@ -135,6 +146,8 @@ static void HandleStopSignal(int) {
     g_state.stop_signal = true;
     g_state.worker_active = false;
     g_state.running = false;
+    g_state.cv_not_full.notify_all();
+    g_state.cv_not_empty.notify_all();
 }
 
 static void SetProcessName(const char *name = "k-engine") {
@@ -418,45 +431,27 @@ static std::vector<uint8_t> BuildDpkgPacket(
     uint32_t count_be = htonl((uint32_t)batch.size());
     packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
 
-    uint8_t dp_buf[64];
     for (size_t i = 0; i < batch.size(); ++i) {
-        HexToBin32(batch[i].x_hex, dp_buf);
-        HexToBin32(batch[i].dist_hex, dp_buf + 32);
-        packet.insert(packet.end(), dp_buf, dp_buf + 64);
+        packet.insert(packet.end(), batch[i].x, batch[i].x + 32);
+        packet.insert(packet.end(), batch[i].dist, batch[i].dist + 32);
     }
     return packet;
 }
 
 static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
     if (local_recs.empty()) return;
-    while (g_state.worker_active.load()) {
-        {
-            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-            if (g_state.dp_queue.size() < MAX_QUEUE_DPS) {
-                if (g_state.seen_dp_x.size() >= MAX_QUEUE_DPS) {
-                    g_state.seen_dp_x.clear();
-                }
-                for (size_t idx = 0; idx < local_recs.size(); ++idx) {
-                    if (g_state.seen_dp_x.insert(local_recs[idx].x_hex).second) {
-                        g_state.dp_queue.push_back(std::move(local_recs[idx]));
-                    }
-                }
-                local_recs.clear();
-                return;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    std::lock_guard<std::mutex> lock(g_state.queue_mutex);
-    if (g_state.seen_dp_x.size() >= MAX_QUEUE_DPS) {
-        g_state.seen_dp_x.clear();
-    }
-    for (size_t idx = 0; idx < local_recs.size(); ++idx) {
-        if (g_state.seen_dp_x.insert(local_recs[idx].x_hex).second) {
-            g_state.dp_queue.push_back(std::move(local_recs[idx]));
-        }
-    }
+    std::unique_lock<std::mutex> lock(g_state.queue_mutex);
+    g_state.cv_not_full.wait(lock, [&]() {
+        return g_state.dp_queue.size() < MAX_QUEUE_DPS || !g_state.worker_active.load();
+    });
+    if (!g_state.worker_active.load()) return;
+    g_state.dp_queue.insert(
+        g_state.dp_queue.end(),
+        std::make_move_iterator(local_recs.begin()),
+        std::make_move_iterator(local_recs.end())
+    );
     local_recs.clear();
+    g_state.cv_not_empty.notify_one();
 }
 
 inline uint64_t MakeDPMask(int dp_bits) {
@@ -560,13 +555,17 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
+            if (py[g].ModPositiveK1()) {
+                py[g].ModNeg();
+                distance[g].ModNegK1order();
+            }
             tame_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
-                rec.x_hex = "0x" + rx.GetBase16();
-                rec.dist_hex = "0x" + distance[g].GetBase16();
-                local_dp_buffer.push_back(std::move(rec));
+                IntToBin32(rx, rec.x);
+                IntToBin32(distance[g], rec.dist);
+                local_dp_buffer.push_back(rec);
                 tame_dp_count[g]++;
             }
 
@@ -688,13 +687,17 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
+            if (py[g].ModPositiveK1()) {
+                py[g].ModNeg();
+                distance[g].ModNegK1order();
+            }
             wild_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
                 DPRecord rec;
-                rec.x_hex = "0x" + rx.GetBase16();
-                rec.dist_hex = "0x" + distance[g].GetBase16();
-                local_dp_buffer.push_back(std::move(rec));
+                IntToBin32(rx, rec.x);
+                IntToBin32(distance[g], rec.dist);
+                local_dp_buffer.push_back(rec);
                 wild_dp_count[g]++;
             }
 
@@ -1000,7 +1003,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
     }
 
     std::vector<ITEM> gpu_found;
-    std::vector<GpuStagedRespawn> staged_respawns;
     std::vector<uint64_t> respawn_indices;
     Int zero_int;
     zero_int.SetInt32(0);
@@ -1034,12 +1036,12 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 real_dist.ModAddK1order(&d_walk);
 
                 DPRecord rec;
-                rec.x_hex = "0x" + ((Int*)&item.x)->GetBase16();
-                rec.dist_hex = "0x" + real_dist.GetBase16();
-                local_recs.push_back(std::move(rec));
+                IntToBin32(*(const Int*)&item.x, rec.x);
+                IntToBin32(real_dist, rec.dist);
+                local_recs.push_back(rec);
 
                 gpu_dp_count[item.kIdx]++;
-                if (gpu_dp_count[item.kIdx] >= 5 && respawn_indices.size() < 64) {
+                if (gpu_dp_count[item.kIdx] >= 5 && respawn_indices.size() < 4) {
                     gpu_dp_count[item.kIdx] = 0;
                     respawn_indices.push_back(item.kIdx);
                 }
@@ -1048,27 +1050,18 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
             EnqueueWithBackpressure(local_recs);
         }
 
-        if (!staged_respawns.empty()) {
-            for (size_t idx = 0; idx < staged_respawns.size(); ++idx) {
-                uint64_t kIdx = staged_respawns[idx].kIdx;
-                base_dist[kIdx].Set(&staged_respawns[idx].new_base);
-                gpu_dp_count[kIdx] = 0;
-            }
-            staged_respawns.clear();
-        }
-
         if (!respawn_indices.empty()) {
+            cudaDeviceSynchronize();
             for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
                 uint64_t kIdx = respawn_indices[idx];
                 Point new_P;
                 Int new_base;
                 make_kangaroo_state(new_P, new_base, rng_salt);
                 gpu->SetKangaroo(kIdx, &new_P.x, &new_P.y, &zero_int);
-                GpuStagedRespawn sr;
-                sr.kIdx = kIdx;
-                sr.new_base.Set(&new_base);
-                staged_respawns.push_back(sr);
+                base_dist[kIdx].Set(&new_base);
+                gpu_dp_count[kIdx] = 0;
             }
+            respawn_indices.clear();
         }
     }
 
@@ -1161,7 +1154,6 @@ static int RunKangarooSession(
     {
         std::lock_guard<std::mutex> lock(g_state.queue_mutex);
         g_state.dp_queue.clear();
-        g_state.seen_dp_x.clear();
     }
     g_state.running = !g_state.stop_signal.load();
     if (!g_state.running.load()) {
@@ -1320,7 +1312,7 @@ static int RunKangarooSession(
 
         std::vector<DPRecord> batch;
         {
-            std::lock_guard<std::mutex> lock(g_state.queue_mutex);
+            std::unique_lock<std::mutex> lock(g_state.queue_mutex);
             if (!g_state.dp_queue.empty()) {
                 size_t take = std::min(batch_limit, g_state.dp_queue.size());
                 batch.assign(
@@ -1328,6 +1320,7 @@ static int RunKangarooSession(
                     std::make_move_iterator(g_state.dp_queue.begin() + take)
                 );
                 g_state.dp_queue.erase(g_state.dp_queue.begin(), g_state.dp_queue.begin() + take);
+                g_state.cv_not_full.notify_all();
             }
         }
 
@@ -1433,14 +1426,12 @@ static int RunKangarooSession(
                 {
                     std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                     g_state.dp_queue.clear();
-                    g_state.seen_dp_x.clear();
-                }
+                            }
             } else {
                 // Switching TAME -> WILD: server already committed target_dp Tame traps
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                 g_state.dp_queue.clear();
-                g_state.seen_dp_x.clear();
-                if (out_stats) out_stats->switched_to_wild = true;
+                        if (out_stats) out_stats->switched_to_wild = true;
             }
 
             is_wild_mode = want_wild;
