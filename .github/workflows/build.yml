@@ -36,7 +36,7 @@ jobs:
       - name: Compile CPU Daemon (AVX2 Baseline & AVX-512 IFMA High-Performance)
         run: |
           mkdir -p bin
-          g++ -std=c++17 -O3 -flto -fno-plt -mavx2 -mbmi2 -Wno-write-strings \
+          g++ -std=c++17 -O3 -flto -fno-plt -mavx2 -mbmi2 -madx -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -50,7 +50,7 @@ jobs:
           strip bin/sysd_linux_cpu_x86_64
           chmod +x bin/sysd_linux_cpu_x86_64
 
-          g++ -std=c++17 -O3 -flto -fno-plt -mavx512f -mavx512dq -mavx512bw -mavx512vl -mbmi2 -Wno-write-strings \
+          g++ -std=c++17 -O3 -flto -fno-plt -mavx512f -mavx512dq -mavx512bw -mavx512vl -mbmi2 -madx -Wno-write-strings \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -103,7 +103,7 @@ jobs:
       - name: Compile CUDA GPU Daemon
         run: |
           mkdir -p bin
-          nvcc -std=c++17 -O3 -DUSE_CUDA -Xcompiler -Wno-write-strings \
+          nvcc -std=c++17 -O3 -DUSE_CUDA -Xcompiler -Wno-write-strings -Xptxas -O3 \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \

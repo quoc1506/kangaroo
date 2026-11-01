@@ -557,10 +557,6 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
-            if (py[g].ModPositiveK1()) {
-                py[g].ModNeg();
-                distance[g].ModNegK1order();
-            }
             tame_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
@@ -689,10 +685,6 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
             px[g].Set(&rx);
             py[g].Set(&ry);
             distance[g].ModAddK1order(&jt->d[j]);
-            if (py[g].ModPositiveK1()) {
-                py[g].ModNeg();
-                distance[g].ModNegK1order();
-            }
             wild_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
@@ -991,7 +983,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         return;
     }
 
-    bool direct_gpu_dist = (range_max.GetBitLength() <= 120);
+    bool direct_gpu_dist = (!is_wild && range_max.GetBitLength() <= 120);
     Int zero_offset;
     zero_offset.SetInt32(0);
     gpu->SetWildOffset(&zero_offset);
