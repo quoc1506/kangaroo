@@ -117,6 +117,7 @@ struct DaemonState {
     std::atomic<bool> worker_active{true};
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
+    std::atomic<size_t> max_queue_dps{4000};
     std::deque<DPRecord> dp_queue;
     std::mutex queue_mutex;
     std::condition_variable cv_not_full;
@@ -445,7 +446,7 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
     if (local_recs.empty()) return;
     std::unique_lock<std::mutex> lock(g_state.queue_mutex);
     g_state.cv_not_full.wait(lock, [&]() {
-        return g_state.dp_queue.size() < MAX_QUEUE_DPS || !g_state.worker_active.load();
+        return g_state.dp_queue.size() < g_state.max_queue_dps.load() || !g_state.worker_active.load();
     });
     if (!g_state.worker_active.load()) return;
     for (auto &rec : local_recs) {
@@ -1250,6 +1251,7 @@ static int RunKangarooSession(
     int active_dp_bits = (int)parsed_bits;
     size_t batch_limit = (size_t)parsed_batch;
     double heartbeat_sec = (double)parsed_hb;
+    g_state.max_queue_dps.store(std::max((size_t)256, batch_limit * 4));
 
     Int range_min, range_max;
     range_min.SetBase16((char*)active_min_hex.c_str());
@@ -1286,11 +1288,12 @@ static int RunKangarooSession(
 #endif
         if (!g_state.use_gpu || g_state.num_threads > 0) {
             int session_threads = is_verify ? std::min(g_state.num_threads, 8) : g_state.num_threads;
+            size_t thread_flush_target = std::max((size_t)1, batch_limit / session_threads);
             for (int i = 0; i < session_threads; ++i) {
                 if (wild_mode) {
-                    workers.emplace_back(WorkerWildThread, i, secp, &jt, active_dp_bits, batch_limit, target_pub, range_min, range_max);
+                    workers.emplace_back(WorkerWildThread, i, secp, &jt, active_dp_bits, thread_flush_target, target_pub, range_min, range_max);
                 } else {
-                    workers.emplace_back(WorkerTameThread, i, secp, &jt, active_dp_bits, batch_limit, range_min, range_max);
+                    workers.emplace_back(WorkerTameThread, i, secp, &jt, active_dp_bits, thread_flush_target, range_min, range_max);
                 }
             }
         }
@@ -1416,6 +1419,7 @@ static int RunKangarooSession(
         bool want_wild = (next_task == "WILD");
         if (want_wild != is_wild_mode) {
             g_state.worker_active = false;
+            g_state.cv_not_full.notify_all();
             for (size_t i = 0; i < workers.size(); ++i) {
                 if (workers[i].joinable()) workers[i].join();
             }
@@ -1429,12 +1433,13 @@ static int RunKangarooSession(
                     {
                         std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                         if (g_state.dp_queue.empty()) break;
-                        size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                        size_t take = std::min((size_t)2000, g_state.dp_queue.size());
                         rem_batch.reserve(take);
                         for (size_t k = 0; k < take; ++k) {
                             rem_batch.push_back(std::move(g_state.dp_queue.front()));
                             g_state.dp_queue.pop_front();
                         }
+                        g_state.cv_not_full.notify_all();
                     }
                     std::string flush_resp;
                     if (!SendBatchReliable(session_url, true, hw_info, hr_str, rem_batch, flush_resp, !is_verify)) {
@@ -1456,7 +1461,7 @@ static int RunKangarooSession(
                 {
                     std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                     g_state.dp_queue.clear();
-                            }
+                }
             } else {
                 // Switching TAME -> WILD: Drain remaining TAME DPs in queue to server as extra traps
                 while (true) {
@@ -1464,12 +1469,13 @@ static int RunKangarooSession(
                     {
                         std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                         if (g_state.dp_queue.empty()) break;
-                        size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                        size_t take = std::min((size_t)2000, g_state.dp_queue.size());
                         rem_tame.reserve(take);
                         for (size_t k = 0; k < take; ++k) {
                             rem_tame.push_back(std::move(g_state.dp_queue.front()));
                             g_state.dp_queue.pop_front();
                         }
+                        g_state.cv_not_full.notify_all();
                     }
                     std::string flush_resp;
                     if (!SendBatchReliable(session_url, false, hw_info, hr_str, rem_tame, flush_resp, !is_verify)) {
@@ -1489,6 +1495,7 @@ static int RunKangarooSession(
     }
 
     g_state.worker_active = false;
+    g_state.cv_not_full.notify_all();
     for (size_t i = 0; i < workers.size(); ++i) {
         if (workers[i].joinable()) workers[i].join();
     }
@@ -1500,12 +1507,13 @@ static int RunKangarooSession(
             {
                 std::lock_guard<std::mutex> lock(g_state.queue_mutex);
                 if (g_state.dp_queue.empty()) break;
-                size_t take = std::min(batch_limit, g_state.dp_queue.size());
+                size_t take = std::min((size_t)2000, g_state.dp_queue.size());
                 final_batch.reserve(take);
                 for (size_t k = 0; k < take; ++k) {
                     final_batch.push_back(std::move(g_state.dp_queue.front()));
                     g_state.dp_queue.pop_front();
                 }
+                g_state.cv_not_full.notify_all();
             }
             std::string final_resp;
             if (!SendBatchReliable(session_url, is_wild_mode, hw_info, hr_str, final_batch, final_resp, false)) {
@@ -1593,17 +1601,21 @@ static int RunVerification(Secp256K1 *secp, const std::vector<int> &active_gpus,
             break;
         }
 
+        std::cout << "  [*] Puzzle #" << std::setw(3) << entry.id
+                  << " (" << std::setw(3) << entry.bits << "-bit): Running TAME + WILD verification..." << std::flush;
+
         SessionStats stats;
         int rc = RunKangarooSession(secp, verify_session_url, active_gpus, hw_info, true, &stats);
         if (rc != 0 || !stats.solved || !stats.key_matched || !stats.switched_to_wild ||
             stats.tame_traps == 0 || stats.wild_checked == 0) {
+            std::cout << "\r";
             std::cerr << "  [-] Puzzle #" << entry.id << " (" << entry.bits << "-bit): [FAIL - Private key array or Secp256k1 mismatch]\n";
             final_rc = 1;
             break;
         }
 
         solved_count++;
-        std::cout << "  [+] Puzzle #" << std::setw(3) << entry.id
+        std::cout << "\r  [+] Puzzle #" << std::setw(3) << entry.id
                   << " (" << std::setw(3) << entry.bits << "-bit)"
                   << " | TAME: " << std::setw(3) << stats.tame_traps
                   << " -> WILD: " << std::setw(3) << stats.wild_checked
