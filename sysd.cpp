@@ -117,7 +117,7 @@ struct DaemonState {
     std::atomic<bool> worker_active{true};
     std::atomic<bool> stop_signal{false};
     std::atomic<uint64_t> total_steps{0};
-    std::atomic<size_t> max_queue_dps{4000};
+    std::atomic<size_t> max_queue_dps{50000};
     std::deque<DPRecord> dp_queue;
     std::mutex queue_mutex;
     std::condition_variable cv_not_full;
@@ -1243,7 +1243,7 @@ static int RunKangarooSession(
     int active_dp_bits = (int)parsed_bits;
     size_t batch_limit = (size_t)parsed_batch;
     double heartbeat_sec = (double)parsed_hb;
-    g_state.max_queue_dps.store(std::max((size_t)256, batch_limit * 4));
+    g_state.max_queue_dps.store(std::max((size_t)50000, batch_limit * 4));
 
     Int range_min, range_max;
     range_min.SetBase16((char*)active_min_hex.c_str());

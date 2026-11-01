@@ -1169,41 +1169,47 @@ try {
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "536870912") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
-    $db->exec("
-        CREATE TABLE IF NOT EXISTS system_settings (
-            setting_key TEXT PRIMARY KEY,
-            setting_value TEXT NOT NULL
-        );
+    if (!$db_existed) {
+        $db->exec("
+            CREATE TABLE IF NOT EXISTS system_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS active_workers (
-            worker_id TEXT PRIMARY KEY,
-            hardware TEXT NOT NULL,
-            hashrate TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            total_dps INTEGER NOT NULL DEFAULT 0,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ");
+            CREATE TABLE IF NOT EXISTS active_workers (
+                worker_id TEXT PRIMARY KEY,
+                hardware TEXT NOT NULL,
+                hashrate TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_dps INTEGER NOT NULL DEFAULT 0,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        ");
+
+        if ($is_verify_mode) {
+            $db->exec("CREATE TABLE IF NOT EXISTS tame_traps (
+                dp_x BLOB PRIMARY KEY,
+                total_distance BLOB NOT NULL
+            ) WITHOUT ROWID;");
+        } else {
+            $db->exec("
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
+            ");
+        }
+    }
 
     if ($is_verify_mode) {
-        $db->exec("CREATE TABLE IF NOT EXISTS tame_traps (
-            dp_x BLOB PRIMARY KEY,
-            total_distance BLOB NOT NULL
-        ) WITHOUT ROWID;");
         $active_shard_count = 1;
         $active_shard_mask = 0;
     } else {
-        $db->exec("
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
-        ");
         $stored_shards = find_setting_or_null($db, "shard_count");
         if ($stored_shards === null) {
             $existing_traps_raw = find_setting_or_null($db, "total_tame_traps");
