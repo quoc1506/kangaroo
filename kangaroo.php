@@ -1373,7 +1373,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         $in_tx = true;
                         
                         // TASK 1: Multi-Row Batch INSERT (chunks of 50 items = 100 parameters)
-                        $chunks = array_chunk($group, 500);
+                        $chunks = array_chunk($group, 100);
                         foreach ($chunks as $chunk) {
                             $placeholders = implode(",", array_fill(0, count($chunk), "(?, ?)"));
                             $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . $placeholders . ";");
