@@ -135,26 +135,35 @@ __global__ void _SetKangaroosBatchKernel(const KangarooRespawnItem *items, size_
 #endif
 }
 
+static KangarooRespawnItem *g_d_respawn_buffer = nullptr;
+static size_t g_d_respawn_capacity = 0;
+
 void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count) {
     if (count == 0 || items == nullptr) return;
-    KangarooRespawnItem *d_items = nullptr;
-    size_t bytes = count * sizeof(KangarooRespawnItem);
-    cudaError_t err = cudaMalloc(&d_items, bytes);
-    if (err != cudaSuccess || d_items == nullptr) {
+    if (count > g_d_respawn_capacity) {
+        if (g_d_respawn_buffer) {
+            cudaFree(g_d_respawn_buffer);
+            g_d_respawn_buffer = nullptr;
+            g_d_respawn_capacity = 0;
+        }
+        size_t new_cap = (count < 65536) ? 65536 : count * 2;
+        if (cudaMalloc(&g_d_respawn_buffer, new_cap * sizeof(KangarooRespawnItem)) == cudaSuccess) {
+            g_d_respawn_capacity = new_cap;
+        }
+    }
+    if (g_d_respawn_buffer == nullptr) {
         for (size_t i = 0; i < count; ++i) {
             SetKangaroo(items[i].kIdx, (Int*)&items[i].px, (Int*)&items[i].py, (Int*)&items[i].d);
         }
         return;
     }
-    cudaMemcpy(d_items, items, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_respawn_buffer, items, count * sizeof(KangarooRespawnItem), cudaMemcpyHostToDevice);
     int gSize = KSIZE * GPU_GRP_SIZE;
     int strideSize = nbThreadPerGroup * KSIZE;
     int blockSize = nbThreadPerGroup * gSize;
     int threads = 256;
     int blocks = (int)((count + threads - 1) / threads);
-    _SetKangaroosBatchKernel<<<blocks, threads>>>(d_items, count, inputKangaroo, nbThreadPerGroup, gSize, strideSize, blockSize, wildOffset);
-    cudaDeviceSynchronize();
-    cudaFree(d_items);
+    _SetKangaroosBatchKernel<<<blocks, threads>>>(g_d_respawn_buffer, count, inputKangaroo, nbThreadPerGroup, gSize, strideSize, blockSize, wildOffset);
 }
 '''
 if "SetKangaroosBatch" not in cu:

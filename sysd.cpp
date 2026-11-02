@@ -1088,30 +1088,93 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
 #endif
 
 static std::string ExtractJsonField(const std::string &json, const std::string &field) {
-    std::string key = "\"" + field + "\"";
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos + key.size());
-    if (pos == std::string::npos) return "";
-    pos++;
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
-        pos++;
-    }
-    if (pos >= json.size()) return "";
-    if (json[pos] == '\"') {
-        pos++;
-        size_t end = json.find('\"', pos);
-        if (end == std::string::npos) return "";
-        return json.substr(pos, end - pos);
-    }
-    size_t end = pos;
-    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']' &&
-           json[end] != ' ' && json[end] != '\t' && json[end] != '\r' && json[end] != '\n') {
-        end++;
-    }
-    return json.substr(pos, end - pos);
-}
+    size_t i = 0;
+    const size_t len = json.size();
+    while (i < len) {
+        while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
+' || json[i] == '
+' ||
+                           json[i] == '{' || json[i] == '}' || json[i] == ',' || json[i] == '[' || json[i] == ']')) {
+            i++;
+        }
+        if (i >= len) break;
 
+        if (json[i] == '"') {
+            i++;
+            size_t key_start = i;
+            while (i < len && json[i] != '"') {
+                if (json[i] == '\' && i + 1 < len) i++;
+                i++;
+            }
+            if (i >= len) break;
+            std::string current_key = json.substr(key_start, i - key_start);
+            i++;
+
+            while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
+' || json[i] == '
+')) i++;
+            if (i >= len || json[i] != ':') continue;
+            i++;
+
+            while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
+' || json[i] == '
+')) i++;
+            if (i >= len) break;
+
+            if (current_key == field) {
+                if (json[i] == '"') {
+                    i++;
+                    size_t val_start = i;
+                    while (i < len && json[i] != '"') {
+                        if (json[i] == '\' && i + 1 < len) i++;
+                        i++;
+                    }
+                    return json.substr(val_start, i - val_start);
+                } else {
+                    size_t val_start = i;
+                    while (i < len && json[i] != ',' && json[i] != '}' && json[i] != ']' &&
+                           json[i] != ' ' && json[i] != '   ' && json[i] != '
+' && json[i] != '
+') {
+                        i++;
+                    }
+                    return json.substr(val_start, i - val_start);
+                }
+            } else {
+                if (json[i] == '"') {
+                    i++;
+                    while (i < len && json[i] != '"') {
+                        if (json[i] == '\' && i + 1 < len) i++;
+                        i++;
+                    }
+                    if (i < len) i++;
+                } else if (json[i] == '{' || json[i] == '[') {
+                    char open_char = json[i];
+                    char close_char = (open_char == '{') ? '}' : ']';
+                    int depth = 1;
+                    i++;
+                    bool in_str = false;
+                    while (i < len && depth > 0) {
+                        if (json[i] == '"' && (i == 0 || json[i - 1] != '\')) {
+                            in_str = !in_str;
+                        } else if (!in_str) {
+                            if (json[i] == open_char) depth++;
+                            else if (json[i] == close_char) depth--;
+                        }
+                        i++;
+                    }
+                } else {
+                    while (i < len && json[i] != ',' && json[i] != '}' && json[i] != ']') {
+                        i++;
+                    }
+                }
+            }
+        } else {
+            i++;
+        }
+    }
+    return "";
+}
 static bool SendBatchReliable(
     const std::string &session_url,
     bool is_wild_mode,
