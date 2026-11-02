@@ -1087,14 +1087,19 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
 }
 #endif
 
+static inline bool IsJsonSpace(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static inline bool IsJsonSep(char c) {
+    return IsJsonSpace(c) || c == '{' || c == '}' || c == ',' || c == '[' || c == ']';
+}
+
 static std::string ExtractJsonField(const std::string &json, const std::string &field) {
     size_t i = 0;
     const size_t len = json.size();
     while (i < len) {
-        while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
-' || json[i] == '
-' ||
-                           json[i] == '{' || json[i] == '}' || json[i] == ',' || json[i] == '[' || json[i] == ']')) {
+        while (i < len && IsJsonSep(json[i])) {
             i++;
         }
         if (i >= len) break;
@@ -1103,22 +1108,18 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
             i++;
             size_t key_start = i;
             while (i < len && json[i] != '"') {
-                if (json[i] == '\' && i + 1 < len) i++;
+                if (json[i] == '\\' && i + 1 < len) i++;
                 i++;
             }
             if (i >= len) break;
             std::string current_key = json.substr(key_start, i - key_start);
             i++;
 
-            while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
-' || json[i] == '
-')) i++;
+            while (i < len && IsJsonSpace(json[i])) i++;
             if (i >= len || json[i] != ':') continue;
             i++;
 
-            while (i < len && (json[i] == ' ' || json[i] == '   ' || json[i] == '
-' || json[i] == '
-')) i++;
+            while (i < len && IsJsonSpace(json[i])) i++;
             if (i >= len) break;
 
             if (current_key == field) {
@@ -1126,16 +1127,13 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
                     i++;
                     size_t val_start = i;
                     while (i < len && json[i] != '"') {
-                        if (json[i] == '\' && i + 1 < len) i++;
+                        if (json[i] == '\\' && i + 1 < len) i++;
                         i++;
                     }
                     return json.substr(val_start, i - val_start);
                 } else {
                     size_t val_start = i;
-                    while (i < len && json[i] != ',' && json[i] != '}' && json[i] != ']' &&
-                           json[i] != ' ' && json[i] != '   ' && json[i] != '
-' && json[i] != '
-') {
+                    while (i < len && json[i] != ',' && json[i] != '}' && json[i] != ']' && !IsJsonSpace(json[i])) {
                         i++;
                     }
                     return json.substr(val_start, i - val_start);
@@ -1144,7 +1142,7 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
                 if (json[i] == '"') {
                     i++;
                     while (i < len && json[i] != '"') {
-                        if (json[i] == '\' && i + 1 < len) i++;
+                        if (json[i] == '\\' && i + 1 < len) i++;
                         i++;
                     }
                     if (i < len) i++;
@@ -1155,7 +1153,7 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
                     i++;
                     bool in_str = false;
                     while (i < len && depth > 0) {
-                        if (json[i] == '"' && (i == 0 || json[i - 1] != '\')) {
+                        if (json[i] == '"' && (i == 0 || json[i - 1] != '\\')) {
                             in_str = !in_str;
                         } else if (!in_str) {
                             if (json[i] == open_char) depth++;
