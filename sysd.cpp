@@ -1055,33 +1055,29 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         }
 
         if (!respawn_indices.empty()) {
-            // TASK 4: Batch Precompute all respawn kangaroo states on CPU before PCIe dispatch
-            struct RespawnBatchItem {
-                uint64_t kIdx;
-                Point P;
-                Int base;
-            };
-            std::vector<RespawnBatchItem> batch_items;
+            // TASK 1 (P0): Batch Precompute all respawn kangaroo states and dispatch in single PCIe transfer + GPU scatter
+            std::vector<KangarooRespawnItem> batch_items;
             batch_items.reserve(respawn_indices.size());
             for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
                 uint64_t kIdx = respawn_indices[idx];
-                RespawnBatchItem item;
+                KangarooRespawnItem item;
                 item.kIdx = kIdx;
-                make_kangaroo_state(item.P, item.base, rng_salt);
+                Point P;
+                Int base;
+                make_kangaroo_state(P, base, rng_salt);
+                item.px.Set(&P.x);
+                item.py.Set(&P.y);
+                if (direct_gpu_dist) {
+                    item.d.Set(&base);
+                } else {
+                    item.d.SetInt32(0);
+                }
+                base_dist[kIdx].Set(&base);
+                gpu_dp_count[kIdx] = 0;
                 batch_items.push_back(std::move(item));
             }
-
-            // Batch apply respawn kangaroo states without redundant CPU stall
-            for (size_t idx = 0; idx < batch_items.size(); ++idx) {
-                const auto &item = batch_items[idx];
-                if (direct_gpu_dist) {
-                    gpu->SetKangaroo(item.kIdx, (Int*)&item.P.x, (Int*)&item.P.y, (Int*)&item.base);
-                } else {
-                    gpu->SetKangaroo(item.kIdx, (Int*)&item.P.x, (Int*)&item.P.y, &zero_int);
-                }
-                base_dist[item.kIdx].Set((Int*)&item.base);
-                gpu_dp_count[item.kIdx] = 0;
-            }
+            // 1 single batched call with CUDA scatter kernel replaces thousands of synchronous cudaMemcpy calls!
+            gpu->SetKangaroosBatch(batch_items.data(), batch_items.size());
             respawn_indices.clear();
         }
     }

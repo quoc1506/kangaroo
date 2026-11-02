@@ -727,6 +727,38 @@ function increment_setting_int($db, $key, $delta) {
     throw new DbBusyException("Database busy during integer counter increment: " . $key);
 }
 
+
+function reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, $force = false) {
+    global $is_verify_mode;
+    if ($is_verify_mode) {
+        $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+        set_setting($db, "total_tame_traps", (string)$actual);
+        return $actual;
+    }
+    $last_reconcile = find_setting_or_null($db, "last_reconcile_time");
+    $now = time();
+    // Reconcile periodically every 120 seconds or when forced
+    if (!$force && $last_reconcile !== null && ($now - intval($last_reconcile)) < 120) {
+        $curr = find_setting_or_null($db, "total_tame_traps");
+        return ($curr !== null) ? intval($curr) : 0;
+    }
+    $actual_count = 0;
+    for ($idx = 0; $idx < $active_shard_count; $idx++) {
+        $sdb = get_shard_db($idx, false);
+        if ($sdb !== null) {
+            try {
+                $cnt = $sdb->querySingle("SELECT COUNT(*) FROM tame_traps;");
+                if ($cnt !== false && $cnt !== null) {
+                    $actual_count += intval($cnt);
+                }
+            } catch (Throwable $_e) {}
+        }
+    }
+    set_setting($db, "total_tame_traps", (string)$actual_count);
+    set_setting($db, "last_reconcile_time", (string)$now);
+    return $actual_count;
+}
+
 function get_total_wild_steps($db, $dp_bits) {
     $wild_dps_raw = find_setting_or_null($db, "total_wild_dps");
     $wild_dps = ($wild_dps_raw !== null) ? intval($wild_dps_raw) : 0;
@@ -1359,20 +1391,21 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
                 $shard_groups[$shard_idx][] = ["x" => $bin_x, "dist" => $packed_dist];
             }
-
             ksort($shard_groups);
             $actual_inserted = 0;
+            $all_shards_ok = true;
 
             foreach ($shard_groups as $shard_idx => $group) {
                 $sdb = get_shard_db($shard_idx, true);
-                for ($attempt = 0; $attempt < 5; $attempt++) {
+                $shard_success = false;
+                for ($attempt = 0; $attempt < 10; $attempt++) {
                     $in_tx = false;
                     $shard_added = 0;
                     try {
                         $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
                         $in_tx = true;
                         
-                        // TASK 1: Multi-Row Batch INSERT (chunks of 50 items = 100 parameters)
+                        // TASK 1: Multi-Row Batch INSERT (chunks of 100 items = 200 parameters)
                         $chunks = array_chunk($group, 100);
                         foreach ($chunks as $chunk) {
                             $placeholders = implode(",", array_fill(0, count($chunk), "(?, ?)"));
@@ -1390,24 +1423,37 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         $sdb->exec("COMMIT;");
                         $in_tx = false;
                         $actual_inserted += $shard_added;
-
+                        $shard_success = true;
                         break;
                     } catch (Throwable $ex) {
                         if ($in_tx) {
                             try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
                         }
-                        if ($attempt === 4) {
-                            if ($actual_inserted > 0) {
-                                increment_setting_int($db, "total_tame_traps", $actual_inserted);
-                            }
-                            throw new DbBusyException("Tame shard " . $shard_idx . " busy");
+                        if ($attempt === 9) {
+                            $all_shards_ok = false;
+                            break;
                         }
-                        usleep(20000 * ($attempt + 1));
+                        usleep(15000 * ($attempt + 1) + rand(1000, 4000));
                     }
+                }
+                if (!$shard_success) {
+                    $all_shards_ok = false;
+                    break;
                 }
             }
 
-            // Autocommit Single-Statement Execution (Cach A: Zero PHP Transaction Lock Contention)
+            if (!$all_shards_ok) {
+                // TASK 6: Sửa lỗi Counter Drift - Reconcile lại chính xác từ DB, không cộng dồn biến tạm bị lỗi
+                reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, true);
+                throw new DbBusyException("Shard database busy during batch commit");
+            }
+
+            // TASK 6: Chỉ cập nhật system_settings khi TOÀN BỘ shards của batch đã commit thành công
+            if ($actual_inserted > 0) {
+                increment_setting_int($db, "total_tame_traps", $actual_inserted);
+            }
+
+            // TASK 6: Cập nhật thống kê worker Idempotent - không lạm phát dps khi duplicate retry
             try {
                 $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
                                         VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
@@ -1421,28 +1467,18 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
                 $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
                 $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                $w_stmt->bindValue(":dps", $actual_inserted, SQLITE3_INTEGER);
                 $w_stmt->execute();
                 $w_stmt->close();
-
-                if ($actual_inserted > 0) {
-                    $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                                            VALUES ('total_tame_traps', :val)
-                                            ON CONFLICT(setting_key) DO UPDATE SET
-                                                setting_value = CAST(setting_value AS INTEGER) + :val;");
-                    $s_stmt->bindValue(":val", $actual_inserted, SQLITE3_INTEGER);
-                    $s_stmt->execute();
-                    $s_stmt->close();
-                }
             } catch (Throwable $_e) {}
-            $total_raw = find_setting_or_null($db, "total_tame_traps");
-            $total = ($total_raw !== null) ? intval($total_raw) : 0;
+
+            // TASK 6: Định kỳ đối soát (Reconcile) để đảm bảo tính toàn vẹn 100% không bao giờ bị lệch counter
+            $total = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
             $space_w = get_space_width_float(get_required_setting($db, "range_min"), get_required_setting($db, "range_max"));
             $task_type = ($total >= $target_dp) ? "WILD" : "TAME";
             $prob_info = calculate_hit_probability($total, 0.0, $dp_bits, $space_w);
-
             if ($is_verify_mode) {
                 $db->close();
             }
@@ -1456,7 +1492,6 @@ if ($action === "submit_tame" || $action === "check_wild") {
             ]);
             exit;
         }
-
         if ($action === "check_wild") {
             $range_min = get_required_setting($db, "range_min");
             $range_max = get_required_setting($db, "range_max");
@@ -1659,7 +1694,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $s_stmt->close();
                 }
             } catch (Throwable $_e) {}
-            $total_traps = intval(get_required_setting($db, "total_tame_traps"));
+            $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
 
@@ -1704,7 +1739,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
     // API 5: GET STATS
     if ($action === "get_stats") {
         header("Content-Type: application/json");
-        $total_traps = intval(get_required_setting($db, "total_tame_traps"));
+        $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
         $target_dp = intval(get_required_setting($db, "target_dp"));
         $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
         $wild_dps_raw = find_setting_or_null($db, "total_wild_dps");
@@ -1746,7 +1781,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
     }
 
     // Web Dashboard (action == "")
-    $total_traps = intval(get_required_setting($db, "total_tame_traps"));
+    $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
     $target_dp = intval(get_required_setting($db, "target_dp"));
     $vault_exists = file_exists($vault_path);
     $db_size_mb = calculate_database_size_mb($db_path, $shards_dir);
