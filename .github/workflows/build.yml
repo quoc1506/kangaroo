@@ -88,7 +88,7 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Constants.h .
             sed -i 's/#define NB_RUN 64/#define NB_RUN 2048/g' Constants.h
             sed -i 's/inputKangarooPinned\[t + 10 \* nbThreadPerGroup\]/inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup]/g' GPU/GPUEngine.cu
-            python3 scripts/patch_upstream.py
+            python3 patch_upstream.py
             rm -rf /tmp/upstream_kangaroo
           fi
       - name: Install CUDA Toolkit
