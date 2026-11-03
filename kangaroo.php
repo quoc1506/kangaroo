@@ -1386,6 +1386,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $shard_added = 0;
                     try {
                         $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
+                        $sdb->exec("PRAGMA synchronous = OFF;");
                         $in_tx = true;
                         
                         // TASK 1: Multi-Row Batch INSERT (chunks of 100 items = 200 parameters)
@@ -1541,7 +1542,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $map_by_x = [];
                     foreach ($chunk as $c_idx => $dp_item) {
                         $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
-                        $map_by_x[$dp_item["bin_x"]] = $dp_item["bin_dist"];
+                        $map_by_x[$dp_item["bin_x"]][] = $dp_item["bin_dist"];
                     }
 
                     $sres = null;
@@ -1568,13 +1569,14 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
                     foreach ($matched_rows as $row) {
                         $bin_x = $row["dp_x"];
-                        $bin_dist = $map_by_x[$bin_x];
+                        $wild_dists = isset($map_by_x[$bin_x]) ? $map_by_x[$bin_x] : [];
                         $raw_tame_dist = $row["total_distance"];
                         if (strlen($raw_tame_dist) < 32) {
                             $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
                         }
                         $tame_dist_hex = bin2hex($raw_tame_dist);
-                        $wild_dist_hex = bin2hex($bin_dist);
+                        foreach ($wild_dists as $bin_dist) {
+                            $wild_dist_hex = bin2hex($bin_dist);
                         $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
 
                         if (!$cands["is_verified"]) {
@@ -1649,6 +1651,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                             "stop" => true
                         ]);
                         exit;
+                        }
                     }
                 }
 
