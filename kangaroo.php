@@ -620,6 +620,23 @@ function get_shard_db($shard_byte, $create_if_missing = true) {
 }
 
 function find_setting_or_null($db, $key) {
+    if (isset($GLOBALS["SYSTEM_SETTINGS_CACHE"][$key])) {
+        return $GLOBALS["SYSTEM_SETTINGS_CACHE"][$key];
+    }
+    if (empty($GLOBALS["SYSTEM_SETTINGS_CACHE"])) {
+        try {
+            $q = @$db->query("SELECT setting_key, setting_value FROM system_settings;");
+            if ($q) {
+                while ($r = $q->fetchArray(SQLITE3_ASSOC)) {
+                    $GLOBALS["SYSTEM_SETTINGS_CACHE"][$r["setting_key"]] = (string)$r["setting_value"];
+                }
+                $q->finalize();
+                if (isset($GLOBALS["SYSTEM_SETTINGS_CACHE"][$key])) {
+                    return $GLOBALS["SYSTEM_SETTINGS_CACHE"][$key];
+                }
+            }
+        } catch (Throwable $_e) {}
+    }
     for ($attempt = 0; $attempt < 5; $attempt++) {
         $stmt = null;
         try {
@@ -660,6 +677,7 @@ function set_setting($db, $key, $value) {
             $stmt->bindValue(":v", (string)$value, SQLITE3_TEXT);
             $stmt->execute();
             $stmt->close();
+            $GLOBALS["SYSTEM_SETTINGS_CACHE"][$key] = (string)$value;
             return;
         } catch (Throwable $ex) {
             if ($stmt) {
@@ -707,6 +725,7 @@ function increment_setting_int($db, $key, $delta) {
             if ($row === false) {
                 throw new RuntimeException("Counter missing after atomic update: " . $key);
             }
+            $GLOBALS["SYSTEM_SETTINGS_CACHE"][$key] = (string)$row["setting_value"];
             return intval($row["setting_value"]);
         } catch (Throwable $ex) {
             if ($stmt) {
@@ -800,7 +819,7 @@ function parse_incoming_dp_payload() {
     }
     $pos += 4;
     $count = $cnt_hdr["count"];
-    if ($count > 10000 || ($pos + ($count * 64)) > $len) {
+    if ($count > 50000 || ($pos + ($count * 64)) > $len) {
         return null;
     }
 
@@ -1299,6 +1318,14 @@ try {
         $tame_count = intval(get_required_setting($db, "total_tame_traps"));
         $target_dp = intval(get_required_setting($db, "target_dp"));
         $batch_lim = intval(get_required_setting($db, "batch_limit"));
+        // Adaptive hardware scaling: allocate larger batch buffer (5,000 DPs) for high-throughput GPU workers
+        if (isset($_GET["worker_id"])) {
+            $check_wid = SQLite3::escapeString((string)$_GET["worker_id"]);
+            $hw_val = @$db->querySingle("SELECT hardware FROM active_workers WHERE worker_id = '" . $check_wid . "' LIMIT 1;");
+            if ($hw_val && stripos((string)$hw_val, "gpu") !== false) {
+                $batch_lim = max($batch_lim, 5000);
+            }
+        }
         $hb_base = intval(get_required_setting($db, "heartbeat_sec"));
         $r_min = get_required_setting($db, "range_min");
         $r_max = get_required_setting($db, "range_max");
@@ -1503,20 +1530,6 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
 
                 $in_read_tx = false;
-                if (!$is_verify_mode) {
-                    for ($tx_att = 0; $tx_att < 5; $tx_att++) {
-                        try {
-                            $sdb->exec("BEGIN DEFERRED TRANSACTION;");
-                            $in_read_tx = true;
-                            break;
-                        } catch (Throwable $ex) {
-                            if ($tx_att === 4) {
-                                throw new DbBusyException("Wild read snapshot busy on shard " . $shard_idx);
-                            }
-                            usleep(15000 * ($tx_att + 1));
-                        }
-                    }
-                }
 
                 $chunks = array_chunk($group, 100);
                 foreach ($chunks as $chunk) {

@@ -52,7 +52,7 @@ typedef struct {
     if "if(d_respawn_buffer) cudaFree(d_respawn_buffer);" not in cu:
         cu = cu.replace(
             "  if(jumpPinned) cudaFreeHost(jumpPinned);",
-            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) free(h_gpu_items);"
+            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_gpu_items);"
         )
 
     old_launch_pattern = '''    // Use cudaMemcpyAsync to avoid default spin wait of cudaMemcpy wich takes 100% CPU
@@ -124,14 +124,13 @@ void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count
             this->d_respawn_buffer = nullptr;
         }
         if (this->h_gpu_items) {
-            free(this->h_gpu_items);
+            cudaFreeHost(this->h_gpu_items);
             this->h_gpu_items = nullptr;
         }
         this->d_respawn_capacity = 0;
         size_t new_cap = (count < 65536) ? 65536 : count * 2;
         if (cudaMalloc(&this->d_respawn_buffer, new_cap * sizeof(KangarooGpuItem)) == cudaSuccess) {
-            this->h_gpu_items = (KangarooGpuItem*)malloc(new_cap * sizeof(KangarooGpuItem));
-            if (this->h_gpu_items) {
+            if (cudaHostAlloc((void**)&this->h_gpu_items, new_cap * sizeof(KangarooGpuItem), cudaHostAllocDefault) == cudaSuccess) {
                 this->d_respawn_capacity = new_cap;
             } else {
                 cudaFree(this->d_respawn_buffer);
