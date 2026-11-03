@@ -728,19 +728,19 @@ function increment_setting_int($db, $key, $delta) {
 }
 
 
-function reconcile_total_tame_traps(, , ,  = false) {
-    global ;
-    if () {
-         = intval(->querySingle("SELECT COUNT(*) FROM tame_traps;"));
-        set_setting(, "total_tame_traps", (string));
-        return ;
+function reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, $force = false) {
+    global $is_verify_mode;
+    if ($is_verify_mode) {
+        $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+        set_setting($db, "total_tame_traps", (string)$actual);
+        return $actual;
     }
-
     // Task 2: High-performance monotonic counter directly from master system_settings
     // Eliminates disk-freezing SELECT COUNT(*) B-Tree scans across 32 shards
-     = find_setting_or_null(, "total_tame_traps");
-    return ( !== null) ? intval() : 0;
+    $curr = find_setting_or_null($db, "total_tame_traps");
+    return ($curr !== null) ? intval($curr) : 0;
 }
+
 
 function get_total_wild_steps($db, $dp_bits) {
     $wild_dps_raw = find_setting_or_null($db, "total_wild_dps");
@@ -1438,15 +1438,15 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             // Task 4: Giảm tranh chấp khóa ghi - Throttle cập nhật active_workers (chỉ ghi khi heartbeat rỗng hoặc sau mỗi 30s)
             try {
-                 = ( === 0);
-                if (!) {
-                     = ->querySingle("SELECT strftime('%s', 'now') - strftime('%s', last_seen) FROM active_workers WHERE worker_id = '" . SQLite3::escapeString() . "';");
-                    if ( === false ||  === null || intval() >= 30) {
-                         = true;
+                $need_update = ($actual_inserted === 0);
+                if (!$need_update) {
+                    $diff = $db->querySingle("SELECT strftime('%s', 'now') - strftime('%s', last_seen) FROM active_workers WHERE worker_id = '" . SQLite3::escapeString($worker_id) . "';");
+                    if ($diff === false || $diff === null || intval($diff) >= 30) {
+                        $need_update = true;
                     }
                 }
-                if () {
-                     = ->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                if ($need_update) {
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
                                             VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
                                             ON CONFLICT(worker_id) DO UPDATE SET
                                                 hardware = :hw,
@@ -1454,15 +1454,15 @@ if ($action === "submit_tame" || $action === "check_wild") {
                                                 mode = :mode,
                                                 total_dps = total_dps + :dps,
                                                 last_seen = CURRENT_TIMESTAMP;");
-                    ->bindValue(":wid", , SQLITE3_TEXT);
-                    ->bindValue(":hw", , SQLITE3_TEXT);
-                    ->bindValue(":hr", , SQLITE3_TEXT);
-                    ->bindValue(":mode", , SQLITE3_TEXT);
-                    ->bindValue(":dps", , SQLITE3_INTEGER);
-                    ->execute();
-                    ->close();
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $actual_inserted, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
                 }
-            } catch (Throwable ) {}
+            } catch (Throwable $_e) {}
 
             // TASK 6: Định kỳ đối soát (Reconcile) để đảm bảo tính toàn vẹn 100% không bao giờ bị lệch counter
             $total = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
@@ -1660,15 +1660,15 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             // Task 4: Giảm tranh chấp khóa ghi - Throttle cập nhật active_workers (chỉ ghi khi heartbeat rỗng hoặc sau mỗi 30s)
             try {
-                 = ( === 0);
-                if (!) {
-                     = ->querySingle("SELECT strftime('%s', 'now') - strftime('%s', last_seen) FROM active_workers WHERE worker_id = '" . SQLite3::escapeString() . "';");
-                    if ( === false ||  === null || intval() >= 30) {
-                         = true;
+                $need_update = ($batch_size === 0);
+                if (!$need_update) {
+                    $diff = $db->querySingle("SELECT strftime('%s', 'now') - strftime('%s', last_seen) FROM active_workers WHERE worker_id = '" . SQLite3::escapeString($worker_id) . "';");
+                    if ($diff === false || $diff === null || intval($diff) >= 30) {
+                        $need_update = true;
                     }
                 }
-                if () {
-                     = ->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                if ($need_update) {
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
                                             VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
                                             ON CONFLICT(worker_id) DO UPDATE SET
                                                 hardware = :hw,
@@ -1676,26 +1676,25 @@ if ($action === "submit_tame" || $action === "check_wild") {
                                                 mode = :mode,
                                                 total_dps = total_dps + :dps,
                                                 last_seen = CURRENT_TIMESTAMP;");
-                    ->bindValue(":wid", , SQLITE3_TEXT);
-                    ->bindValue(":hw", , SQLITE3_TEXT);
-                    ->bindValue(":hr", , SQLITE3_TEXT);
-                    ->bindValue(":mode", , SQLITE3_TEXT);
-                    ->bindValue(":dps", , SQLITE3_INTEGER);
-                    ->execute();
-                    ->close();
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
                 }
-
-                if ( > 0) {
-                     = ->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                if ($batch_size > 0) {
+                    $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
                                             VALUES ('total_wild_dps', :val)
                                             ON CONFLICT(setting_key) DO UPDATE SET
                                                 setting_value = CAST(setting_value AS INTEGER) + :val;");
-                    ->bindValue(":val", , SQLITE3_INTEGER);
-                    ->execute();
-                    ->close();
+                    $s_stmt->bindValue(":val", $batch_size, SQLITE3_INTEGER);
+                    $s_stmt->execute();
+                    $s_stmt->close();
                 }
-            } catch (Throwable ) {}
-             = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
+            } catch (Throwable $_e) {}
+            $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
 
