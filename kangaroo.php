@@ -1687,13 +1687,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $w_stmt->close();
                 }
                 if ($batch_size > 0) {
-                    $s_stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                                            VALUES ('total_wild_dps', :val)
-                                            ON CONFLICT(setting_key) DO UPDATE SET
-                                                setting_value = CAST(setting_value AS INTEGER) + :val;");
-                    $s_stmt->bindValue(":val", $batch_size, SQLITE3_INTEGER);
-                    $s_stmt->execute();
-                    $s_stmt->close();
+                    increment_setting_int($db, "total_wild_dps", $batch_size);
                 }
             } catch (Throwable $_e) {}
             $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);

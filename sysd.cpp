@@ -1468,7 +1468,7 @@ static int RunKangarooSession(
     uint64_t last_steps = g_state.total_steps.load();
     double cached_hashrate_mhs = 0.0;
     int verify_batches_sent = 0;
-    const int poll_ms = is_verify ? 2 : 250;
+    const int poll_ms = is_verify ? 2 : 30;
 
     auto format_hashrate = [&](double mhs) -> std::string {
         std::ostringstream hr_ss;
