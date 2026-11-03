@@ -1386,7 +1386,6 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $shard_added = 0;
                     try {
                         $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
-                        $sdb->exec("PRAGMA synchronous = OFF;");
                         $in_tx = true;
                         
                         // TASK 1: Multi-Row Batch INSERT (chunks of 100 items = 200 parameters)
