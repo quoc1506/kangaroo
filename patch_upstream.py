@@ -251,6 +251,12 @@ typedef struct {
             "  initialised = false;\n  d_respawn_buffer = NULL;\n  h_gpu_items = NULL;\n  d_respawn_capacity = 0;\n  evt_sync = NULL;\n  cudaEventCreateWithFlags(&evt_sync, cudaEventDisableTiming);"
         )
 
+    if "inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup]" not in cu:
+        cu = cu.replace(
+            "inputKangarooPinned[t + 10 * nbThreadPerGroup] = (uint64_t)NB_JUMP;",
+            "inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = (uint64_t)NB_JUMP;"
+        )
+
     if "if(d_respawn_buffer) cudaFree(d_respawn_buffer);" not in cu:
         cu = cu.replace(
             "  if(jumpPinned) cudaFreeHost(jumpPinned);",
@@ -374,8 +380,19 @@ void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count
     with open("GPU/GPUEngine.cu", "w") as f:
         f.write(cu)
 
+def patch_constants():
+    if not os.path.exists("Constants.h"):
+        return
+    with open("Constants.h", "r") as f:
+        c = f.read()
+    if "#define NB_RUN 64" in c:
+        c = c.replace("#define NB_RUN 64", "#define NB_RUN 2048")
+        with open("Constants.h", "w") as f:
+            f.write(c)
+
 if __name__ == "__main__":
     patch_timer()
+    patch_constants()
     patch_secpk1_compat()
     patch_secpk1_int()
     patch_gpu_engine()

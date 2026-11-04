@@ -87,11 +87,9 @@ jobs:
             cp -rf /tmp/upstream_kangaroo/GPU .
             cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
             cp -f /tmp/upstream_kangaroo/Constants.h .
-            sed -i 's/#define NB_RUN 64/#define NB_RUN 2048/g' Constants.h
-            sed -i 's/inputKangarooPinned\[t + 10 \* nbThreadPerGroup\]/inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup]/g' GPU/GPUEngine.cu
-            python3 patch_upstream.py
             rm -rf /tmp/upstream_kangaroo
           fi
+          python3 patch_upstream.py
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
