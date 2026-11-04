@@ -445,10 +445,11 @@ static std::vector<uint8_t> BuildDpkgPacket(
 static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
     if (local_recs.empty()) return;
     std::unique_lock<std::mutex> lock(g_state.queue_mutex);
-    g_state.cv_not_full.wait(lock, [&]() {
-        return g_state.dp_queue.size() < g_state.max_queue_dps.load() || !g_state.worker_active.load();
-    });
-    if (!g_state.worker_active.load()) return;
+    if (g_state.worker_active.load()) {
+        g_state.cv_not_full.wait(lock, [&]() {
+            return g_state.dp_queue.size() < g_state.max_queue_dps.load() || !g_state.worker_active.load();
+        });
+    }
     for (auto &rec : local_recs) {
         g_state.dp_queue.push_back(std::move(rec));
     }
@@ -1479,9 +1480,21 @@ static int RunKangarooSession(
     int exit_rc = 0;
 
     while (g_state.running.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
         auto now = std::chrono::steady_clock::now();
         double since_send = std::chrono::duration<double>(now - last_send_time).count();
+        double wait_sec = std::max(0.001, heartbeat_sec - since_send);
+        auto wait_duration = std::chrono::milliseconds(is_verify ? 2 : (int)(wait_sec * 1000.0));
+
+        {
+            std::unique_lock<std::mutex> lock(g_state.queue_mutex);
+            g_state.cv_not_empty.wait_for(lock, wait_duration, [&]() {
+                return g_state.dp_queue.size() >= batch_limit || !g_state.running.load();
+            });
+        }
+        if (!g_state.running.load()) break;
+
+        now = std::chrono::steady_clock::now();
+        since_send = std::chrono::duration<double>(now - last_send_time).count();
 
         size_t queued_count = 0;
         {
