@@ -831,23 +831,30 @@ function query_active_workers($db) {
     $now_ts = time();
     for ($attempt = 0; $attempt < 5; $attempt++) {
         $res = null;
+        $act_res = null;
         try {
             $workers_list = [];
             $total_hashrate_mhs = 0.0;
             $online_count = 0;
+
+            // Compute true total hashrate & online count across ALL active workers (unlimited by LIMIT 50)
+            $act_res = $db->query("SELECT hashrate, last_seen FROM active_workers WHERE last_seen >= datetime('now', '-120 seconds');");
+            while ($act = $act_res->fetchArray(SQLITE3_ASSOC)) {
+                $online_count++;
+                if (preg_match("/([\d\.]+)/", $act["hashrate"], $m)) {
+                    $total_hashrate_mhs += floatval($m[1]);
+                }
+            }
+            $act_res->finalize();
+            $act_res = null;
+
+            // Retrieve latest 50 workers for UI dashboard view
             $res = $db->query("SELECT * FROM active_workers ORDER BY last_seen DESC LIMIT 50;");
             while ($w = $res->fetchArray(SQLITE3_ASSOC)) {
                 $last_ts = strtotime($w["last_seen"] . " UTC");
                 $diff_sec = max(0, $now_ts - $last_ts);
-                $is_online = ($diff_sec <= 120);
-                $w["is_online"] = $is_online;
+                $w["is_online"] = ($diff_sec <= 120);
                 $w["diff_sec"] = $diff_sec;
-                if ($is_online) {
-                    $online_count++;
-                    if (preg_match("/([\d\.]+)/", $w["hashrate"], $m)) {
-                        $total_hashrate_mhs += floatval($m[1]);
-                    }
-                }
                 $workers_list[] = $w;
             }
             $res->finalize();

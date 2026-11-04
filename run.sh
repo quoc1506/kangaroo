@@ -36,7 +36,7 @@ elif [ "$OS" = "Linux" ]; then
             echo "[-] Fatal: Native ARM64 binary missing: $DIR/bin/sysd_linux_cpu_arm64" >&2
             exit 1
         fi
-    elif grep -q "avx512f" /proc/cpuinfo && grep -q "avx512dq" /proc/cpuinfo && grep -q "avx512bw" /proc/cpuinfo && grep -q "avx512vl" /proc/cpuinfo; then
+    elif [ -f /proc/cpuinfo ] && grep -q "avx512f" /proc/cpuinfo && grep -q "avx512dq" /proc/cpuinfo && grep -q "avx512bw" /proc/cpuinfo && grep -q "avx512vl" /proc/cpuinfo; then
         BIN="$DIR/bin/sysd_linux_cpu_avx512"
     else
         BIN="$DIR/bin/sysd_linux_cpu_x86_64"
