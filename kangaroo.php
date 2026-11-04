@@ -1357,9 +1357,9 @@ try {
     }
 
 if ($action === "submit_tame" || $action === "check_wild") {
-            $range_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-            $range_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-            $target_pubkey = $is_verify_mode ? get_required_setting($db, "target_pubkey") : PUZZLE140_TARGET_PUBKEY;
+        header("Content-Type: application/json");
+
+        $already_solved = $is_verify_mode
             ? (find_setting_or_null($db, "verify_solved") === "1")
             : file_exists($vault_path);
         if ($already_solved) {
@@ -1386,9 +1386,9 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $dp_list = $payload["dp_list"];
         $batch_size = count($dp_list);
         $current_mode = ($action === "check_wild") ? "WILD" : "TAME";
-            $range_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-            $range_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-            $target_pubkey = $is_verify_mode ? get_required_setting($db, "target_pubkey") : PUZZLE140_TARGET_PUBKEY;
+
+        // Note: Worker registry and counters are updated atomically in master transaction at end of request
+
         if ($action === "submit_tame") {
             $shard_groups = [];
             foreach ($dp_list as $dp) {
@@ -1463,16 +1463,16 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 increment_setting_int($db, "total_tame_traps", $actual_inserted);
             }
 
-            // Cap nhat active_workers truc tiep moi request de bao toan 100% diem
+            // Cập nhật active_workers tức thì (không throttle 30s) để bảo toàn 100% điểm đóng góp
             try {
-                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)\n" .
-                                        "VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)\n" .
-                                        "ON CONFLICT(worker_id) DO UPDATE SET\n" .
-                                            "hardware = :hw,\n" .
-                                            "hashrate = :hr,\n" .
-                                            "mode = :mode,\n" .
-                                            "total_dps = total_dps + :dps,\n" .
-                                            "last_seen = CURRENT_TIMESTAMP;");
+                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                        VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                        ON CONFLICT(worker_id) DO UPDATE SET
+                                            hardware = :hw,
+                                            hashrate = :hr,
+                                            mode = :mode,
+                                            total_dps = total_dps + :dps,
+                                            last_seen = CURRENT_TIMESTAMP;");
                 $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
                 $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
                 $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
@@ -1482,6 +1482,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $w_stmt->close();
             } catch (Throwable $_e) {}
 
+            // TASK 6: Định kỳ đối soát (Reconcile) để đảm bảo tính toàn vẹn 100% không bao giờ bị lệch counter
             $total = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
@@ -1679,16 +1680,16 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             }
 
-            // Cap nhat active_workers truc tiep moi request de bao toan 100% diem
+            // Cập nhật active_workers tức thì (không throttle 30s) để bảo toàn 100% điểm đóng góp
             try {
-                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)\n" .
-                                        "VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)\n" .
-                                        "ON CONFLICT(worker_id) DO UPDATE SET\n" .
-                                            "hardware = :hw,\n" .
-                                            "hashrate = :hr,\n" .
-                                            "mode = :mode,\n" .
-                                            "total_dps = total_dps + :dps,\n" .
-                                            "last_seen = CURRENT_TIMESTAMP;");
+                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                        VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                        ON CONFLICT(worker_id) DO UPDATE SET
+                                            hardware = :hw,
+                                            hashrate = :hr,
+                                            mode = :mode,
+                                            total_dps = total_dps + :dps,
+                                            last_seen = CURRENT_TIMESTAMP;");
                 $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
                 $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
                 $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
@@ -1700,13 +1701,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     increment_setting_int($db, "total_wild_dps", $batch_size);
                 }
             } catch (Throwable $_e) {}
-
             $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
-            $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
-            $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-            $r_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-            $space_w = get_space_width_float($r_min, $r_max);
+            $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
+
             if ($is_verify_mode) {
                 $db->close();
             }
@@ -1750,7 +1748,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
         header("Content-Type: application/json");
         $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
         $target_dp = intval(get_required_setting($db, "target_dp"));
-        $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
+        $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
         $wild_dps_raw = find_setting_or_null($db, "total_wild_dps");
         $total_wild_dps = ($wild_dps_raw !== null) ? intval($wild_dps_raw) : 0;
         $wild_steps = get_total_wild_steps($db, $dp_bits);
@@ -1796,11 +1794,11 @@ if ($action === "submit_tame" || $action === "check_wild") {
     $target_dp = intval(get_required_setting($db, "target_dp"));
     $vault_exists = file_exists($vault_path);
     $db_size_mb = calculate_database_size_mb($db_path, $shards_dir);
-    $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
+    $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
     $wild_steps = get_total_wild_steps($db, $dp_bits);
-        $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-        $r_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-        $space_w = get_space_width_float($r_min, $r_max);
+    $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
+    $r_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
+    $space_w = get_space_width_float($r_min, $r_max);
     $prob_info = calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w);
     list($workers, $active_workers_count, $total_hashrate_mhs) = query_active_workers($db);
     $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2));
