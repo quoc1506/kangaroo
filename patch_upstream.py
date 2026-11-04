@@ -1,14 +1,90 @@
 #!/usr/bin/env python3
 """Patch JeanLucPons/Kangaroo for:
-1. Portable ARM64 (Linux aarch64 & macOS Apple Silicon) support in SECPK1/Int.h:
-   Eliminates invalid '=d'/'=a' asm constraints & x86-only builtins via GCC/Clang 128-bit arithmetic.
-2. Multi-GPU safe batched kangaroo respawning (per-instance VRAM buffers, eliminates global static collisions).
-3. Asynchronous decoupling (Launch() separates kernel finish & result retrieval from callKernel()).
-4. Elimination of OS sleep jitter via persistent cudaEvent_t and hybrid polling.
+1. Portable ARM64 (macOS Apple Silicon Xcode & Linux aarch64) in SECPK1/Int.h:
+   - Eliminates invalid '=d'/'=a' asm constraints via GCC/Clang unsigned __int128 arithmetic.
+   - Portable carry/borrow routines and ARM64 cntvct_el0 virtual cycle counter.
+2. Apple Silicon & Clang compatibility in SECPK1/Int.cpp & SECPK1/IntMod.cpp:
+   - Guards x86-only emmintrin.h header from triggering Xcode Clang error.
+   - Implements ARM64 drop-in replacement for the 3 SSE instructions used in DivStep62.
+3. Modern C++ (GCC 13/14 & Xcode Clang 15+) in Timer.h & Timer.cpp:
+   - Injects #include <stdint.h> to resolve missing uint32_t definitions.
+4. Multi-GPU safe batched kangaroo respawning in GPU/GPUEngine.h & GPU/GPUEngine.cu:
+   - Multi-GPU instance VRAM buffers, eliminates global static collisions.
+   - Hybrid spin-yield polling, eliminates OS 1-4ms sleep jitter.
+   - Asynchronous decoupled callKernel().
 """
 import os
 import re
 import sys
+
+def patch_timer():
+    for fpath in ["Timer.h", "Timer.cpp"]:
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath, "r") as f:
+            c = f.read()
+        if "<stdint.h>" not in c and "<cstdint>" not in c:
+            c = "#include <stdint.h>\n" + c
+            with open(fpath, "w") as f:
+                f.write(c)
+            print(f"[+] Patched {fpath} with #include <stdint.h> (GCC 13+/Xcode Clang uint32_t fix)")
+
+def patch_secpk1_compat():
+    # 1. Patch SECPK1/Int.cpp (guard x86-only emmintrin.h)
+    target_int = "SECPK1/Int.cpp"
+    if os.path.exists(target_int):
+        with open(target_int, "r") as f:
+            c = f.read()
+        if "#include <emmintrin.h>" in c and "defined(__x86_64__)" not in c:
+            c = c.replace(
+                "#include <emmintrin.h>",
+                "#if defined(__x86_64__) || defined(_M_X64)\n#include <emmintrin.h>\n#endif"
+            )
+            with open(target_int, "w") as f:
+                f.write(c)
+            print("[+] Patched SECPK1/Int.cpp (guard x86-only emmintrin.h)")
+
+    # 2. Patch SECPK1/IntMod.cpp (ARM64 SSE emulation for DivStep62)
+    target_mod = "SECPK1/IntMod.cpp"
+    if os.path.exists(target_mod):
+        with open(target_mod, "r") as f:
+            c = f.read()
+        if "#include <emmintrin.h>" in c and "ARM64 drop-in replacement" not in c:
+            replacement = '''#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#else
+#include <stdint.h>
+// ARM64 / Non-x86 drop-in replacement for SSE intrinsics used in DivStep62
+typedef struct {
+  int64_t m128i_i64[2];
+  uint64_t m128i_u64[2];
+} __m128i;
+
+static inline __m128i _mm_slli_epi64(__m128i a, int count) {
+  __m128i r;
+  r.m128i_u64[0] = a.m128i_u64[0] << count;
+  r.m128i_u64[1] = a.m128i_u64[1] << count;
+  return r;
+}
+
+static inline __m128i _mm_add_epi64(__m128i a, __m128i b) {
+  __m128i r;
+  r.m128i_u64[0] = a.m128i_u64[0] + b.m128i_u64[0];
+  r.m128i_u64[1] = a.m128i_u64[1] + b.m128i_u64[1];
+  return r;
+}
+
+static inline __m128i _mm_sub_epi64(__m128i a, __m128i b) {
+  __m128i r;
+  r.m128i_u64[0] = a.m128i_u64[0] - b.m128i_u64[0];
+  r.m128i_u64[1] = a.m128i_u64[1] - b.m128i_u64[1];
+  return r;
+}
+#endif'''
+            c = c.replace("#include <emmintrin.h>", replacement)
+            with open(target_mod, "w") as f:
+                f.write(c)
+            print("[+] Patched SECPK1/IntMod.cpp (ARM64 DivStep62 SSE compatibility)")
 
 def patch_secpk1_int():
     target = "SECPK1/Int.h"
@@ -221,7 +297,7 @@ typedef struct {
     if "if(d_respawn_buffer) cudaFree(d_respawn_buffer);" not in cu:
         cu = cu.replace(
             "  if(jumpPinned) cudaFreeHost(jumpPinned);",
-            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_gpu_items);"
+            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_hpu_items);" if "h_hpu_items" in cu else "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_gpu_items);"
         )
 
     old_launch_pattern = '''    // Use cudaMemcpyAsync to avoid default spin wait of cudaMemcpy wich takes 100% CPU
@@ -345,5 +421,7 @@ void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count
     print("[+] Patched GPU/GPUEngine.cu (Multi-GPU instance buffers & scatter kernel)")
 
 if __name__ == "__main__":
+    patch_timer()
+    patch_secpk1_compat()
     patch_secpk1_int()
     patch_gpu_engine()
