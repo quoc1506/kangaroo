@@ -738,35 +738,21 @@ function increment_setting_int($db, $key, $delta) {
 }
 
 
-function reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, $force = false) {
-    global $is_verify_mode;
-    if ($is_verify_mode) {
+function reconcile_total_tame_traps($db, $shards_dir = "", $active_shard_count = 1, $force = false) {
+    if ($force) {
         $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
         set_setting($db, "total_tame_traps", (string)$actual);
         return $actual;
     }
-    if ($force) {
-        $actual_total = 0;
-        for ($s = 0; $s < $active_shard_count; $s++) {
-            $hex = str_pad(dechex($s), 2, "0", STR_PAD_LEFT);
-            $path = $shards_dir . "/traps_" . $hex . ".db";
-            if (is_file($path) && filesize($path) > 0) {
-                try {
-                    $sdb = new SQLite3($path);
-                    $c = $sdb->querySingle("SELECT COUNT(*) FROM tame_traps;");
-                    if ($c !== false && $c !== null) {
-                        $actual_total += intval($c);
-                    }
-                    $sdb->close();
-                } catch (Throwable $_e) {}
-            }
-        }
-        set_setting($db, "total_tame_traps", (string)$actual_total);
-        return $actual_total;
-    }
     $curr = find_setting_or_null($db, "total_tame_traps");
-    return ($curr !== null) ? intval($curr) : 0;
+    if ($curr === null) {
+        $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
+        set_setting($db, "total_tame_traps", (string)$actual);
+        return $actual;
+    }
+    return intval($curr);
 }
+
 
 
 function get_total_wild_steps($db, $dp_bits) {
@@ -1206,68 +1192,53 @@ try {
     }
     $db->exec("PRAGMA journal_mode = WAL;");
     $db->exec("PRAGMA synchronous = NORMAL;");
-    $db->exec("PRAGMA wal_autocheckpoint = 1000;");
-    $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-131072") . ";");
-    $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "536870912") . ";");
+    $db->exec("PRAGMA journal_mode = WAL;");
+    $db->exec("PRAGMA synchronous = NORMAL;");
+    $db->exec("PRAGMA wal_autocheckpoint = 2000;");
+    $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
+    $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "1073741824") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
-    if (!$db_existed) {
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS system_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS active_workers (
+            worker_id TEXT PRIMARY KEY,
+            hardware TEXT NOT NULL,
+            hashrate TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            total_dps INTEGER NOT NULL DEFAULT 0,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workers_last_seen ON active_workers(last_seen DESC);
+
+        CREATE TABLE IF NOT EXISTS tame_traps (
+            dp_x BLOB PRIMARY KEY,
+            total_distance BLOB NOT NULL
+        ) WITHOUT ROWID;
+    ");
+
+    if (!$db_existed && !$is_verify_mode) {
         $db->exec("
-            CREATE TABLE IF NOT EXISTS system_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS active_workers (
-                worker_id TEXT PRIMARY KEY,
-                hardware TEXT NOT NULL,
-                hashrate TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                total_dps INTEGER NOT NULL DEFAULT 0,
-                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '27');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
         ");
-
-        if ($is_verify_mode) {
-            $db->exec("CREATE TABLE IF NOT EXISTS tame_traps (
-                dp_x BLOB PRIMARY KEY,
-                total_distance BLOB NOT NULL
-            ) WITHOUT ROWID;");
-        } else {
-            $db->exec("
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '50000000');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '27');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
-            ");
-        }
     }
 
-    if ($is_verify_mode) {
-        $active_shard_count = 1;
-        $active_shard_mask = 0;
-    } else {
-        $stored_shards = find_setting_or_null($db, "shard_count");
-        if ($stored_shards === null) {
-            $existing_traps_raw = find_setting_or_null($db, "total_tame_traps");
-            $existing_traps = ($existing_traps_raw !== null) ? intval($existing_traps_raw) : 0;
-            $legacy_high = ($existing_traps > 0) ? glob($shards_dir . "/traps_[2-9a-f][0-9a-f].db") : [];
-            $active_shard_count = (!empty($legacy_high)) ? 256 : DEFAULT_SHARD_COUNT;
-            set_setting($db, "shard_count", (string)$active_shard_count);
-        } else {
-            $parsed_sc = intval($stored_shards);
-            if ($parsed_sc !== 32 && $parsed_sc !== 256) {
-                throw new RuntimeException("Unsupported shard_count setting: " . $stored_shards);
-            }
-            $active_shard_count = $parsed_sc;
-        }
-        $active_shard_mask = $active_shard_count - 1;
-    }
+    $active_shard_count = 1;
+    $active_shard_mask = 0;
+
 
     if ($action === "verify" && isset($_GET["init_id"])) {
         header("Content-Type: application/json");
@@ -1330,7 +1301,7 @@ try {
         $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
         $r_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
         $t_pub = $is_verify_mode ? get_required_setting($db, "target_pubkey") : PUZZLE140_TARGET_PUBKEY;
-        $dp_b = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_BITS;
+        $dp_b = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
         $is_solved = $is_verify_mode
             ? (find_setting_or_null($db, "verify_solved") === "1")
             : file_exists($vault_path);
@@ -1390,100 +1361,79 @@ if ($action === "submit_tame" || $action === "check_wild") {
         // Note: Worker registry and counters are updated atomically in master transaction at end of request
 
         if ($action === "submit_tame") {
-            $shard_groups = [];
+            $items_to_insert = [];
             foreach ($dp_list as $dp) {
                 $bin_x = $dp["bin_x"];
                 $bin_dist = $dp["bin_dist"];
-                $shard_idx = ord($bin_x[31]) & $active_shard_mask;
                 $packed_dist = ltrim($bin_dist, "\0");
                 if ($packed_dist === "") {
                     $packed_dist = "\0";
                 }
-                $shard_groups[$shard_idx][] = ["x" => $bin_x, "dist" => $packed_dist];
+                $items_to_insert[] = ["x" => $bin_x, "dist" => $packed_dist];
             }
-            ksort($shard_groups);
+
             $actual_inserted = 0;
-            $all_shards_ok = true;
+            for ($attempt = 0; $attempt < 10; $attempt++) {
+                $in_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_tx = true;
 
-            foreach ($shard_groups as $shard_idx => $group) {
-                $sdb = get_shard_db($shard_idx, true);
-                $shard_success = false;
-                for ($attempt = 0; $attempt < 10; $attempt++) {
-                    $in_tx = false;
-                    $shard_added = 0;
-                    try {
-                        $sdb->exec("BEGIN IMMEDIATE TRANSACTION;");
-                        $in_tx = true;
-                        
-                        // TASK 1: Multi-Row Batch INSERT (chunks of 100 items = 200 parameters)
-                        $chunks = array_chunk($group, 100);
-                        foreach ($chunks as $chunk) {
-                            $placeholders = implode(",", array_fill(0, count($chunk), "(?, ?)"));
-                            $sins = $sdb->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . $placeholders . ";");
-                            $param_idx = 1;
-                            foreach ($chunk as $item) {
-                                $sins->bindValue($param_idx++, $item["x"], SQLITE3_BLOB);
-                                $sins->bindValue($param_idx++, $item["dist"], SQLITE3_BLOB);
-                            }
-                            $sins->execute();
-                            $sins->close();
-                            $shard_added += $sdb->changes();
+                    $chunks = array_chunk($items_to_insert, 100);
+                    foreach ($chunks as $chunk) {
+                        $placeholders = implode(",", array_fill(0, count($chunk), "(?, ?)"));
+                        $sins = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . $placeholders . ";");
+                        $param_idx = 1;
+                        foreach ($chunk as $item) {
+                            $sins->bindValue($param_idx++, $item["x"], SQLITE3_BLOB);
+                            $sins->bindValue($param_idx++, $item["dist"], SQLITE3_BLOB);
                         }
-                        
-                        $sdb->exec("COMMIT;");
-                        $in_tx = false;
-                        $actual_inserted += $shard_added;
-                        $shard_success = true;
-                        break;
-                    } catch (Throwable $ex) {
-                        if ($in_tx) {
-                            try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                        }
-                        if ($attempt === 9) {
-                            $all_shards_ok = false;
-                            break;
-                        }
-                        usleep(15000 * ($attempt + 1) + rand(1000, 4000));
+                        $sins->execute();
+                        $sins->close();
+                        $actual_inserted += $db->changes();
                     }
-                }
-                if (!$shard_success) {
-                    $all_shards_ok = false;
+
+                    if ($actual_inserted > 0) {
+                        $stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                            VALUES ('total_tame_traps', CAST(:d AS TEXT))
+                            ON CONFLICT(setting_key) DO UPDATE SET
+                                setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
+                        $stmt->bindValue(":d", $actual_inserted, SQLITE3_INTEGER);
+                        $stmt->execute();
+                        $stmt->close();
+                    }
+
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $actual_inserted, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
+
+                    $db->exec("COMMIT;");
+                    $in_tx = false;
                     break;
+                } catch (Throwable $ex) {
+                    if ($in_tx) {
+                        try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
+                    }
+                    if ($attempt === 9) {
+                        throw new DbBusyException("Database busy during batch commit");
+                    }
+                    usleep(15000 * ($attempt + 1) + rand(1000, 4000));
                 }
             }
 
-            if (!$all_shards_ok) {
-                // TASK 6: Sửa lỗi Counter Drift - Reconcile lại chính xác từ DB, không cộng dồn biến tạm bị lỗi
-                reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, true);
-                throw new DbBusyException("Shard database busy during batch commit");
-            }
-
-            // TASK 6: Chỉ cập nhật system_settings khi TOÀN BỘ shards của batch đã commit thành công
-            if ($actual_inserted > 0) {
-                increment_setting_int($db, "total_tame_traps", $actual_inserted);
-            }
-
-            // Cập nhật active_workers tức thì (không throttle 30s) để bảo toàn 100% điểm đóng góp
-            try {
-                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                        VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                        ON CONFLICT(worker_id) DO UPDATE SET
-                                            hardware = :hw,
-                                            hashrate = :hr,
-                                            mode = :mode,
-                                            total_dps = total_dps + :dps,
-                                            last_seen = CURRENT_TIMESTAMP;");
-                $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                $w_stmt->bindValue(":dps", $actual_inserted, SQLITE3_INTEGER);
-                $w_stmt->execute();
-                $w_stmt->close();
-            } catch (Throwable $_e) {}
-
-            // TASK 6: Định kỳ đối soát (Reconcile) để đảm bảo tính toàn vẹn 100% không bao giờ bị lệch counter
-            $total = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
+            $total = reconcile_total_tame_traps($db, "", 1, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
             $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
@@ -1504,107 +1454,48 @@ if ($action === "submit_tame" || $action === "check_wild") {
             ]);
             exit;
         }
+
         if ($action === "check_wild") {
             $range_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
             $range_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
             $target_pubkey = $is_verify_mode ? get_required_setting($db, "target_pubkey") : PUZZLE140_TARGET_PUBKEY;
 
-            $shard_groups = [];
-            foreach ($dp_list as $dp) {
-                $shard_idx = ord($dp["bin_x"][31]) & $active_shard_mask;
-                $shard_groups[$shard_idx][] = $dp;
-            }
-            ksort($shard_groups);
-
-            foreach ($shard_groups as $shard_idx => $group) {
-                $sdb = get_shard_db($shard_idx, false);
-                if ($sdb === null) {
+            $chunks = array_chunk($dp_list, 100);
+            foreach ($chunks as $chunk) {
+                if (empty($chunk)) {
                     continue;
                 }
+                $placeholders = implode(",", array_fill(0, count($chunk), "?"));
+                $schk = $db->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
 
-                $in_read_tx = false;
-                if (!$is_verify_mode) {
-                    for ($tx_att = 0; $tx_att < 5; $tx_att++) {
-                        try {
-                            $sdb->exec("BEGIN DEFERRED TRANSACTION;");
-                            $in_read_tx = true;
-                            break;
-                        } catch (Throwable $ex) {
-                            if ($tx_att === 4) {
-                                throw new DbBusyException("Wild read snapshot busy on shard " . $shard_idx);
-                            }
-                            usleep(15000 * ($tx_att + 1));
-                        }
-                    }
+                $map_by_x = [];
+                foreach ($chunk as $c_idx => $dp_item) {
+                    $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
+                    $map_by_x[$dp_item["bin_x"]][] = $dp_item["bin_dist"];
                 }
 
-                $chunks = array_chunk($group, 100);
-                foreach ($chunks as $chunk) {
-                    if (empty($chunk)) {
-                        continue;
-                    }
-                    $placeholders = implode(",", array_fill(0, count($chunk), "?"));
-                    $schk = null;
-                    for ($prep_att = 0; $prep_att < 5; $prep_att++) {
-                        try {
-                            $schk = $sdb->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
-                            break;
-                        } catch (Throwable $ex) {
-                            if ($prep_att === 4) {
-                                if ($in_read_tx) { try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
-                                throw new DbBusyException("Wild lookup prepare busy on shard " . $shard_idx);
-                            }
-                            usleep(15000 * ($prep_att + 1));
-                        }
-                    }
+                $sres = $schk->execute();
+                $matched_rows = [];
+                while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
+                    $matched_rows[] = $row;
+                }
+                $sres->finalize();
+                $schk->close();
 
-                    $map_by_x = [];
-                    foreach ($chunk as $c_idx => $dp_item) {
-                        $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
-                        $map_by_x[$dp_item["bin_x"]][] = $dp_item["bin_dist"];
+                foreach ($matched_rows as $row) {
+                    $bin_x = $row["dp_x"];
+                    $wild_dists = isset($map_by_x[$bin_x]) ? $map_by_x[$bin_x] : [];
+                    $raw_tame_dist = $row["total_distance"];
+                    if (strlen($raw_tame_dist) < 32) {
+                        $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
                     }
-
-                    $sres = null;
-                    $matched_rows = [];
-                    for ($attempt = 0; $attempt < 5; $attempt++) {
-                        try {
-                            $sres = $schk->execute();
-                            while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
-                                $matched_rows[] = $row;
-                            }
-                            $sres->finalize();
-                            break;
-                        } catch (Throwable $ex) {
-                            if ($sres) { $sres->finalize(); }
-                            if ($attempt === 4) {
-                                $schk->close();
-                                if ($in_read_tx) { try { $sdb->exec("ROLLBACK;"); } catch (Throwable $_rb) {} }
-                                throw new DbBusyException("Wild lookup execution busy on shard " . $shard_idx);
-                            }
-                            usleep(15000 * ($attempt + 1));
-                        }
-                    }
-                    $schk->close();
-
-                    foreach ($matched_rows as $row) {
-                        $bin_x = $row["dp_x"];
-                        $wild_dists = isset($map_by_x[$bin_x]) ? $map_by_x[$bin_x] : [];
-                        $raw_tame_dist = $row["total_distance"];
-                        if (strlen($raw_tame_dist) < 32) {
-                            $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
-                        }
-                        $tame_dist_hex = bin2hex($raw_tame_dist);
-                        foreach ($wild_dists as $bin_dist) {
-                            $wild_dist_hex = bin2hex($bin_dist);
+                    $tame_dist_hex = bin2hex($raw_tame_dist);
+                    foreach ($wild_dists as $bin_dist) {
+                        $wild_dist_hex = bin2hex($bin_dist);
                         $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
 
                         if (!$cands["is_verified"]) {
                             continue;
-                        }
-
-                        if ($in_read_tx) {
-                            try { $sdb->exec("COMMIT;"); } catch (Throwable $_cm) {}
-                            $in_read_tx = false;
                         }
 
                         $collision_dp_hex = "0x" . bin2hex($bin_x);
@@ -1670,17 +1561,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
                             "stop" => true
                         ]);
                         exit;
-                        }
                     }
-                }
-
-                if ($in_read_tx) {
-                    try { $sdb->exec("COMMIT;"); } catch (Throwable $_cm) {}
-                    $in_read_tx = false;
                 }
             }
 
-            // Cập nhật active_workers tức thì (không throttle 30s) để bảo toàn 100% điểm đóng góp
             try {
                 $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
                                         VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
@@ -1701,7 +1585,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     increment_setting_int($db, "total_wild_dps", $batch_size);
                 }
             } catch (Throwable $_e) {}
-            $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
+
+            $total_traps = reconcile_total_tame_traps($db, "", 1, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
 
@@ -1717,6 +1602,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
             ]);
             exit;
         }
+
     }
 
     // API 4: SET TARGET DP

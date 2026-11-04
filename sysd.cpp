@@ -271,9 +271,9 @@ public:
         Int eff_span;
         ComputeSpawnSpan(range_width, eff_span);
         int w_bits = eff_span.GetBitLength();
-        int max_bit = (w_bits >= 30) ? ((w_bits + 5) / 2) : std::max(5, (w_bits + 3) / 2);
+        int max_bit = (w_bits / 2) + 1;
         if (max_bit > 120) max_bit = 120;
-        int span = (max_bit > 16) ? 15 : (max_bit - 1);
+        int span = (max_bit > 16) ? 14 : std::max(1, max_bit - 1);
         int min_bit = max_bit - span;
 
         for (int i = 0; i < NB_JUMP; ++i) {
@@ -1051,7 +1051,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                     respawn_indices.push_back(item.kIdx);
                 }
             }
-            EnqueueWithBackpressure(local_recs);
         }
 
         if (!respawn_indices.empty()) {
@@ -1184,14 +1183,20 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
             respawn_indices.clear();
         }
 
-        // Synchronously launch next kernel after respawned kangaroos are written
+        // Asynchronously launch next CUDA kernel immediately before locking queue mutex
         if (!gpu->callKernel()) {
             std::cerr << "[-] Fatal GPU #" << gpu_id << ": CUDA kernel execution failed\n";
             cudaDeviceSynchronize();
             delete gpu;
             std::exit(1);
         }
+
+        // Enqueue DPs to transport buffer concurrently while GPU is already crunching next batch
+        if (!local_recs.empty()) {
+            EnqueueWithBackpressure(local_recs);
+        }
     }
+
 
     cudaDeviceSynchronize();
     delete gpu;

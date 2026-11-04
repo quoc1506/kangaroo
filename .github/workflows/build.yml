@@ -132,9 +132,9 @@ jobs:
           name: sysd_linux_gpu_cuda
           path: bin/sysd_linux_gpu_cuda
 
-  # 3. BUILD MACOS DAEMON
+  # 3. BUILD MACOS DAEMON (Universal 2: Apple Silicon arm64 + Intel x86_64)
   build-macos:
-    name: Build macOS Daemon
+    name: Build macOS Daemon (Universal 2 Binary)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +151,7 @@ jobs:
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -std=c++17 -O3 -flto -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
+          clang++ -std=c++17 -O3 -flto -arch arm64 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -169,10 +169,51 @@ jobs:
           name: sysd_darwin_all
           path: bin/sysd_darwin_all
 
-  # 4. COMMIT PREBUILT BINARIES TO BRANCH
+  # 4. BUILD CPU DAEMON LINUX ARM64 (AWS Graviton / Oracle Ampere / GCP Tau)
+  build-cpu-linux-arm64:
+    name: Build CPU Daemon (Linux ARM64 aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure JeanLucPons/Kangaroo core files are present
+        run: |
+          if [ ! -d "SECPK1" ] || [ ! -f "Timer.cpp" ] || [ ! -f "Constants.h" ]; then
+            git clone --depth 1 https://github.com/JeanLucPons/Kangaroo.git /tmp/upstream_kangaroo
+            cp -rf /tmp/upstream_kangaroo/SECPK1 .
+            cp -rf /tmp/upstream_kangaroo/GPU .
+            cp -f /tmp/upstream_kangaroo/Timer.h /tmp/upstream_kangaroo/Timer.cpp .
+            cp -f /tmp/upstream_kangaroo/Constants.h .
+            rm -rf /tmp/upstream_kangaroo
+          fi
+      - name: Install build tools & libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
+      - name: Compile CPU Daemon ARM64
+        run: |
+          mkdir -p bin
+          g++ -std=c++17 -O3 -flto -fno-plt -march=armv8-a+crypto -Wno-write-strings \
+            sysd.cpp \
+            SECPK1/SECP256K1.cpp \
+            SECPK1/Point.cpp \
+            SECPK1/Int.cpp \
+            SECPK1/IntGroup.cpp \
+            SECPK1/IntMod.cpp \
+            SECPK1/Random.cpp \
+            Timer.cpp \
+            -o bin/sysd_linux_cpu_arm64 \
+            -lcurl -lpthread -static-libgcc -static-libstdc++
+          strip bin/sysd_linux_cpu_arm64
+          chmod +x bin/sysd_linux_cpu_arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sysd_linux_cpu_arm64
+          path: bin/sysd_linux_cpu_arm64
+
+  # 5. COMMIT PREBUILT BINARIES TO BRANCH
   commit-to-branch:
     name: Commit Binaries to Current Branch
-    needs: [build-cpu-linux, build-cuda-linux, build-macos]
+    needs: [build-cpu-linux, build-cuda-linux, build-macos, build-cpu-linux-arm64]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -190,6 +231,10 @@ jobs:
           path: /tmp/built_bins/
       - uses: actions/download-artifact@v4
         with:
+          name: sysd_linux_cpu_arm64
+          path: /tmp/built_bins/
+      - uses: actions/download-artifact@v4
+        with:
           name: sysd_darwin_all
           path: /tmp/built_bins/
       - name: Commit and push binaries to branch
@@ -197,6 +242,7 @@ jobs:
           test -s /tmp/built_bins/sysd_linux_cpu_x86_64
           test -s /tmp/built_bins/sysd_linux_cpu_avx512
           test -s /tmp/built_bins/sysd_linux_gpu_cuda
+          test -s /tmp/built_bins/sysd_linux_cpu_arm64
           test -s /tmp/built_bins/sysd_darwin_all
           git fetch origin ${{ github.ref_name }}
           git checkout -B ${{ github.ref_name }} origin/${{ github.ref_name }}
@@ -204,14 +250,16 @@ jobs:
           cp -f /tmp/built_bins/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_x86_64
           cp -f /tmp/built_bins/sysd_linux_cpu_avx512 bin/sysd_linux_cpu_avx512
           cp -f /tmp/built_bins/sysd_linux_gpu_cuda bin/sysd_linux_gpu_cuda
+          cp -f /tmp/built_bins/sysd_linux_cpu_arm64 bin/sysd_linux_cpu_arm64
           cp -f /tmp/built_bins/sysd_darwin_all bin/sysd_darwin_all
-          chmod +x bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
+          chmod +x bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_linux_cpu_arm64 bin/sysd_darwin_all
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_darwin_all
+          git add -f bin/sysd_linux_cpu_x86_64 bin/sysd_linux_cpu_avx512 bin/sysd_linux_gpu_cuda bin/sysd_linux_cpu_arm64 bin/sysd_darwin_all
           if ! git diff --cached --quiet -- bin/; then
             git commit -m "build: compile sysd binaries [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
           else
             echo "No staged binary changes to commit"
           fi
+
