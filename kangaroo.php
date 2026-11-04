@@ -1440,7 +1440,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $target_pubkey = PUZZLE140_TARGET_PUBKEY;
             }
 
-            $chunks = array_chunk($dp_list, 1000);
+            $chunks = array_chunk($dp_list, 500);
             foreach ($chunks as $chunk) {
                 if (empty($chunk)) {
                     continue;
@@ -1567,7 +1567,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $w_stmt->close();
                     if ($batch_size > 0) {
                         $s_upd = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                            VALUES (total_wild_dps, CAST(:d AS TEXT))
+                            VALUES ('total_wild_dps', CAST(:d AS TEXT))
                             ON CONFLICT(setting_key) DO UPDATE SET
                                 setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
                         $s_upd->bindValue(":d", $batch_size, SQLITE3_INTEGER);

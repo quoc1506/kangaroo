@@ -3,7 +3,7 @@
  * Core Cryptography: Jean-Luc Pons Canonical Kangaroo Engine (JeanLucPons/Kangaroo)
  * Architecture:
  *  - Single unified TAME + WILD Kangaroo pipeline for both Production & --verify
- *  - High-performance L1-cache aligned Montgomery batch walk (CPU_GRP_SIZE = 1024)
+ *  - High-performance Montgomery simultaneous batch walk (CPU_GRP_SIZE = 1024 - Math/Amortization Optimal)
  *  - Full Native Multi-GPU CUDA execution with 256-bit host base-distance & staged respawn
  *  - Symmetric [-W/2, +W/2] Wild Kangaroo seeding (zero upper-bound blind spot)
  *  - Strict /dev/urandom 256-bit thread_local PRNG + pure rejection sampling
@@ -75,6 +75,12 @@
 #endif
 #define NB_JUMP 32
 
+// CPU_GRP_SIZE = 1024: TOÁN HỌC & KIẾN TRÚC TỐI ƯU CỦA JEAN-LUC PONS (KHÔNG ĐƯỢC GIẢM VỀ 128/256).
+// Lý do: Phép đảo modulo 256-bit (Int::ModInv - Lehmer/DivStep62) cực nặng, tốn ~800-1200 chu kỳ CPU.
+// Với size = 1024: chi phí ModInv chia đều (amortized) chỉ còn ~1 chu kỳ/điểm (~1000/1024).
+// Nếu giảm về 128: chi phí ModInv vọt lên ~8 chu kỳ/điểm (tăng 8 lần overhead thuật toán chia dư).
+// Mặc dù ~208KB tràn khỏi L1D rơi vào L2 Cache, vòng lặp duyệt mảng tuần tự tuyến tính (linear streaming)
+// được L2 Hardware Stream Prefetcher của CPU nạp trước liên tục, che giấu hoàn toàn độ trễ bộ nhớ.
 #define CPU_GRP_SIZE 1024
 #define MAX_QUEUE_DPS 500000
 
