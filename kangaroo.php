@@ -1328,8 +1328,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $items_to_insert[] = ["x" => $bin_x, "dist" => $packed_dist];
             }
 
-            $actual_inserted = 0;
             for ($attempt = 0; $attempt < 10; $attempt++) {
+                $actual_inserted = 0;
                 $in_tx = false;
                 try {
                     $db->exec("BEGIN IMMEDIATE TRANSACTION;");
@@ -1433,7 +1433,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $target_pubkey = PUZZLE140_TARGET_PUBKEY;
             }
 
-            $chunks = array_chunk($dp_list, 100);
+            $chunks = array_chunk($dp_list, 1000);
             foreach ($chunks as $chunk) {
                 if (empty($chunk)) {
                     continue;
@@ -1538,27 +1538,49 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             }
 
-            try {
-                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                        VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                        ON CONFLICT(worker_id) DO UPDATE SET
-                                            hardware = :hw,
-                                            hashrate = :hr,
-                                            mode = :mode,
-                                            total_dps = total_dps + :dps,
-                                            last_seen = CURRENT_TIMESTAMP;");
-                $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
-                $w_stmt->execute();
-                $w_stmt->close();
-                if ($batch_size > 0) {
-                    increment_setting_int($db, "total_wild_dps", $batch_size);
+            for ($w_att = 0; $w_att < 5; $w_att++) {
+                $in_w_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_w_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
+                    if ($batch_size > 0) {
+                        $s_upd = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                            VALUES (total_wild_dps, CAST(:d AS TEXT))
+                            ON CONFLICT(setting_key) DO UPDATE SET
+                                setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
+                        $s_upd->bindValue(":d", $batch_size, SQLITE3_INTEGER);
+                        $s_upd->execute();
+                        $s_upd->close();
+                    }
+                    $db->exec("COMMIT;");
+                    $in_w_tx = false;
+                    prune_stale_workers($db);
+                    break;
+                } catch (Throwable $_w_ex) {
+                    if ($in_w_tx) {
+                        try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
+                    }
+                    if ($w_att === 4) {
+                        break;
+                    }
+                    usleep(10000 * ($w_att + 1));
                 }
-                prune_stale_workers($db);
-            } catch (Throwable $_e) {}
+            }
 
             $total_traps = reconcile_total_tame_traps($db, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
