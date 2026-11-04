@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Patch JeanLucPons/Kangaroo for:
-1. Portable ARM64 (macOS Apple Silicon Xcode & Linux aarch64) in SECPK1/Int.h:
-   - Eliminates invalid '=d'/'=a' asm constraints via GCC/Clang unsigned __int128 arithmetic.
-   - Portable carry/borrow routines and ARM64 cntvct_el0 virtual cycle counter.
+1. Clang & GCC cross-compatibility in SECPK1/Int.h:
+   - Fixes Clang conflict with built-in '__rdtsc' (static re-declaration error).
+   - Maps '_subborrow_u64' to '__builtin_ia32_subborrow_u64' on Clang vs '__builtin_ia32_sbb_u64' on GCC.
+   - Portable ARM64 (Apple Silicon / aarch64) using GCC/Clang unsigned __int128 arithmetic.
 2. Apple Silicon & Clang compatibility in SECPK1/Int.cpp & SECPK1/IntMod.cpp:
    - Guards x86-only emmintrin.h header from triggering Xcode Clang error.
    - Implements ARM64 drop-in replacement for the 3 SSE instructions used in DivStep62.
+   - Silences Clang false-positive 'GCC lass than 7.3 detected' warnings and enables register caching for carry bit.
 3. Modern C++ (GCC 13/14 & Xcode Clang 15+) in Timer.h & Timer.cpp:
    - Injects #include <stdint.h> to resolve missing uint32_t definitions.
 4. Multi-GPU safe batched kangaroo respawning in GPU/GPUEngine.h & GPU/GPUEngine.cu:
@@ -27,7 +29,6 @@ def patch_timer():
             c = "#include <stdint.h>\n" + c
             with open(fpath, "w") as f:
                 f.write(c)
-            print(f"[+] Patched {fpath} with #include <stdint.h> (GCC 13+/Xcode Clang uint32_t fix)")
 
 def patch_secpk1_compat():
     # 1. Patch SECPK1/Int.cpp (guard x86-only emmintrin.h)
@@ -42,13 +43,20 @@ def patch_secpk1_compat():
             )
             with open(target_int, "w") as f:
                 f.write(c)
-            print("[+] Patched SECPK1/Int.cpp (guard x86-only emmintrin.h)")
 
-    # 2. Patch SECPK1/IntMod.cpp (ARM64 SSE emulation for DivStep62)
+    # 2. Patch SECPK1/IntMod.cpp
     target_mod = "SECPK1/IntMod.cpp"
     if os.path.exists(target_mod):
         with open(target_mod, "r") as f:
             c = f.read()
+
+        # Fix false-positive GCC version warning in Clang and avoid slow volatile carry
+        old_gcc_check = "#if (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))"
+        new_gcc_check = "#if defined(__clang__) || (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))"
+        if old_gcc_check in c:
+            c = c.replace(old_gcc_check, new_gcc_check)
+
+        # ARM64 SSE emulation for DivStep62
         if "#include <emmintrin.h>" in c and "ARM64 drop-in replacement" not in c:
             replacement = '''#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
@@ -82,9 +90,9 @@ static inline __m128i _mm_sub_epi64(__m128i a, __m128i b) {
 }
 #endif'''
             c = c.replace("#include <emmintrin.h>", replacement)
-            with open(target_mod, "w") as f:
-                f.write(c)
-            print("[+] Patched SECPK1/IntMod.cpp (ARM64 DivStep62 SSE compatibility)")
+
+        with open(target_mod, "w") as f:
+            f.write(c)
 
 def patch_secpk1_int():
     target = "SECPK1/Int.h"
@@ -94,57 +102,9 @@ def patch_secpk1_int():
     with open(target, "r") as f:
         content = f.read()
 
-    if "Portable ARM64" in content:
-        print("[*] SECPK1/Int.h already patched for ARM64")
-        return
-
-    old_block = '''#ifndef WIN64
-
-// Missing intrinsics
-static uint64_t inline _umul128(uint64_t a, uint64_t b, uint64_t *h) {
-  uint64_t rhi;
-  uint64_t rlo;
-  __asm__( "mulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
-  *h = rhi;
-  return rlo;
-}
-
-static int64_t inline _mul128(int64_t a, int64_t b, int64_t *h) {
-  uint64_t rhi;
-  uint64_t rlo;
-  __asm__( "imulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
-  *h = rhi;
-  return rlo;  
-}
-
-static uint64_t inline _udiv128(uint64_t hi, uint64_t lo, uint64_t d,uint64_t *r) {
-  uint64_t q;
-  uint64_t _r;
-  __asm__( "divq  %[d];" :"=d"(_r),"=a"(q) :"d"(hi),"a"(lo),[d]"rm"(d));
-  *r = _r;
-  return q;  
-}
-
-static uint64_t inline __rdtsc() {
-  uint32_t h;
-  uint32_t l;
-  __asm__( "rdtsc;" :"=d"(h),"=a"(l));
-  return (uint64_t)h << 32 | (uint64_t)l;
-}
-
-#define __shiftright128(a,b,n) ((a)>>(n))|((b)<<(64-(n)))
-#define __shiftleft128(a,b,n) ((b)<<(n))|((a)>>(64-(n)))
-#define _subborrow_u64(a,b,c,d) __builtin_ia32_sbb_u64(a,b,c,(long long unsigned int*)d);
-#define _addcarry_u64(a,b,c,d) __builtin_ia32_addcarryx_u64(a,b,c,(long long unsigned int*)d);
-#define _byteswap_uint64 __builtin_bswap64
-#define LZC(x) __builtin_clzll(x)
-#define TZC(x) __builtin_ctzll(x)
-
-#else'''
-
     new_block = '''#ifndef WIN64
 
-// Missing intrinsics - Portable ARM64 (aarch64 / Apple Silicon) & x86_64 implementation
+// Missing intrinsics - Portable Clang / GCC (ARM64 & x86_64) implementation
 #if defined(__x86_64__) || defined(_M_X64)
 static uint64_t inline _umul128(uint64_t a, uint64_t b, uint64_t *h) {
   uint64_t rhi;
@@ -170,18 +130,24 @@ static uint64_t inline _udiv128(uint64_t hi, uint64_t lo, uint64_t d,uint64_t *r
   return q;  
 }
 
-static uint64_t inline __rdtsc() {
-  uint32_t h;
-  uint32_t l;
-  __asm__( "rdtsc;" :"=d"(h),"=a"(l));
-  return (uint64_t)h << 32 | (uint64_t)l;
+#if !defined(__clang__)
+static inline uint64_t pons_rdtsc() {
+  uint32_t h, l;
+  __asm__ __volatile__("rdtsc;" : "=d"(h), "=a"(l));
+  return ((uint64_t)h << 32) | (uint64_t)l;
 }
+#define __rdtsc pons_rdtsc
+#endif
 
+#if defined(__clang__)
+#define _subborrow_u64(a,b,c,d) __builtin_ia32_subborrow_u64(a,b,c,(long long unsigned int*)d)
+#else
 #define _subborrow_u64(a,b,c,d) __builtin_ia32_sbb_u64(a,b,c,(long long unsigned int*)d)
+#endif
 #define _addcarry_u64(a,b,c,d) __builtin_ia32_addcarryx_u64(a,b,c,(long long unsigned int*)d)
 
 #else
-// Standard GCC/Clang 128-bit arithmetic & ARM virtual counter for ARM64/Apple Silicon
+// Non-x86_64 (ARM64 / Apple Silicon / aarch64) using GCC/Clang 128-bit arithmetic
 static inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t *h) {
   unsigned __int128 res = (unsigned __int128)a * (unsigned __int128)b;
   *h = (uint64_t)(res >> 64);
@@ -201,7 +167,7 @@ static inline uint64_t _udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *
   return q;
 }
 
-static inline uint64_t __rdtsc() {
+static inline uint64_t pons_rdtsc() {
 #if defined(__aarch64__) || defined(__arm64__)
   uint64_t val;
   __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
@@ -210,6 +176,7 @@ static inline uint64_t __rdtsc() {
   return 0ULL;
 #endif
 }
+#define __rdtsc pons_rdtsc
 
 static inline unsigned char _addcarry_u64(unsigned char c_in, uint64_t a, uint64_t b, void *out) {
   unsigned __int128 sum = (unsigned __int128)a + (unsigned __int128)b + (unsigned __int128)c_in;
@@ -232,20 +199,11 @@ static inline unsigned char _subborrow_u64(unsigned char b_in, uint64_t a, uint6
 
 #else'''
 
-    if old_block in content:
-        content = content.replace(old_block, new_block)
+    pat = re.compile(r'#ifndef WIN64.*?#define TZC\(x\) __builtin_ctzll\(x\)\s*#else', re.DOTALL)
+    if pat.search(content):
+        content = pat.sub(new_block, content, count=1)
         with open(target, "w") as f:
             f.write(content)
-        print("[+] Patched SECPK1/Int.h for ARM64/Apple Silicon compatibility")
-    else:
-        pat = re.compile(r'#ifndef WIN64.*?#define TZC\(x\) __builtin_ctzll\(x\)\s*#else', re.DOTALL)
-        if pat.search(content):
-            content = pat.sub(new_block, content, count=1)
-            with open(target, "w") as f:
-                f.write(content)
-            print("[+] Patched SECPK1/Int.h via regex pattern")
-        else:
-            print("[-] Warning: Could not locate assembly block in SECPK1/Int.h")
 
 def patch_gpu_engine():
     # 1. Patch GPU/GPUEngine.h
@@ -280,7 +238,6 @@ typedef struct {
         )
         with open("GPU/GPUEngine.h", "w") as f:
             f.write(h)
-        print("[+] Patched GPU/GPUEngine.h (Multi-GPU instance buffers & declarations)")
 
     # 2. Patch GPU/GPUEngine.cu
     if not os.path.exists("GPU/GPUEngine.cu"):
@@ -297,7 +254,7 @@ typedef struct {
     if "if(d_respawn_buffer) cudaFree(d_respawn_buffer);" not in cu:
         cu = cu.replace(
             "  if(jumpPinned) cudaFreeHost(jumpPinned);",
-            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_hpu_items);" if "h_hpu_items" in cu else "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_gpu_items);"
+            "  if(jumpPinned) cudaFreeHost(jumpPinned);\n  if(evt_sync) cudaEventDestroy(evt_sync);\n  if(d_respawn_buffer) cudaFree(d_respawn_buffer);\n  if(h_gpu_items) cudaFreeHost(h_gpu_items);"
         )
 
     old_launch_pattern = '''    // Use cudaMemcpyAsync to avoid default spin wait of cudaMemcpy wich takes 100% CPU
@@ -326,13 +283,11 @@ typedef struct {
 
     if old_launch_pattern in cu:
         cu = cu.replace(old_launch_pattern, new_launch_wait)
-        print("[+] Patched GPUEngine::Launch wait loop with persistent event & hybrid polling")
 
     old_launch_tail = '\n  return callKernel();\n\n}'
     new_launch_tail = '\n  return true;\n\n}'
     if old_launch_tail in cu:
         cu = cu.replace(old_launch_tail, new_launch_tail)
-        print("[+] Decoupled callKernel() from GPUEngine::Launch() (solves P0 async desync)")
 
     batch_func = '''__global__ void _SetKangaroosBatchKernel(const KangarooGpuItem *items, size_t count, uint64_t *inputKangaroo, int nbThreadPerGroup, int gSize, int strideSize, int blockSize) {
     size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
@@ -418,7 +373,6 @@ void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count
 
     with open("GPU/GPUEngine.cu", "w") as f:
         f.write(cu)
-    print("[+] Patched GPU/GPUEngine.cu (Multi-GPU instance buffers & scatter kernel)")
 
 if __name__ == "__main__":
     patch_timer()
