@@ -29,6 +29,7 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
+          python3 patch_upstream.py
       - name: Install build tools & libraries
         run: |
           sudo apt-get update
@@ -148,10 +149,11 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
+          python3 patch_upstream.py
       - name: Compile on macOS
         run: |
           mkdir -p bin
-          clang++ -std=c++17 -O3 -flto -arch arm64 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations -D__rdtsc=pons_rdtsc -D__builtin_ia32_sbb_u64=__builtin_ia32_subborrow_u64 \
+          clang++ -std=c++17 -O3 -flto -arch arm64 -arch x86_64 -Wno-write-strings -Wno-deprecated-declarations \
             sysd.cpp \
             SECPK1/SECP256K1.cpp \
             SECPK1/Point.cpp \
@@ -185,6 +187,7 @@ jobs:
             cp -f /tmp/upstream_kangaroo/Constants.h .
             rm -rf /tmp/upstream_kangaroo
           fi
+          python3 patch_upstream.py
       - name: Install build tools & libraries
         run: |
           sudo apt-get update

@@ -1020,9 +1020,9 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         uint64_t batch_steps = (uint64_t)total_kangaroos * NB_RUN;
         g_state.total_steps += batch_steps;
         respawn_indices.clear();
+        std::vector<DPRecord> local_recs;
 
         if (!gpu_found.empty()) {
-            std::vector<DPRecord> local_recs;
             local_recs.reserve(gpu_found.size());
             for (size_t idx = 0; idx < gpu_found.size(); ++idx) {
                 const ITEM &item = gpu_found[idx];

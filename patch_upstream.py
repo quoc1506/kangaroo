@@ -1,13 +1,180 @@
 #!/usr/bin/env python3
-"""Patch JeanLucPons/Kangaroo GPU files for:
-1. Multi-GPU safe batched kangaroo respawning (per-instance VRAM buffers, eliminates global static collisions).
-2. Asynchronous decoupling (Launch() separates kernel finish & result retrieval from callKernel()).
-3. Elimination of OS sleep jitter via persistent cudaEvent_t and hybrid polling.
+"""Patch JeanLucPons/Kangaroo for:
+1. Portable ARM64 (Linux aarch64 & macOS Apple Silicon) support in SECPK1/Int.h:
+   Eliminates invalid '=d'/'=a' asm constraints & x86-only builtins via GCC/Clang 128-bit arithmetic.
+2. Multi-GPU safe batched kangaroo respawning (per-instance VRAM buffers, eliminates global static collisions).
+3. Asynchronous decoupling (Launch() separates kernel finish & result retrieval from callKernel()).
+4. Elimination of OS sleep jitter via persistent cudaEvent_t and hybrid polling.
 """
+import os
+import re
 import sys
+
+def patch_secpk1_int():
+    target = "SECPK1/Int.h"
+    if not os.path.exists(target):
+        return
+
+    with open(target, "r") as f:
+        content = f.read()
+
+    if "Portable ARM64" in content:
+        print("[*] SECPK1/Int.h already patched for ARM64")
+        return
+
+    old_block = '''#ifndef WIN64
+
+// Missing intrinsics
+static uint64_t inline _umul128(uint64_t a, uint64_t b, uint64_t *h) {
+  uint64_t rhi;
+  uint64_t rlo;
+  __asm__( "mulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
+  *h = rhi;
+  return rlo;
+}
+
+static int64_t inline _mul128(int64_t a, int64_t b, int64_t *h) {
+  uint64_t rhi;
+  uint64_t rlo;
+  __asm__( "imulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
+  *h = rhi;
+  return rlo;  
+}
+
+static uint64_t inline _udiv128(uint64_t hi, uint64_t lo, uint64_t d,uint64_t *r) {
+  uint64_t q;
+  uint64_t _r;
+  __asm__( "divq  %[d];" :"=d"(_r),"=a"(q) :"d"(hi),"a"(lo),[d]"rm"(d));
+  *r = _r;
+  return q;  
+}
+
+static uint64_t inline __rdtsc() {
+  uint32_t h;
+  uint32_t l;
+  __asm__( "rdtsc;" :"=d"(h),"=a"(l));
+  return (uint64_t)h << 32 | (uint64_t)l;
+}
+
+#define __shiftright128(a,b,n) ((a)>>(n))|((b)<<(64-(n)))
+#define __shiftleft128(a,b,n) ((b)<<(n))|((a)>>(64-(n)))
+#define _subborrow_u64(a,b,c,d) __builtin_ia32_sbb_u64(a,b,c,(long long unsigned int*)d);
+#define _addcarry_u64(a,b,c,d) __builtin_ia32_addcarryx_u64(a,b,c,(long long unsigned int*)d);
+#define _byteswap_uint64 __builtin_bswap64
+#define LZC(x) __builtin_clzll(x)
+#define TZC(x) __builtin_ctzll(x)
+
+#else'''
+
+    new_block = '''#ifndef WIN64
+
+// Missing intrinsics - Portable ARM64 (aarch64 / Apple Silicon) & x86_64 implementation
+#if defined(__x86_64__) || defined(_M_X64)
+static uint64_t inline _umul128(uint64_t a, uint64_t b, uint64_t *h) {
+  uint64_t rhi;
+  uint64_t rlo;
+  __asm__( "mulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
+  *h = rhi;
+  return rlo;
+}
+
+static int64_t inline _mul128(int64_t a, int64_t b, int64_t *h) {
+  uint64_t rhi;
+  uint64_t rlo;
+  __asm__( "imulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
+  *h = rhi;
+  return rlo;  
+}
+
+static uint64_t inline _udiv128(uint64_t hi, uint64_t lo, uint64_t d,uint64_t *r) {
+  uint64_t q;
+  uint64_t _r;
+  __asm__( "divq  %[d];" :"=d"(_r),"=a"(q) :"d"(hi),"a"(lo),[d]"rm"(d));
+  *r = _r;
+  return q;  
+}
+
+static uint64_t inline __rdtsc() {
+  uint32_t h;
+  uint32_t l;
+  __asm__( "rdtsc;" :"=d"(h),"=a"(l));
+  return (uint64_t)h << 32 | (uint64_t)l;
+}
+
+#define _subborrow_u64(a,b,c,d) __builtin_ia32_sbb_u64(a,b,c,(long long unsigned int*)d)
+#define _addcarry_u64(a,b,c,d) __builtin_ia32_addcarryx_u64(a,b,c,(long long unsigned int*)d)
+
+#else
+// Standard GCC/Clang 128-bit arithmetic & ARM virtual counter for ARM64/Apple Silicon
+static inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t *h) {
+  unsigned __int128 res = (unsigned __int128)a * (unsigned __int128)b;
+  *h = (uint64_t)(res >> 64);
+  return (uint64_t)res;
+}
+
+static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h) {
+  __int128 res = (__int128)a * (__int128)b;
+  *h = (int64_t)(res >> 64);
+  return (int64_t)res;
+}
+
+static inline uint64_t _udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *r) {
+  unsigned __int128 dividend = ((unsigned __int128)hi << 64) | lo;
+  uint64_t q = (uint64_t)(dividend / d);
+  *r = (uint64_t)(dividend % d);
+  return q;
+}
+
+static inline uint64_t __rdtsc() {
+#if defined(__aarch64__) || defined(__arm64__)
+  uint64_t val;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+  return val;
+#else
+  return 0ULL;
+#endif
+}
+
+static inline unsigned char _addcarry_u64(unsigned char c_in, uint64_t a, uint64_t b, void *out) {
+  unsigned __int128 sum = (unsigned __int128)a + (unsigned __int128)b + (unsigned __int128)c_in;
+  *(uint64_t *)out = (uint64_t)sum;
+  return (unsigned char)(sum >> 64);
+}
+
+static inline unsigned char _subborrow_u64(unsigned char b_in, uint64_t a, uint64_t b, void *out) {
+  unsigned __int128 diff = (unsigned __int128)a - (unsigned __int128)b - (unsigned __int128)(b_in ? 1 : 0);
+  *(uint64_t *)out = (uint64_t)diff;
+  return (unsigned char)((diff >> 64) ? 1 : 0);
+}
+#endif
+
+#define __shiftright128(a,b,n) ((a)>>(n))|((b)<<(64-(n)))
+#define __shiftleft128(a,b,n) ((b)<<(n))|((a)>>(64-(n)))
+#define _byteswap_uint64 __builtin_bswap64
+#define LZC(x) __builtin_clzll(x)
+#define TZC(x) __builtin_ctzll(x)
+
+#else'''
+
+    if old_block in content:
+        content = content.replace(old_block, new_block)
+        with open(target, "w") as f:
+            f.write(content)
+        print("[+] Patched SECPK1/Int.h for ARM64/Apple Silicon compatibility")
+    else:
+        pat = re.compile(r'#ifndef WIN64.*?#define TZC\(x\) __builtin_ctzll\(x\)\s*#else', re.DOTALL)
+        if pat.search(content):
+            content = pat.sub(new_block, content, count=1)
+            with open(target, "w") as f:
+                f.write(content)
+            print("[+] Patched SECPK1/Int.h via regex pattern")
+        else:
+            print("[-] Warning: Could not locate assembly block in SECPK1/Int.h")
 
 def patch_gpu_engine():
     # 1. Patch GPU/GPUEngine.h
+    if not os.path.exists("GPU/GPUEngine.h"):
+        return
     with open("GPU/GPUEngine.h", "r") as f:
         h = f.read()
 
@@ -40,6 +207,8 @@ typedef struct {
         print("[+] Patched GPU/GPUEngine.h (Multi-GPU instance buffers & declarations)")
 
     # 2. Patch GPU/GPUEngine.cu
+    if not os.path.exists("GPU/GPUEngine.cu"):
+        return
     with open("GPU/GPUEngine.cu", "r") as f:
         cu = f.read()
 
@@ -176,4 +345,5 @@ void GPUEngine::SetKangaroosBatch(const KangarooRespawnItem *items, size_t count
     print("[+] Patched GPU/GPUEngine.cu (Multi-GPU instance buffers & scatter kernel)")
 
 if __name__ == "__main__":
+    patch_secpk1_int()
     patch_gpu_engine()
