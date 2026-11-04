@@ -735,8 +735,25 @@ function reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, $forc
         set_setting($db, "total_tame_traps", (string)$actual);
         return $actual;
     }
-    // Task 2: High-performance monotonic counter directly from master system_settings
-    // Eliminates disk-freezing SELECT COUNT(*) B-Tree scans across 32 shards
+    if ($force) {
+        $actual_total = 0;
+        for ($s = 0; $s < $active_shard_count; $s++) {
+            $hex = str_pad(dechex($s), 2, "0", STR_PAD_LEFT);
+            $path = $shards_dir . "/traps_" . $hex . ".db";
+            if (is_file($path) && filesize($path) > 0) {
+                try {
+                    $sdb = new SQLite3($path);
+                    $c = $sdb->querySingle("SELECT COUNT(*) FROM tame_traps;");
+                    if ($c !== false && $c !== null) {
+                        $actual_total += intval($c);
+                    }
+                    $sdb->close();
+                } catch (Throwable $_e) {}
+            }
+        }
+        set_setting($db, "total_tame_traps", (string)$actual_total);
+        return $actual_total;
+    }
     $curr = find_setting_or_null($db, "total_tame_traps");
     return ($curr !== null) ? intval($curr) : 0;
 }
@@ -1212,7 +1229,7 @@ try {
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
-                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '23');
+                INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '27');
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
                 INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');

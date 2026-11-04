@@ -3,9 +3,9 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 BIN=""
 GPU_FLAG=""
-
 HAS_GPU_ARG=0
 FORCE_CPU=0
 ARGS=()
@@ -29,7 +29,14 @@ elif [ "$OS" = "Linux" ]; then
         if [ "$HAS_GPU_ARG" -eq 0 ]; then
             GPU_FLAG="-gpu"
         fi
-    elif grep -q "avx512f" /proc/cpuinfo && grep -q "avx512dq" /proc/cpuinfo && grep -q "avx512bw" /proc/cpuinfo && grep -q "avx512vl" /proc/cpuinfo && grep -q "avx512ifma" /proc/cpuinfo; then
+    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        if [ -f "$DIR/bin/sysd_linux_cpu_arm64" ]; then
+            BIN="$DIR/bin/sysd_linux_cpu_arm64"
+        else
+            echo "[-] Fatal: Native ARM64 binary missing: $DIR/bin/sysd_linux_cpu_arm64" >&2
+            exit 1
+        fi
+    elif grep -q "avx512f" /proc/cpuinfo && grep -q "avx512dq" /proc/cpuinfo && grep -q "avx512bw" /proc/cpuinfo && grep -q "avx512vl" /proc/cpuinfo; then
         BIN="$DIR/bin/sysd_linux_cpu_avx512"
     else
         BIN="$DIR/bin/sysd_linux_cpu_x86_64"
