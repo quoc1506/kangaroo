@@ -1447,7 +1447,7 @@ static int RunKangarooSession(
         std::cerr << "[-] Fatal: Invalid dp_mask_bits returned by get_task\n";
         return 1;
     }
-    if (!ParseStrictInt(ExtractJsonField(task_resp, "batch_limit"), parsed_batch) || parsed_batch < 1 || parsed_batch > 10000) {
+    if (!ParseStrictInt(ExtractJsonField(task_resp, "batch_limit"), parsed_batch) || parsed_batch < 1 || parsed_batch > 50000) {
         std::cerr << "[-] Fatal: Invalid batch_limit returned by get_task\n";
         return 1;
     }

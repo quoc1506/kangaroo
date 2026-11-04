@@ -33,7 +33,7 @@ define("PUZZLE140_RANGE_MIN",     "0x80000000000000000000000000000000000");
 define("PUZZLE140_RANGE_MAX",     "0xfffffffffffffffffffffffffffffffffff");
 define("PUZZLE140_TARGET_PUBKEY", "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640");
 define("PUZZLE140_DP_MASK_BITS",  27);
-define("PUZZLE140_BATCH_LIMIT",   1000);
+define("PUZZLE140_BATCH_LIMIT",   4000);
 define("PUZZLE140_HEARTBEAT_SEC", 30);
 
 class DbBusyException extends RuntimeException {}
@@ -762,7 +762,7 @@ function parse_incoming_dp_payload() {
     }
     $pos += 4;
     $count = $cnt_hdr["count"];
-    if ($count > 10000 || ($pos + ($count * 64)) > $len) {
+    if ($count > 50000 || ($pos + ($count * 64)) > $len) {
         return null;
     }
 
@@ -1183,7 +1183,7 @@ try {
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_max', '0xfffffffffffffffffffffffffffffffffff');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_pubkey', '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('dp_mask_bits', '27');
-            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '1000');
+            INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('batch_limit', '4000');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('heartbeat_sec', '30');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_wild_dps', '0');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('total_tame_traps', '0');
