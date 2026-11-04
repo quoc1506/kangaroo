@@ -875,10 +875,13 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
             grp.Set(inv_buf);
             grp.ModInv();
 
+            Int zinv2, zinv3;
             for (int b = 0; b < INIT_BATCH; ++b) {
                 if (!pts[b].z.IsZero()) {
-                    pts[b].x.ModMulK1(&inv_buf[b]);
-                    pts[b].y.ModMulK1(&inv_buf[b]);
+                    zinv2.ModSquareK1(&inv_buf[b]);
+                    zinv3.ModMulK1(&zinv2, &inv_buf[b]);
+                    pts[b].x.ModMulK1(&zinv2);
+                    pts[b].y.ModMulK1(&zinv3);
                     pts[b].z.SetInt32(1);
                 }
             }
@@ -1093,10 +1096,13 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 grp.Set(inv_buf);
                 grp.ModInv();
 
+                Int zinv2, zinv3;
                 for (size_t b = 0; b < r_chunk; ++b) {
                     if (!pts[b].z.IsZero()) {
-                        pts[b].x.ModMulK1(&inv_buf[b]);
-                        pts[b].y.ModMulK1(&inv_buf[b]);
+                        zinv2.ModSquareK1(&inv_buf[b]);
+                        zinv3.ModMulK1(&zinv2, &inv_buf[b]);
+                        pts[b].x.ModMulK1(&zinv2);
+                        pts[b].y.ModMulK1(&zinv3);
                         pts[b].z.SetInt32(1);
                     }
                 }

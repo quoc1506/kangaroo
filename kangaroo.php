@@ -25,7 +25,6 @@ if (!class_exists("SQLite3")) {
 }
 
 define("PHP_GUARD", "<?" . "php http_response_code(403); exit('403 Forbidden'); ?" . ">\n");
-define("DEFAULT_SHARD_COUNT", 32);
 
 // =========================================================================
 // PUZZLE 140 DEDICATED CONSTANTS (ZERO SQLITE CONFIG QUERIES)
@@ -575,60 +574,6 @@ function purge_verify_db($base_data_dir) {
     }
 }
 
-function get_shard_db($shard_byte, $create_if_missing = true) {
-    global $is_verify_mode, $db, $shards_dir, $active_shard_mask, $active_shard_count;
-    if ($is_verify_mode) {
-        return $db;
-    }
-    static $shard_handles = [];
-    $idx = (is_int($shard_byte) ? $shard_byte : ord($shard_byte)) & $active_shard_mask;
-    $hex = str_pad(dechex($idx), 2, "0", STR_PAD_LEFT);
-    if (isset($shard_handles[$hex])) {
-        return $shard_handles[$hex];
-    }
-    $path = $shards_dir . "/traps_" . $hex . ".db";
-    if (!$create_if_missing) {
-        clearstatcache(true, $path);
-        if (!is_file($path) || filesize($path) === 0) {
-            return null;
-        }
-    }
-    for ($attempt = 0; $attempt < 5; $attempt++) {
-        $sdb = null;
-        try {
-            clearstatcache(true, $path);
-            $needs_init = (!is_file($path) || filesize($path) === 0);
-            $sdb = new SQLite3($path);
-            $sdb->enableExceptions(true);
-            $sdb->busyTimeout(30000);
-            if ($needs_init) {
-                if (!chmod($path, 0600)) {
-                    throw new RuntimeException("Failed to secure shard database permissions");
-                }
-                $sdb->exec("PRAGMA page_size = 8192; PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;");
-                $sdb->exec("CREATE TABLE IF NOT EXISTS tame_traps (
-                    dp_x BLOB PRIMARY KEY,
-                    total_distance BLOB NOT NULL
-                ) WITHOUT ROWID;");
-            }
-            $cache_kb = ($active_shard_count <= 32) ? "-4096" : "-2048";
-            $mmap_bytes = ($active_shard_count <= 32) ? "67108864" : "33554432";
-            $sdb->exec("PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 2000; PRAGMA cache_size = " . $cache_kb . "; PRAGMA mmap_size = " . $mmap_bytes . "; PRAGMA temp_store = MEMORY;");
-            $shard_handles[$hex] = $sdb;
-            return $sdb;
-        } catch (Throwable $ex) {
-            if ($sdb) {
-                try { $sdb->close(); } catch (Throwable $_cl) {}
-            }
-            if ($attempt === 4) {
-                throw new DbBusyException("Shard database busy during open: traps_" . $hex . ".db");
-            }
-            usleep(15000 * ($attempt + 1));
-        }
-    }
-    throw new DbBusyException("Shard database busy during open: traps_" . $hex . ".db");
-}
-
 function find_setting_or_null($db, $key) {
     for ($attempt = 0; $attempt < 5; $attempt++) {
         $stmt = null;
@@ -738,7 +683,7 @@ function increment_setting_int($db, $key, $delta) {
 }
 
 
-function reconcile_total_tame_traps($db, $shards_dir = "", $active_shard_count = 1, $force = false) {
+function reconcile_total_tame_traps($db, $force = false) {
     if ($force) {
         $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
         set_setting($db, "total_tame_traps", (string)$actual);
@@ -907,22 +852,14 @@ function query_active_workers($db) {
     throw new DbBusyException("Database busy while querying workers");
 }
 
-function calculate_database_size_mb($db_path, $shards_dir) {
+function calculate_database_size_mb($db_path) {
     $total_bytes = 0;
-    if (is_file($db_path)) {
-        $sz = @filesize($db_path);
-        if ($sz !== false) {
-            $total_bytes += $sz;
-        }
-    }
-    $shard_files = @glob($shards_dir . "/traps_*.db*");
-    if (is_array($shard_files)) {
-        foreach ($shard_files as $sf) {
-            if (is_file($sf)) {
-                $sz = @filesize($sf);
-                if ($sz !== false) {
-                    $total_bytes += $sz;
-                }
+    foreach (["", "-wal", "-shm"] as $ext) {
+        $f = $db_path . $ext;
+        if (is_file($f)) {
+            $sz = @filesize($f);
+            if ($sz !== false) {
+                $total_bytes += $sz;
             }
         }
     }
@@ -1171,14 +1108,11 @@ try {
     if ($is_verify_mode) {
         $db_path = $base_data_dir . "/verify.db";
         $vault_path = "";
-        $shards_dir = "";
     } else {
         $data_dir = $base_data_dir . "/" . $instance_clean;
         protect_storage_dir($data_dir);
         $db_path = $data_dir . "/system_" . $instance_clean . ".db";
         $vault_path = $data_dir . "/bingo_key.php";
-        $shards_dir = $data_dir . "/shards";
-        protect_storage_dir($shards_dir);
     }
 
     $db_existed = file_exists($db_path);
@@ -1192,11 +1126,9 @@ try {
     }
     $db->exec("PRAGMA journal_mode = WAL;");
     $db->exec("PRAGMA synchronous = NORMAL;");
-    $db->exec("PRAGMA journal_mode = WAL;");
-    $db->exec("PRAGMA synchronous = NORMAL;");
     $db->exec("PRAGMA wal_autocheckpoint = 2000;");
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
-    $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "1073741824") . ";");
+    $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
     $db->exec("
@@ -1236,8 +1168,6 @@ try {
         ");
     }
 
-    $active_shard_count = 1;
-    $active_shard_mask = 0;
 
 
     if ($action === "verify" && isset($_GET["init_id"])) {
@@ -1433,12 +1363,22 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             }
 
-            $total = reconcile_total_tame_traps($db, "", 1, false);
-            $target_dp = intval(get_required_setting($db, "target_dp"));
-            $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
-            $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-            $r_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-            $space_w = get_space_width_float($r_min, $r_max);
+            $total = reconcile_total_tame_traps($db, false);
+            if ($is_verify_mode) {
+                $target_dp = intval(get_required_setting($db, "target_dp"));
+                $dp_bits = intval(get_required_setting($db, "dp_mask_bits"));
+                $r_min = get_required_setting($db, "range_min");
+                $r_max = get_required_setting($db, "range_max");
+                $space_w = get_space_width_float($r_min, $r_max);
+            } else {
+                static $p140_space_w = null;
+                if ($p140_space_w === null) {
+                    $p140_space_w = get_space_width_float(PUZZLE140_RANGE_MIN, PUZZLE140_RANGE_MAX);
+                }
+                $target_dp = intval(find_setting_or_null($db, "target_dp") ?? 50000000);
+                $dp_bits = PUZZLE140_DP_MASK_BITS;
+                $space_w = $p140_space_w;
+            }
             $task_type = ($total >= $target_dp) ? "WILD" : "TAME";
             $prob_info = calculate_hit_probability($total, 0.0, $dp_bits, $space_w);
             if ($is_verify_mode) {
@@ -1456,9 +1396,15 @@ if ($action === "submit_tame" || $action === "check_wild") {
         }
 
         if ($action === "check_wild") {
-            $range_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
-            $range_max = $is_verify_mode ? get_required_setting($db, "range_max") : PUZZLE140_RANGE_MAX;
-            $target_pubkey = $is_verify_mode ? get_required_setting($db, "target_pubkey") : PUZZLE140_TARGET_PUBKEY;
+            if ($is_verify_mode) {
+                $range_min = get_required_setting($db, "range_min");
+                $range_max = get_required_setting($db, "range_max");
+                $target_pubkey = get_required_setting($db, "target_pubkey");
+            } else {
+                $range_min = PUZZLE140_RANGE_MIN;
+                $range_max = PUZZLE140_RANGE_MAX;
+                $target_pubkey = PUZZLE140_TARGET_PUBKEY;
+            }
 
             $chunks = array_chunk($dp_list, 100);
             foreach ($chunks as $chunk) {
@@ -1586,7 +1532,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             } catch (Throwable $_e) {}
 
-            $total_traps = reconcile_total_tame_traps($db, "", 1, false);
+            $total_traps = reconcile_total_tame_traps($db, false);
             $target_dp = intval(get_required_setting($db, "target_dp"));
             $task_type = ($total_traps >= $target_dp) ? "WILD" : "TAME";
 
@@ -1632,7 +1578,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
     // API 5: GET STATS
     if ($action === "get_stats") {
         header("Content-Type: application/json");
-        $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
+        $total_traps = reconcile_total_tame_traps($db, false);
         $target_dp = intval(get_required_setting($db, "target_dp"));
         $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
         $wild_dps_raw = find_setting_or_null($db, "total_wild_dps");
@@ -1644,7 +1590,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $prob = calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w);
 
         list($workers_list, $online_count, $total_hashrate_mhs) = query_active_workers($db);
-        $db_size_mb = calculate_database_size_mb($db_path, $shards_dir);
+        $db_size_mb = calculate_database_size_mb($db_path);
         $vault_solved = file_exists($vault_path);
 
         echo json_encode([
@@ -1676,10 +1622,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
     }
 
     // Web Dashboard (action == "")
-    $total_traps = reconcile_total_tame_traps($db, $shards_dir, $active_shard_count, false);
+    $total_traps = reconcile_total_tame_traps($db, false);
     $target_dp = intval(get_required_setting($db, "target_dp"));
     $vault_exists = file_exists($vault_path);
-    $db_size_mb = calculate_database_size_mb($db_path, $shards_dir);
+    $db_size_mb = calculate_database_size_mb($db_path);
     $dp_bits = $is_verify_mode ? intval(get_required_setting($db, "dp_mask_bits")) : PUZZLE140_DP_MASK_BITS;
     $wild_steps = get_total_wild_steps($db, $dp_bits);
     $r_min = $is_verify_mode ? get_required_setting($db, "range_min") : PUZZLE140_RANGE_MIN;
@@ -1935,7 +1881,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
             <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">Cơ Sở Dữ Liệu & Vault</div>
             <div class="stat-val"><span id="val-dbsize"><?= $db_size_mb ?></span> <span style="font-size: 13px; font-weight: normal; color: #64748b;">MB</span></div>
             <div style="font-size: 11px; margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
-                <span style="color: #64748b;"><?= $active_shard_count ?> Shards WITHOUT ROWID</span>
+                <span style="color: #64748b;">SQLite3 WAL WITHOUT ROWID</span>
                 <?php if ($vault_exists): ?>
                     <span id="val-vault-badge" class="badge badge-green" style="font-size: 11px;">BINGO (bingo_key.php)</span>
                 <?php else: ?>

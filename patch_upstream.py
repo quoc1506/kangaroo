@@ -284,7 +284,7 @@ typedef struct {
       #endif
     }
     while(cudaEventQuery(evt_sync) == cudaErrorNotReady) {
-      sched_yield();
+      Timer::SleepMillis(1);
     }'''
 
     if old_launch_pattern in cu:
