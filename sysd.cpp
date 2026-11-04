@@ -271,10 +271,13 @@ public:
         Int eff_span;
         ComputeSpawnSpan(range_width, eff_span);
         int w_bits = eff_span.GetBitLength();
-        int max_bit = (w_bits / 2) + 1;
+        // Optimal Pollard kangaroo step: mean jump ~ 0.5 * 2^(w_bits/2) (Jean-Luc Pons standard)
+        // For Puzzle 140 (139 bits): bit range 60 to 73 gives average jump ~ 2^69.4 (30-40% step reduction)
+        int max_bit = (w_bits / 2) + 4;
         if (max_bit > 120) max_bit = 120;
-        int span = (max_bit > 16) ? 14 : std::max(1, max_bit - 1);
+        int span = (max_bit > 16) ? 13 : std::max(1, max_bit - 1);
         int min_bit = max_bit - span;
+        if (min_bit < 1) min_bit = 1;
 
         for (int i = 0; i < NB_JUMP; ++i) {
             d[i].SetInt32(0);
@@ -373,14 +376,16 @@ static bool NormalizeHex(const std::string &raw, std::string &out_hex) {
     return !out_hex.empty();
 }
 
-static bool ParseStrictInt(const std::string &s, long &out_val) {
+template<typename T>
+static bool ParseStrictInt(const std::string &s, T &out_val) {
     if (s.empty()) return false;
     char *endptr = nullptr;
-    long val = std::strtol(s.c_str(), &endptr, 10);
-    if (endptr == s.c_str() || *endptr != '\0') {
+    errno = 0;
+    long long val = std::strtoll(s.c_str(), &endptr, 10);
+    if (errno != 0 || endptr == s.c_str() || *endptr != '\0') {
         return false;
     }
-    out_val = val;
+    out_val = static_cast<T>(val);
     return true;
 }
 
@@ -777,6 +782,11 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
     std::vector<Int> zero_dists(total_kangaroos);
     std::vector<Int> base_dist(total_kangaroos);
     std::vector<uint32_t> gpu_dp_count(total_kangaroos, 0);
+    std::vector<uint64_t> gpu_spawn_launch(total_kangaroos, 0);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
+    uint64_t max_launches = max_kangaroo_steps / NB_RUN;
+    if (max_launches < 1) max_launches = 1;
+    uint64_t current_launch = 0;
 
     Int w_half(&range_width);
     w_half.ShiftR(1);
@@ -1020,6 +1030,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
             std::exit(1);
         }
 
+        current_launch++;
         uint64_t batch_steps = (uint64_t)total_kangaroos * NB_RUN;
         g_state.total_steps += batch_steps;
         respawn_indices.clear();
@@ -1052,6 +1063,17 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                     in_respawn[item.kIdx] = true;
                     gpu_dp_count[item.kIdx] = 0;
                     respawn_indices.push_back(item.kIdx);
+                }
+            }
+        }
+
+        // Scan periodically (every 64 launches) to respawn GPU kangaroos trapped in short loops or dead walks
+        if ((current_launch & 63ULL) == 0ULL) {
+            for (int k = 0; k < total_kangaroos; ++k) {
+                if (!in_respawn[k] && (current_launch - gpu_spawn_launch[k]) >= max_launches) {
+                    in_respawn[k] = true;
+                    gpu_dp_count[k] = 0;
+                    respawn_indices.push_back(k);
                 }
             }
         }
@@ -1184,7 +1206,9 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
 
             gpu->SetKangaroosBatch(batch_items.data(), batch_items.size());
             for (size_t idx = 0; idx < respawn_indices.size(); ++idx) {
-                in_respawn[respawn_indices[idx]] = false;
+                uint64_t r_k = respawn_indices[idx];
+                gpu_spawn_launch[r_k] = current_launch;
+                in_respawn[r_k] = false;
             }
             respawn_indices.clear();
         }
@@ -1217,8 +1241,17 @@ static inline bool IsJsonSep(char c) {
     return IsJsonSpace(c) || c == '{' || c == '}' || c == ',' || c == '[' || c == ']';
 }
 
-static std::string ExtractJsonField(const std::string &json, const std::string &field) {
-    size_t i = 0;
+static std::string ExtractJsonField(const std::string &raw_json, const std::string &field) {
+    if (raw_json.empty()) return "";
+    size_t start_pos = 0;
+    while (start_pos < raw_json.size() && IsJsonSpace(raw_json[start_pos])) start_pos++;
+    // If response is HTML error page or does not start with JSON object/array, abort gracefully
+    if (start_pos >= raw_json.size() || (raw_json[start_pos] != '{' && raw_json[start_pos] != '[')) {
+        return "";
+    }
+
+    const std::string &json = raw_json;
+    size_t i = start_pos;
     const size_t len = json.size();
     while (i < len) {
         while (i < len && IsJsonSep(json[i])) {
@@ -1235,10 +1268,13 @@ static std::string ExtractJsonField(const std::string &json, const std::string &
             }
             if (i >= len) break;
             std::string current_key = json.substr(key_start, i - key_start);
-            i++;
+            if (i < len && json[i] == '"') i++;
 
             while (i < len && IsJsonSpace(json[i])) i++;
-            if (i >= len || json[i] != ':') continue;
+            if (i >= len || json[i] != ':') {
+                if (i < len) i++;
+                continue;
+            }
             i++;
 
             while (i < len && IsJsonSpace(json[i])) i++;
@@ -1316,6 +1352,10 @@ static bool SendBatchReliable(
             if (st == "OK" || st == "CONTINUE" || st == "BINGO") {
                 out_resp_body = std::move(res.body);
                 return true;
+            }
+            if (res.body.find("<br") != std::string::npos || res.body.find("Fatal error") != std::string::npos || res.body.find("Notice") != std::string::npos) {
+                std::cerr << "[-] Server returned PHP error in HTTP 200 response: "
+                          << res.body.substr(0, std::min((size_t)140, res.body.size())) << "...\n";
             }
         }
 

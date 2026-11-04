@@ -340,8 +340,12 @@ function fn_sub($a, $b, $N) {
         list($r, $_) = u256_sub($a, $b);
         return $r;
     }
-    list($s, $_c) = u256_add($a, $N);
-    list($r, $_b) = u256_sub($s, $b);
+    // Safe modular subtraction (a - b) mod N = (N - b) + a to prevent 256-bit addition overflow
+    list($diff, $_) = u256_sub($N, $b);
+    list($r, $c) = u256_add($diff, $a);
+    if ($c > 0 || u256_cmp($r, $N) >= 0) {
+        list($r, $_) = u256_sub($r, $N);
+    }
     return $r;
 }
 
@@ -802,7 +806,16 @@ function calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w
     }
 
     $exponent = (0.75 * $tame_steps * (float)$wild_steps) / (float)$space_w;
-    $prob = 1.0 - exp(-$exponent);
+    // Underflow guard: When $exponent < 1e-15, IEEE-754 exp(-$exponent) rounds to 1.0, causing 1.0 - 1.0 = 0.0.
+    // -expm1(-$exponent) preserves subnormal & tiny probabilities with full precision.
+    if ($exponent <= 0.0) {
+        $prob = 0.0;
+    } elseif ($exponent < 1e-15) {
+        $prob = $exponent; // Taylor series: 1 - exp(-x) ≈ x
+    } else {
+        $prob = -expm1(-$exponent);
+    }
+    if ($prob > 1.0) $prob = 1.0;
     return [
         "mode" => "WILD_ACTIVE",
         "prob_numeric" => $prob,
@@ -864,6 +877,15 @@ function calculate_database_size_mb($db_path) {
         }
     }
     return round($total_bytes / (1024 * 1024), 2);
+}
+
+function prune_stale_workers($db) {
+    // TTL Cleanup: Purge inactive workers older than 24h probabilistically (~2% of submissions)
+    if (mt_rand(1, 50) === 1) {
+        try {
+            $db->exec("DELETE FROM active_workers WHERE last_seen < datetime('now', '-24 hours');");
+        } catch (Throwable $_e) {}
+    }
 }
 
 try {
@@ -1351,6 +1373,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
                     $db->exec("COMMIT;");
                     $in_tx = false;
+                    prune_stale_workers($db);
                     break;
                 } catch (Throwable $ex) {
                     if ($in_tx) {
@@ -1530,6 +1553,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 if ($batch_size > 0) {
                     increment_setting_int($db, "total_wild_dps", $batch_size);
                 }
+                prune_stale_workers($db);
             } catch (Throwable $_e) {}
 
             $total_traps = reconcile_total_tame_traps($db, false);
