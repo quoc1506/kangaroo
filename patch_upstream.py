@@ -107,19 +107,15 @@ def patch_secpk1_int():
 // Missing intrinsics - Portable Clang / GCC (ARM64 & x86_64) implementation
 #if defined(__x86_64__) || defined(_M_X64)
 static uint64_t inline _umul128(uint64_t a, uint64_t b, uint64_t *h) {
-  uint64_t rhi;
-  uint64_t rlo;
-  __asm__( "mulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
-  *h = rhi;
-  return rlo;
+  unsigned __int128 res = (unsigned __int128)a * (unsigned __int128)b;
+  *h = (uint64_t)(res >> 64);
+  return (uint64_t)res;
 }
 
 static int64_t inline _mul128(int64_t a, int64_t b, int64_t *h) {
-  uint64_t rhi;
-  uint64_t rlo;
-  __asm__( "imulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
-  *h = rhi;
-  return rlo;  
+  __int128 res = (__int128)a * (__int128)b;
+  *h = (int64_t)(res >> 64);
+  return (int64_t)res;
 }
 
 static uint64_t inline _udiv128(uint64_t hi, uint64_t lo, uint64_t d,uint64_t *r) {
@@ -236,14 +232,40 @@ typedef struct {
             "  bool initialised;",
             "  bool initialised;\n  KangarooGpuItem *d_respawn_buffer;\n  KangarooGpuItem *h_gpu_items;\n  size_t d_respawn_capacity;\n  cudaEvent_t evt_sync;"
         )
-        with open("GPU/GPUEngine.h", "w") as f:
-            f.write(h)
+    h = h.replace("uint32_t kangarooSize;", "size_t kangarooSize;")
+    h = h.replace("uint32_t kangarooSizePinned;", "size_t kangarooSizePinned;")
+    with open("GPU/GPUEngine.h", "w") as f:
+        f.write(h)
 
     # 2. Patch GPU/GPUEngine.cu
     if not os.path.exists("GPU/GPUEngine.cu"):
         return
     with open("GPU/GPUEngine.cu", "r") as f:
         cu = f.read()
+
+    # Modern GPU SM architecture core counts (Ampere, Ada Lovelace, Hopper, Blackwell)
+    cu = cu.replace(
+        "    { 0x75,  64 },\n    { -1, -1 } };",
+        "    { 0x75,  64 },\n    { 0x80,  64 },\n    { 0x86, 128 },\n    { 0x87, 128 },\n    { 0x89, 128 },\n    { 0x90, 128 },\n    { 0xa0, 128 },\n    { 0xc0, 128 },\n    { -1, -1 } };"
+    )
+
+    # 64-bit pointer arithmetic and buffer allocation
+    cu = cu.replace(
+        "int xPtr = (blockIdx.x*blockDim.x*GPU_GRP_SIZE) * KSIZE;",
+        "size_t xPtr = ((size_t)blockIdx.x * (size_t)blockDim.x * (size_t)GPU_GRP_SIZE) * (size_t)KSIZE;"
+    )
+    cu = cu.replace(
+        "kangarooSize = nbThread * GPU_GRP_SIZE * KSIZE * 8;",
+        "kangarooSize = (size_t)nbThread * (size_t)GPU_GRP_SIZE * (size_t)KSIZE * 8;"
+    )
+    cu = cu.replace(
+        "kangarooSizePinned = nbThreadPerGroup * GPU_GRP_SIZE *  KSIZE * 8;",
+        "kangarooSizePinned = (size_t)nbThreadPerGroup * (size_t)GPU_GRP_SIZE * (size_t)KSIZE * 8;"
+    )
+    cu = cu.replace(
+        "uint32_t offset = b * blockSize;",
+        "size_t offset = (size_t)b * (size_t)blockSize;"
+    )
 
     if "d_respawn_buffer = NULL;" not in cu:
         cu = cu.replace(

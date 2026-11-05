@@ -1343,6 +1343,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $items_to_insert[] = ["x" => $bin_x, "dist" => $packed_dist];
             }
 
+            usort($items_to_insert, function ($a, $b) {
+                return strcmp($a["x"], $b["x"]);
+            });
+
             for ($attempt = 0; $attempt < 10; $attempt++) {
                 $actual_inserted = 0;
                 $in_tx = false;
@@ -1699,6 +1703,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
     $prob_info = calculate_hit_probability($total_traps, $wild_steps, $dp_bits, $space_w);
     list($workers, $active_workers_count, $total_hashrate_mhs) = query_active_workers($db);
     $progress_pct = min(100.0, round(($total_traps / max(1, $target_dp)) * 100.0, 2));
+    $batch_limit = $is_verify_mode ? intval(get_required_setting($db, "batch_limit")) : PUZZLE140_BATCH_LIMIT;
 
 } catch (DbBusyException $e) {
     http_response_code(503);
@@ -1929,7 +1934,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     <span class="pulse-dot"></span>
                     <span id="val-workers-count"><?= $active_workers_count ?> Online (<?= count($workers) ?> tổng)</span>
                 </span>
-                <span style="color: #64748b;">Batch 1,000 DPs</span>
+                <span style="color: #64748b;">Batch <?= number_format($batch_limit) ?> DPs</span>
             </div>
         </div>
 

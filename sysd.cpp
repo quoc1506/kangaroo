@@ -90,12 +90,7 @@ struct DPRecord {
 };
 
 inline void IntToBin32(const Int &val, uint8_t *out) {
-    for (int i = 0; i < 4; ++i) {
-        uint64_t w = val.bits64[3 - i];
-        for (int b = 7; b >= 0; --b) {
-            out[i * 8 + (7 - b)] = (uint8_t)((w >> (b * 8)) & 0xFF);
-        }
-    }
+    const_cast<Int&>(val).Get32Bytes(out);
 }
 
 struct HttpResult {
@@ -727,11 +722,6 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 }
 
 #ifdef USE_CUDA
-struct GpuStagedRespawn {
-    uint64_t kIdx;
-    Int new_base;
-};
-
 // FULL NATIVE CUDA GPU WORKER THREAD (256-bit Host Base Distance + Parallel Montgomery Init + Staged Respawn)
 static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp, JumpTable *jt, int dp_bits, bool is_wild, Int range_min, Int range_max, Point target_pub) {
     cudaError_t dev_err = cudaSetDevice(gpu_id);
@@ -891,13 +881,10 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
             grp.Set(inv_buf);
             grp.ModInv();
 
-            Int zinv2, zinv3;
             for (int b = 0; b < INIT_BATCH; ++b) {
                 if (!pts[b].z.IsZero()) {
-                    zinv2.ModSquareK1(&inv_buf[b]);
-                    zinv3.ModMulK1(&zinv2, &inv_buf[b]);
-                    pts[b].x.ModMulK1(&zinv2);
-                    pts[b].y.ModMulK1(&zinv3);
+                    pts[b].x.ModMulK1(&inv_buf[b]);
+                    pts[b].y.ModMulK1(&inv_buf[b]);
                     pts[b].z.SetInt32(1);
                 }
             }
@@ -1003,7 +990,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
         return;
     }
 
-    bool direct_gpu_dist = (!is_wild && range_max.GetBitLength() <= 120);
+    const bool direct_gpu_dist = false;
     Int zero_offset;
     zero_offset.SetInt32(0);
     gpu->SetWildOffset(&zero_offset);
@@ -1124,13 +1111,10 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 grp.Set(inv_buf);
                 grp.ModInv();
 
-                Int zinv2, zinv3;
                 for (size_t b = 0; b < r_chunk; ++b) {
                     if (!pts[b].z.IsZero()) {
-                        zinv2.ModSquareK1(&inv_buf[b]);
-                        zinv3.ModMulK1(&zinv2, &inv_buf[b]);
-                        pts[b].x.ModMulK1(&zinv2);
-                        pts[b].y.ModMulK1(&zinv3);
+                        pts[b].x.ModMulK1(&inv_buf[b]);
+                        pts[b].y.ModMulK1(&inv_buf[b]);
                         pts[b].z.SetInt32(1);
                     }
                 }
