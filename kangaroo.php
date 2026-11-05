@@ -32,6 +32,14 @@ define("PHP_GUARD", "<?" . "php http_response_code(403); exit('403 Forbidden'); 
 define("PUZZLE140_RANGE_MIN",     "0x80000000000000000000000000000000000");
 define("PUZZLE140_RANGE_MAX",     "0xfffffffffffffffffffffffffffffffffff");
 define("PUZZLE140_TARGET_PUBKEY", "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640");
+// DP_MASK_BITS = 27: GIA TRI CHUAN XAC TUYET DOI - KHONG DUOC TU Y NANG LEN 43-44.
+// Ly do ky thuat & he thong phan tan:
+// 1. Tan suat Checkpoint: 2^27 (~134 trieu buoc/DP). GPU 800 MH/s ra 1 DP sau ~0.16s, CPU 40 MH/s ra 1 DP sau ~3.3s.
+//    Worker gom du batch 4,000 DP sau vai phut de gui ve SQLite luu tien do, tranh mat trang cong suc khi dut mang/crash/het gio cloud.
+// 2. Neu de DP 44: 2^44 = 17.59 NGHIN TY buoc/DP. GPU 800 MH/s mat 6.1 TIENG moi ra 1 DP, CPU mat 5.1 NGAY.
+//    Worker chay hang tieng khong nop duoc trap nao, mat mang la mat 100% cong suc; server heartbeat 30s bi te liet thanh batch rong.
+// 3. Khong pha vo co che Respawn: sysd quy dinh kangaroo respawn sau 5 DP hoac max_steps (1 << (dp+5)).
+//    Voi DP 44, kangaroo phai di 2^49 buoc moi respawn, bi ket vong lap hang chuc nam.
 define("PUZZLE140_DP_MASK_BITS",  27);
 define("PUZZLE140_BATCH_LIMIT",   4000);
 define("PUZZLE140_HEARTBEAT_SEC", 30);
@@ -1342,7 +1350,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $db->exec("BEGIN IMMEDIATE TRANSACTION;");
                     $in_tx = true;
 
-                    $chunks = array_chunk($items_to_insert, 100);
+                    $chunks = array_chunk($items_to_insert, 500);
                     foreach ($chunks as $chunk) {
                         $placeholders = implode(",", array_fill(0, count($chunk), "(?, ?)"));
                         $sins = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . $placeholders . ";");

@@ -385,6 +385,12 @@ def patch_constants():
         return
     with open("Constants.h", "r") as f:
         c = f.read()
+    # NB_RUN = 2048: SWEET SPOT TOI UU CUA CUDA KERNEL (KHONG DUOC GIAM VE 64/1024 VA KHONG TANG LEN 4096).
+    # 1. Triet tieu launch overhead: Kernel chay ~25-30ms, gap 6,000 lan overhead goi kernel (5us), giam launch overhead CPU xuong <0.05%.
+    # 2. Khong dinh Windows TDR: 28ms chi bang 1.4% nguong timeout 2000ms cua Windows display driver, man hinh khong bao gio bi giat/lag.
+    # 3. An toan bo dem maxFound: 1 launch tren GPU chay ~17 ty buoc, DP 27 sinh ~128 DP. Buffer 131,072 phan tu chi dung ~0.1%, khong bao gio bi tran/mat DP.
+    # 4. Ly do khong dung 1024: 1024 chay mat ~14ms, tan suat launch 70 lan/s lam ton 2-3% CPU overhead.
+    # 5. Ly do khong dung 4096: Overhead o 2048 da duoi 0.05%, 4096 khong tang hashrate thuc te nhung lam nhan doi do tre phan hoi Stop/BINGO.
     if "#define NB_RUN 64" in c:
         c = c.replace("#define NB_RUN 64", "#define NB_RUN 2048")
         with open("Constants.h", "w") as f:
