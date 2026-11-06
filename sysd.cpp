@@ -156,11 +156,9 @@ static void CleanupMainCurlHandle() {
 }
 
 static void HandleStopSignal(int) {
-    g_state.stop_signal = true;
-    g_state.worker_active = false;
-    g_state.running = false;
-    g_state.cv_not_full.notify_all();
-    g_state.cv_not_empty.notify_all();
+    g_state.stop_signal.store(true, std::memory_order_relaxed);
+    g_state.worker_active.store(false, std::memory_order_relaxed);
+    g_state.running.store(false, std::memory_order_relaxed);
 }
 
 static void SetProcessName(const char *name = "k-engine") {
@@ -423,7 +421,7 @@ static std::vector<uint8_t> BuildDpkgPacket(
     const std::string &worker_id,
     const std::string &hw_info,
     const std::string &hr_str,
-    const std::vector<DPRecord> &batch
+    std::vector<DPRecord> &batch
 ) {
     std::vector<uint8_t> packet;
     packet.reserve(16 + worker_id.size() + hw_info.size() + hr_str.size() + batch.size() * 64);
@@ -451,18 +449,16 @@ static std::vector<uint8_t> BuildDpkgPacket(
     uint32_t count_be = htonl((uint32_t)batch.size());
     packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
 
-    // Client-side batch pre-sorting by 32-byte DP x (0.15ms in C++ vs 18ms usort in PHP)
-    // Ensures strictly ascending primary keys for SQLite WITHOUT ROWID B-Tree insertions
-    std::vector<DPRecord> sorted_batch = batch;
-    if (sorted_batch.size() > 1) {
-        std::sort(sorted_batch.begin(), sorted_batch.end(), [](const DPRecord &a, const DPRecord &b) {
+    // Client-side batch pre-sorting by 32-byte DP x in-place (zero 256KB copy)
+    if (batch.size() > 1) {
+        std::sort(batch.begin(), batch.end(), [](const DPRecord &a, const DPRecord &b) {
             return std::memcmp(a.x, b.x, 32) < 0;
         });
     }
 
-    for (size_t i = 0; i < sorted_batch.size(); ++i) {
-        packet.insert(packet.end(), sorted_batch[i].x, sorted_batch[i].x + 32);
-        packet.insert(packet.end(), sorted_batch[i].dist, sorted_batch[i].dist + 32);
+    for (size_t i = 0; i < batch.size(); ++i) {
+        packet.insert(packet.end(), batch[i].x, batch[i].x + 32);
+        packet.insert(packet.end(), batch[i].dist, batch[i].dist + 32);
     }
 
     return packet;
@@ -471,10 +467,8 @@ static std::vector<uint8_t> BuildDpkgPacket(
 static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
     if (local_recs.empty()) return;
     std::unique_lock<std::mutex> lock(g_state.queue_mutex);
-    if (g_state.worker_active.load()) {
-        g_state.cv_not_full.wait(lock, [&]() {
-            return g_state.dp_queue.size() < g_state.max_queue_dps.load() || !g_state.worker_active.load();
-        });
+    while (g_state.dp_queue.size() >= g_state.max_queue_dps.load() && g_state.worker_active.load()) {
+        g_state.cv_not_full.wait_for(lock, std::chrono::milliseconds(50));
     }
     // Efficient range insert to reduce mutex hold duration
     g_state.dp_queue.insert(
@@ -515,14 +509,14 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
-    alignas(64) static thread_local Int px[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int py[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int distance[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int dx[CPU_GRP_SIZE];
-    alignas(64) static thread_local uint32_t jmp[CPU_GRP_SIZE];
+    alignas(64) Int px[CPU_GRP_SIZE];
+    alignas(64) Int py[CPU_GRP_SIZE];
+    alignas(64) Int distance[CPU_GRP_SIZE];
+    alignas(64) Int dx[CPU_GRP_SIZE];
+    alignas(64) uint32_t jmp[CPU_GRP_SIZE];
 
-    alignas(64) static thread_local uint32_t tame_dp_count[CPU_GRP_SIZE];
-    alignas(64) static thread_local uint64_t tame_step_count[CPU_GRP_SIZE];
+    alignas(64) uint32_t tame_dp_count[CPU_GRP_SIZE];
+    alignas(64) uint64_t tame_step_count[CPU_GRP_SIZE];
 
     auto spawn_tame_kangaroo = [&](int g) {
         while (true) {
@@ -638,14 +632,14 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
 
     IntGroup grp(CPU_GRP_SIZE);
-    alignas(64) static thread_local Int px[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int py[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int distance[CPU_GRP_SIZE];
-    alignas(64) static thread_local Int dx[CPU_GRP_SIZE];
-    alignas(64) static thread_local uint32_t jmp[CPU_GRP_SIZE];
+    alignas(64) Int px[CPU_GRP_SIZE];
+    alignas(64) Int py[CPU_GRP_SIZE];
+    alignas(64) Int distance[CPU_GRP_SIZE];
+    alignas(64) Int dx[CPU_GRP_SIZE];
+    alignas(64) uint32_t jmp[CPU_GRP_SIZE];
 
-    alignas(64) static thread_local uint32_t wild_dp_count[CPU_GRP_SIZE];
-    alignas(64) static thread_local uint64_t wild_step_count[CPU_GRP_SIZE];
+    alignas(64) uint32_t wild_dp_count[CPU_GRP_SIZE];
+    alignas(64) uint64_t wild_step_count[CPU_GRP_SIZE];
 
     auto spawn_wild_kangaroo = [&](int g) {
         while (true) {
@@ -1349,7 +1343,7 @@ static bool SendBatchReliable(
     bool is_wild_mode,
     const std::string &hw_info,
     const std::string &hr_str,
-    const std::vector<DPRecord> &batch,
+    std::vector<DPRecord> &batch,
     std::string &out_resp_body,
     bool allow_retry_until_stopped
 ) {
@@ -1547,7 +1541,8 @@ static int RunKangarooSession(
         auto now = std::chrono::steady_clock::now();
         double since_send = std::chrono::duration<double>(now - last_send_time).count();
         double wait_sec = std::max(0.001, heartbeat_sec - since_send);
-        auto wait_duration = std::chrono::milliseconds(is_verify ? 2 : (int)(wait_sec * 1000.0));
+        int wait_ms = is_verify ? 2 : std::min(100, std::max(1, (int)(wait_sec * 1000.0)));
+        auto wait_duration = std::chrono::milliseconds(wait_ms);
 
         {
             std::unique_lock<std::mutex> lock(g_state.queue_mutex);

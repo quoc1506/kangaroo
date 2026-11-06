@@ -1154,6 +1154,7 @@ try {
     }
 
     $db_existed = file_exists($db_path);
+    $db_needs_init = (!$db_existed || @filesize($db_path) === 0);
     $db = new SQLite3($db_path);
     $db->enableExceptions(true);
     $db->busyTimeout(30000);
@@ -1175,28 +1176,30 @@ try {
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
-    $db->exec("
-        CREATE TABLE IF NOT EXISTS system_settings (
-            setting_key TEXT PRIMARY KEY,
-            setting_value TEXT NOT NULL
-        );
+    if ($db_needs_init) {
+        $db->exec("
+            CREATE TABLE IF NOT EXISTS system_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS active_workers (
-            worker_id TEXT PRIMARY KEY,
-            hardware TEXT NOT NULL,
-            hashrate TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            total_dps INTEGER NOT NULL DEFAULT 0,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS active_workers (
+                worker_id TEXT PRIMARY KEY,
+                hardware TEXT NOT NULL,
+                hashrate TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_dps INTEGER NOT NULL DEFAULT 0,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_workers_last_seen ON active_workers(last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_workers_last_seen ON active_workers(last_seen DESC);
 
-        CREATE TABLE IF NOT EXISTS tame_traps (
-            dp_x BLOB PRIMARY KEY,
-            total_distance BLOB NOT NULL
-        ) WITHOUT ROWID;
-    ");
+            CREATE TABLE IF NOT EXISTS tame_traps (
+                dp_x BLOB PRIMARY KEY,
+                total_distance BLOB NOT NULL
+            ) WITHOUT ROWID;
+        ");
+    }
 
     if (!$db_existed && !$is_verify_mode) {
         $db->exec("
@@ -1372,17 +1375,17 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $db->exec("BEGIN IMMEDIATE TRANSACTION;");
                     $in_tx = true;
 
-                    $chunks = array_chunk($items_to_insert, 500);
-                    $stmt500 = null;
-                    if (count($items_to_insert) >= 500) {
-                        $sql500 = "INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . implode(",", array_fill(0, 500, "(?, ?)")) . ";";
-                        $stmt500 = $db->prepare($sql500);
+                    $chunks = array_chunk($items_to_insert, 450);
+                    $stmt450 = null;
+                    if (count($items_to_insert) >= 450) {
+                        $sql450 = "INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . implode(",", array_fill(0, 450, "(?, ?)")) . ";";
+                        $stmt450 = $db->prepare($sql450);
                     }
                     foreach ($chunks as $chunk) {
                         $cnt = count($chunk);
-                        $is_500 = ($cnt === 500 && $stmt500 !== null);
-                        if ($is_500) {
-                            $stmt = $stmt500;
+                        $is_450 = ($cnt === 450 && $stmt450 !== null);
+                        if ($is_450) {
+                            $stmt = $stmt450;
                             $stmt->reset();
                         } else {
                             $placeholders = implode(",", array_fill(0, $cnt, "(?, ?)"));
@@ -1394,13 +1397,13 @@ if ($action === "submit_tame" || $action === "check_wild") {
                             $stmt->bindValue($param_idx++, $item["dist"], SQLITE3_BLOB);
                         }
                         $stmt->execute();
-                        if (!$is_500) {
+                        if (!$is_450) {
                             $stmt->close();
                         }
                         $actual_inserted += $db->changes();
                     }
-                    if ($stmt500 !== null) {
-                        $stmt500->close();
+                    if ($stmt450 !== null) {
+                        $stmt450->close();
                     }
 
                     if ($actual_inserted > 0) {
@@ -1487,20 +1490,20 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $target_pubkey = PUZZLE140_TARGET_PUBKEY;
             }
 
-            $chunks = array_chunk($dp_list, 500);
-            $stmt_chk_500 = null;
-            if (count($dp_list) >= 500) {
-                $sql_chk_500 = "SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN (" . implode(",", array_fill(0, 500, "?")) . ");";
-                $stmt_chk_500 = $db->prepare($sql_chk_500);
+            $chunks = array_chunk($dp_list, 450);
+            $stmt_chk_450 = null;
+            if (count($dp_list) >= 450) {
+                $sql_chk_450 = "SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN (" . implode(",", array_fill(0, 450, "?")) . ");";
+                $stmt_chk_450 = $db->prepare($sql_chk_450);
             }
             foreach ($chunks as $chunk) {
                 $cnt = count($chunk);
                 if ($cnt === 0) {
                     continue;
                 }
-                $is_500 = ($cnt === 500 && $stmt_chk_500 !== null);
-                if ($is_500) {
-                    $schk = $stmt_chk_500;
+                $is_450 = ($cnt === 450 && $stmt_chk_450 !== null);
+                if ($is_450) {
+                    $schk = $stmt_chk_450;
                     $schk->reset();
                 } else {
                     $placeholders = implode(",", array_fill(0, $cnt, "?"));
@@ -1517,7 +1520,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $matched_rows[] = $row;
                 }
                 $sres->finalize();
-                if (!$is_500) {
+                if (!$is_450) {
                     $schk->close();
                 }
 
@@ -1604,74 +1607,51 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             }
 
-            if ($stmt_chk_500 !== null) {
-                $stmt_chk_500->close();
+            if ($stmt_chk_450 !== null) {
+                $stmt_chk_450->close();
             }
 
-            // Throttled worker telemetry in WILD mode: keep check_wild pure read-only.
-            // Only update worker telemetry if verify mode, heartbeat packet, or worker hasn't reported in >25s
-            $should_update_worker = $is_verify_mode || ($batch_size === 0);
-            if (!$should_update_worker) {
-                $last_seen_ts = 0;
-                $chk_w = $db->prepare("SELECT strftime('%s', last_seen) AS ts FROM active_workers WHERE worker_id = :wid LIMIT 1;");
-                if ($chk_w) {
-                    $chk_w->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                    $chk_res = $chk_w->execute();
-                    $chk_row = $chk_res->fetchArray(SQLITE3_ASSOC);
-                    if ($chk_row && isset($chk_row['ts'])) {
-                        $last_seen_ts = intval($chk_row['ts']);
+            for ($w_att = 0; $w_att < 5; $w_att++) {
+                $in_w_tx = false;
+                try {
+                    $db->exec("BEGIN IMMEDIATE TRANSACTION;");
+                    $in_w_tx = true;
+                    $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                            VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(worker_id) DO UPDATE SET
+                                                hardware = :hw,
+                                                hashrate = :hr,
+                                                mode = :mode,
+                                                total_dps = total_dps + :dps,
+                                                last_seen = CURRENT_TIMESTAMP;");
+                    $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
+                    $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
+                    $w_stmt->execute();
+                    $w_stmt->close();
+                    if ($batch_size > 0) {
+                        $s_upd = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
+                            VALUES ('total_wild_dps', CAST(:d AS TEXT))
+                            ON CONFLICT(setting_key) DO UPDATE SET
+                                setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
+                        $s_upd->bindValue(":d", $batch_size, SQLITE3_INTEGER);
+                        $s_upd->execute();
+                        $s_upd->close();
                     }
-                    $chk_res->finalize();
-                    $chk_w->close();
-                }
-                if ((time() - $last_seen_ts) >= 25) {
-                    $should_update_worker = true;
-                }
-            }
-
-            if ($should_update_worker) {
-                for ($w_att = 0; $w_att < 5; $w_att++) {
+                    $db->exec("COMMIT;");
                     $in_w_tx = false;
-                    try {
-                        $db->exec("BEGIN IMMEDIATE TRANSACTION;");
-                        $in_w_tx = true;
-                        $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
-                                                VALUES (:wid, :hw, :hr, :mode, :dps, CURRENT_TIMESTAMP)
-                                                ON CONFLICT(worker_id) DO UPDATE SET
-                                                    hardware = :hw,
-                                                    hashrate = :hr,
-                                                    mode = :mode,
-                                                    total_dps = total_dps + :dps,
-                                                    last_seen = CURRENT_TIMESTAMP;");
-                        $w_stmt->bindValue(":wid", $worker_id, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hw", $hardware, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":hr", $hashrate, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":mode", $current_mode, SQLITE3_TEXT);
-                        $w_stmt->bindValue(":dps", $batch_size, SQLITE3_INTEGER);
-                        $w_stmt->execute();
-                        $w_stmt->close();
-                        if ($batch_size > 0) {
-                            $s_upd = $db->prepare("INSERT INTO system_settings (setting_key, setting_value)
-                                VALUES ('total_wild_dps', CAST(:d AS TEXT))
-                                ON CONFLICT(setting_key) DO UPDATE SET
-                                    setting_value = CAST(CAST(setting_value AS INTEGER) + :d AS TEXT);");
-                            $s_upd->bindValue(":d", $batch_size, SQLITE3_INTEGER);
-                            $s_upd->execute();
-                            $s_upd->close();
-                        }
-                        $db->exec("COMMIT;");
-                        $in_w_tx = false;
-                        prune_stale_workers($db);
-                        break;
-                    } catch (Throwable $_w_ex) {
-                        if ($in_w_tx) {
-                            try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
-                        }
-                        if ($w_att === 4) {
-                            break;
-                        }
-                        usleep(10000 * ($w_att + 1));
+                    prune_stale_workers($db);
+                    break;
+                } catch (Throwable $_w_ex) {
+                    if ($in_w_tx) {
+                        try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
                     }
+                    if ($w_att === 4) {
+                        break;
+                    }
+                    usleep(10000 * ($w_att + 1));
                 }
             }
 
