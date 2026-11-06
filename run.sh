@@ -38,8 +38,11 @@ elif [ "$OS" = "Linux" ]; then
         fi
     elif [ -f /proc/cpuinfo ] && grep -q "avx512f" /proc/cpuinfo && grep -q "avx512dq" /proc/cpuinfo && grep -q "avx512bw" /proc/cpuinfo && grep -q "avx512vl" /proc/cpuinfo; then
         BIN="$DIR/bin/sysd_linux_cpu_avx512"
-    else
+    elif [ -f /proc/cpuinfo ] && grep -q "avx2" /proc/cpuinfo; then
         BIN="$DIR/bin/sysd_linux_cpu_x86_64"
+    else
+        echo "[-] Fatal: CPU lacks required AVX2 instruction set support (check /proc/cpuinfo for avx2)" >&2
+        exit 1
     fi
 else
     echo "[-] Fatal: Unsupported operating system: $OS" >&2

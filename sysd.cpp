@@ -1522,8 +1522,10 @@ static int RunKangarooSession(
 
     launch_all_workers(is_wild_mode);
 
-    auto last_send_time = std::chrono::steady_clock::now();
-    auto last_rate_time = last_send_time;
+    auto session_start_time = std::chrono::steady_clock::now();
+    auto last_send_time = session_start_time;
+    auto last_rate_time = session_start_time;
+    bool has_initial_announced = false;
     uint64_t last_steps = g_state.total_steps.load();
     double cached_hashrate_mhs = 0.0;
     int verify_batches_sent = 0;
@@ -1561,8 +1563,13 @@ static int RunKangarooSession(
             queued_count = g_state.dp_queue.size();
         }
 
-        if (queued_count < batch_limit && since_send < heartbeat_sec) {
+        double since_start = std::chrono::duration<double>(now - session_start_time).count();
+        bool is_early_announce = (!is_verify && !has_initial_announced && since_start >= 3.0);
+        if (queued_count < batch_limit && since_send < heartbeat_sec && !is_early_announce) {
             continue;
+        }
+        if (is_early_announce) {
+            has_initial_announced = true;
         }
 
         last_send_time = now;
@@ -1735,7 +1742,7 @@ static int RunKangarooSession(
     }
 
     if (!is_verify && g_state.stop_signal.load()) {
-        std::string hr_str = "0.00 MH/s";
+        std::string hr_str = format_hashrate(cached_hashrate_mhs);
         while (true) {
             std::vector<DPRecord> final_batch;
             {
