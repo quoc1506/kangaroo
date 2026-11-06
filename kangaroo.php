@@ -1281,6 +1281,20 @@ try {
             : file_exists($vault_path);
         $task_type = ($tame_count >= $target_dp) ? "WILD" : "TAME";
 
+        $incoming_worker_id = isset($_GET["worker_id"]) ? trim((string)$_GET["worker_id"]) : "";
+        if ($incoming_worker_id !== "" && strlen($incoming_worker_id) <= 128) {
+            try {
+                $w_stmt = $db->prepare("INSERT INTO active_workers (worker_id, hardware, hashrate, mode, total_dps, last_seen)
+                                        VALUES (:wid, 'Initializing...', '0.00 MH/s', :mode, 0, CURRENT_TIMESTAMP)
+                                        ON CONFLICT(worker_id) DO UPDATE SET
+                                            last_seen = CURRENT_TIMESTAMP;");
+                $w_stmt->bindValue(":wid", $incoming_worker_id, SQLITE3_TEXT);
+                $w_stmt->bindValue(":mode", $task_type, SQLITE3_TEXT);
+                $w_stmt->execute();
+                $w_stmt->close();
+            } catch (Throwable $_w_init_err) {}
+        }
+
         if ($is_verify_mode) {
             $db->close();
         }
@@ -1473,26 +1487,38 @@ if ($action === "submit_tame" || $action === "check_wild") {
             }
 
             $chunks = array_chunk($dp_list, 500);
+            $stmt_chk_500 = null;
+            if (count($dp_list) >= 500) {
+                $sql_chk_500 = "SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN (" . implode(",", array_fill(0, 500, "?")) . ");";
+                $stmt_chk_500 = $db->prepare($sql_chk_500);
+            }
             foreach ($chunks as $chunk) {
-                if (empty($chunk)) {
+                $cnt = count($chunk);
+                if ($cnt === 0) {
                     continue;
                 }
-                $placeholders = implode(",", array_fill(0, count($chunk), "?"));
-                $schk = $db->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
-
+                $is_500 = ($cnt === 500 && $stmt_chk_500 !== null);
+                if ($is_500) {
+                    $schk = $stmt_chk_500;
+                    $schk->reset();
+                } else {
+                    $placeholders = implode(",", array_fill(0, $cnt, "?"));
+                    $schk = $db->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
+                }
                 $map_by_x = [];
                 foreach ($chunk as $c_idx => $dp_item) {
                     $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
                     $map_by_x[$dp_item["bin_x"]][] = $dp_item["bin_dist"];
                 }
-
                 $sres = $schk->execute();
                 $matched_rows = [];
                 while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
                     $matched_rows[] = $row;
                 }
                 $sres->finalize();
-                $schk->close();
+                if (!$is_500) {
+                    $schk->close();
+                }
 
                 foreach ($matched_rows as $row) {
                     $bin_x = $row["dp_x"];
@@ -1575,6 +1601,10 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         exit;
                     }
                 }
+            }
+
+            if ($stmt_chk_500 !== null) {
+                $stmt_chk_500->close();
             }
 
             // Throttled worker telemetry in WILD mode: keep check_wild pure read-only.
