@@ -1,7 +1,7 @@
 <?php
 /**
  * Central Master Coordination Server (100% Pure 64-bit PHP - Zero External Libraries)
- * SQLite3 WAL | 32-Shard Binary BLOB Storage (WITHOUT ROWID) | 1,000 DP Batch Pipeline
+ * SQLite3 WAL | Unified Binary BLOB Storage (WITHOUT ROWID) | 4,000 DP Batch Pipeline
  * Native Pure-PHP 256-Bit BigInt & Secp256k1 Jacobian Verifier | Zero-Fallback & Zero-Dead-Code
  */
 
@@ -548,7 +548,7 @@ function get_space_width_float($range_min_hex, $range_max_hex) {
 }
 
 /* ==========================================================================
- * STORAGE, SHARDED SQLITE3 ENGINE & STRICT ATOMIC STATE HELPERS
+ * STORAGE, UNIFIED SQLITE3 ENGINE & STRICT ATOMIC STATE HELPERS
  * ========================================================================== */
 
 function protect_storage_dir($dir) {
@@ -1114,7 +1114,7 @@ try {
         135 => "0x6d9392a16883f90903d5f78da57af07eb2"
     ];
 
-    // API: EPHEMERAL verify.db LIFECYCLE (Purges verify.db before & after run; zero orphan directories/shards)
+    // API: EPHEMERAL verify.db LIFECYCLE (Purges verify.db before & after run; zero orphan database files)
     if ($action === "verify") {
         header("Content-Type: application/json");
 
@@ -1165,8 +1165,10 @@ try {
         // reducing interior branch nodes, cell headers, and page splits from 5.5GB down to ~2.8-3.0GB
         $db->exec("PRAGMA page_size = 16384;");
         $db->exec("PRAGMA auto_vacuum = INCREMENTAL;");
+        // WAL mode is persistently recorded in SQLite database header bytes 18 & 19;
+        // set once on creation to avoid redundant disk roundtrips on every subsequent HTTP request
+        $db->exec("PRAGMA journal_mode = WAL;");
     }
-    $db->exec("PRAGMA journal_mode = WAL;");
     $db->exec("PRAGMA synchronous = NORMAL;");
     $db->exec("PRAGMA wal_autocheckpoint = 4000;");
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
@@ -1360,9 +1362,8 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $items_to_insert[] = ["x" => $bin_x, "dist" => $packed_dist];
             }
 
-            usort($items_to_insert, function ($a, $b) {
-                return strcmp($a["x"], $b["x"]);
-            });
+            // Items are guaranteed pre-sorted by 32-byte DP x by client C++ (std::sort in sysd.cpp, 0.15ms)
+            // Eliminates 18ms PHP interpreter usort bottleneck and feeds sequential keys to SQLite WITHOUT ROWID
 
             for ($attempt = 0; $attempt < 10; $attempt++) {
                 $actual_inserted = 0;

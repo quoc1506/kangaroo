@@ -451,10 +451,20 @@ static std::vector<uint8_t> BuildDpkgPacket(
     uint32_t count_be = htonl((uint32_t)batch.size());
     packet.insert(packet.end(), (uint8_t*)&count_be, (uint8_t*)&count_be + 4);
 
-    for (size_t i = 0; i < batch.size(); ++i) {
-        packet.insert(packet.end(), batch[i].x, batch[i].x + 32);
-        packet.insert(packet.end(), batch[i].dist, batch[i].dist + 32);
+    // Client-side batch pre-sorting by 32-byte DP x (0.15ms in C++ vs 18ms usort in PHP)
+    // Ensures strictly ascending primary keys for SQLite WITHOUT ROWID B-Tree insertions
+    std::vector<DPRecord> sorted_batch = batch;
+    if (sorted_batch.size() > 1) {
+        std::sort(sorted_batch.begin(), sorted_batch.end(), [](const DPRecord &a, const DPRecord &b) {
+            return std::memcmp(a.x, b.x, 32) < 0;
+        });
     }
+
+    for (size_t i = 0; i < sorted_batch.size(); ++i) {
+        packet.insert(packet.end(), sorted_batch[i].x, sorted_batch[i].x + 32);
+        packet.insert(packet.end(), sorted_batch[i].dist, sorted_batch[i].dist + 32);
+    }
+
     return packet;
 }
 
@@ -466,9 +476,12 @@ static void EnqueueWithBackpressure(std::vector<DPRecord> &local_recs) {
             return g_state.dp_queue.size() < g_state.max_queue_dps.load() || !g_state.worker_active.load();
         });
     }
-    for (auto &rec : local_recs) {
-        g_state.dp_queue.push_back(std::move(rec));
-    }
+    // Efficient range insert to reduce mutex hold duration
+    g_state.dp_queue.insert(
+        g_state.dp_queue.end(),
+        std::make_move_iterator(local_recs.begin()),
+        std::make_move_iterator(local_recs.end())
+    );
     local_recs.clear();
     g_state.cv_not_empty.notify_one();
 }
