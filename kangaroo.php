@@ -1201,7 +1201,7 @@ try {
         ");
     }
 
-    if (!$db_existed && !$is_verify_mode) {
+    if ($db_needs_init && !$is_verify_mode) {
         $db->exec("
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('target_dp', '" . PUZZLE140_DEFAULT_TARGET_DP . "');
             INSERT OR IGNORE INTO system_settings (setting_key, setting_value) VALUES ('range_min', '0x80000000000000000000000000000000000');
