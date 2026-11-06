@@ -107,9 +107,19 @@ struct SessionStats {
     uint64_t wild_checked = 0;
 };
 
+static std::string GenerateDefaultWorkerId() {
+    uint64_t pid_v = (uint64_t)getpid();
+    uint64_t clk = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    std::random_device rd;
+    uint32_t rnd = rd();
+    std::ostringstream oss;
+    oss << "node_worker_" << std::hex << (pid_v & 0xffff) << "_" << ((clk ^ rnd) & 0xffffff);
+    return oss.str();
+}
+
 struct DaemonState {
     std::string server_url = DEFAULT_SERVER_URL;
-    std::string worker_id = "node_worker";
+    std::string worker_id = GenerateDefaultWorkerId();
     int num_threads = 0;
     bool verify_mode = false;
     bool use_gpu = false;
