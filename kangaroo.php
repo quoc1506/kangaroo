@@ -695,19 +695,24 @@ function increment_setting_int($db, $key, $delta) {
 }
 
 
-function reconcile_total_tame_traps($db, $force = false) {
-    if ($force) {
-        $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
-        set_setting($db, "total_tame_traps", (string)$actual);
-        return $actual;
-    }
+function get_total_tame_traps($db) {
     $curr = find_setting_or_null($db, "total_tame_traps");
     if ($curr === null) {
+        set_setting($db, "total_tame_traps", "0");
+        return 0;
+    }
+    return intval($curr);
+}
+
+function reconcile_total_tame_traps($db, $force = false) {
+    // Only in dedicated CLI terminal can a manual full table scan ever run if user explicitly forces it
+    if ($force && php_sapi_name() === "cli") {
+        @set_time_limit(0);
         $actual = intval($db->querySingle("SELECT COUNT(*) FROM tame_traps;"));
         set_setting($db, "total_tame_traps", (string)$actual);
         return $actual;
     }
-    return intval($curr);
+    return get_total_tame_traps($db);
 }
 
 
@@ -893,6 +898,7 @@ function calculate_database_size_mb($db_path) {
     $total_bytes = 0;
     foreach (["", "-wal", "-shm"] as $ext) {
         $f = $db_path . $ext;
+        @clearstatcache(true, $f);
         if (is_file($f)) {
             $sz = @filesize($f);
             if ($sz !== false) {
@@ -1725,6 +1731,14 @@ if ($action === "submit_tame" || $action === "check_wild") {
         $val = intval($payload["target_dp"]);
         set_setting($db, "target_dp", (string)$val);
         echo json_encode(["status" => "SUCCESS", "target_dp" => $val]);
+        exit;
+    }
+
+    // API: RECONCILE TOTAL TAME TRAPS
+    if ($action === "reconcile") {
+        header("Content-Type: application/json");
+        $actual = get_total_tame_traps($db);
+        echo json_encode(["status" => "SUCCESS", "total_tame_traps" => $actual]);
         exit;
     }
 

@@ -135,7 +135,10 @@ struct DaemonState {
     std::condition_variable cv_not_empty;
 } g_state;
 
+static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp);
+
 static CURL *g_main_curl = nullptr;
+static struct curl_slist *g_bin_headers = nullptr;
 
 static CURL *GetMainCurlHandle() {
     if (!g_main_curl) {
@@ -144,11 +147,28 @@ static CURL *GetMainCurlHandle() {
             std::cerr << "[-] Fatal: curl_easy_init failed\n";
             std::exit(1);
         }
+#ifdef CURL_HTTP_VERSION_2TLS
+        curl_easy_setopt(g_main_curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+#endif
+        curl_easy_setopt(g_main_curl, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(g_main_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(g_main_curl, CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(g_main_curl, CURLOPT_TCP_KEEPINTVL, 15L);
+        curl_easy_setopt(g_main_curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(g_main_curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(g_main_curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    }
+    if (!g_bin_headers) {
+        g_bin_headers = curl_slist_append(nullptr, "Content-Type: application/octet-stream");
     }
     return g_main_curl;
 }
 
 static void CleanupMainCurlHandle() {
+    if (g_bin_headers) {
+        curl_slist_free_all(g_bin_headers);
+        g_bin_headers = nullptr;
+    }
     if (g_main_curl) {
         curl_easy_cleanup(g_main_curl);
         g_main_curl = nullptr;
@@ -331,16 +351,11 @@ static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void 
 static HttpResult HttpGet(const std::string &url) {
     HttpResult out;
     CURL *curl = GetMainCurlHandle();
-    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, nullptr);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     return out;
@@ -349,23 +364,15 @@ static HttpResult HttpGet(const std::string &url) {
 static HttpResult HttpPostBinary(const std::string &url, const uint8_t *data, size_t len) {
     HttpResult out;
     CURL *curl = GetMainCurlHandle();
-    curl_easy_reset(curl);
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, g_bin_headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (const char*)data);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
-    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     out.curl_code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
-    curl_slist_free_all(headers);
     return out;
 }
 
@@ -1522,7 +1529,13 @@ static int RunKangarooSession(
 
     auto format_hashrate = [&](double mhs) -> std::string {
         std::ostringstream hr_ss;
-        hr_ss << std::fixed << std::setprecision(2) << mhs << " MH/s";
+        if (mhs >= 1000000.0) {
+            hr_ss << std::fixed << std::setprecision(2) << (mhs / 1000000.0) << " TH/s";
+        } else if (mhs >= 1000.0) {
+            hr_ss << std::fixed << std::setprecision(2) << (mhs / 1000.0) << " GH/s";
+        } else {
+            hr_ss << std::fixed << std::setprecision(2) << mhs << " MH/s";
+        }
         return hr_ss.str();
     };
 
