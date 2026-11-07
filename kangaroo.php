@@ -1183,8 +1183,8 @@ try {
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
-    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);
-    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_tame (dp_x BLOB NOT NULL, total_distance BLOB NOT NULL);");");
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);");
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_tame (dp_x BLOB NOT NULL, total_distance BLOB NOT NULL);");
 
 
     if ($db_needs_init) {
