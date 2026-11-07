@@ -279,6 +279,20 @@ typedef struct {
             "inputKangarooPinned[g * strideSize + t + 10 * nbThreadPerGroup] = (uint64_t)NB_JUMP;"
         )
 
+    old_cache = """  // Prefer L1 (We do not use __shared__ at all)
+  err = cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+  if(err != cudaSuccess) {
+    printf("GPUEngine: %s\\n",cudaGetErrorString(err));
+    return;
+  }"""
+    new_cache = """  // Prefer L1 (We do not use __shared__ at all)
+  cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+  cudaFuncSetCacheConfig(comp_kangaroos, cudaFuncCachePreferL1);
+  // Modern GPU architecture L1 maximize carveout (Volta, Turing, Ampere, Ada Lovelace, Hopper)
+  cudaFuncSetAttribute(comp_kangaroos, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxL1);"""
+    if old_cache in cu:
+        cu = cu.replace(old_cache, new_cache)
+
     if "if(d_respawn_buffer) cudaFree(d_respawn_buffer);" not in cu:
         cu = cu.replace(
             "  if(jumpPinned) cudaFreeHost(jumpPinned);",

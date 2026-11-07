@@ -265,6 +265,17 @@ static void ComputeSpawnSpan(Int &range_width, Int &out_span) {
     }
 }
 
+// Forward Tame coverage [range_min, range_max + range_width]: fully covers [k, k + W] wild walks
+static void ComputeTameSpan(Int &range_width, Int &out_span) {
+    Int min_span;
+    min_span.SetInt32(2048);
+    out_span.Set(&range_width);
+    out_span.ShiftL(1); // 2 * range_width (span covers k + [0, W] for any k in [range_min, range_max])
+    if (min_span.IsGreater(&out_span)) {
+        out_span.Set(&min_span);
+    }
+}
+
 class JumpTable {
 public:
     int max_bit = 73;
@@ -509,7 +520,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     Int range_width(&range_max);
     range_width.Sub(&range_min);
     Int spawn_span;
-    ComputeSpawnSpan(range_width, spawn_span);
+    ComputeTameSpan(range_width, spawn_span);
 
     const uint64_t rng_salt = (uint64_t)thread_id * 7919ULL + 0x517CC1B727220A95ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
@@ -587,7 +598,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
             px[g].Set(&rx);
             py[g].Set(&ry);
-            distance[g].ModAddK1order(&jt->d[j]);
+            distance[g].Add(&jt->d[j]);
             tame_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
@@ -617,22 +628,12 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
     EnqueueWithBackpressure(local_dp_buffer);
 }
 
-// WILD Worker Thread (CPU - Symmetric [-W/2, +W/2] Centered Offset)
+// WILD Worker Thread (CPU - Forward [K, K + W] Walk, Zero Dead Zone)
 static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Point target_pub, Int range_min, Int range_max) {
     Int range_width(&range_max);
     range_width.Sub(&range_min);
     Int spawn_span;
     ComputeSpawnSpan(range_width, spawn_span);
-
-    Int w_half(&range_width);
-    w_half.ShiftR(1);
-
-    Point target_shifted(target_pub);
-    if (!w_half.IsZero()) {
-        Point neg_half = secp->ComputePublicKey(&w_half);
-        neg_half.y.ModNeg();
-        target_shifted = SafeAddAffine(secp, target_pub, neg_half);
-    }
 
     const uint64_t rng_salt = (uint64_t)thread_id * 104729ULL + 0x9E3779B97F4A7C15ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
@@ -655,17 +656,16 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
             Point P;
             if (r_scalar.IsZero()) {
-                P = target_shifted;
+                P = target_pub;
             } else {
                 Point offset_pt = secp->ComputePublicKey(&r_scalar);
-                P = SafeAddAffine(secp, target_shifted, offset_pt);
+                P = SafeAddAffine(secp, target_pub, offset_pt);
             }
             if (P.isZero()) continue;
 
             px[g].Set(&P.x);
             py[g].Set(&P.y);
             distance[g].Set(&r_scalar);
-            distance[g].ModSubK1order(&w_half);
             wild_dp_count[g] = 0;
             wild_step_count[g] = 0;
             return;
@@ -715,7 +715,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
             px[g].Set(&rx);
             py[g].Set(&ry);
-            distance[g].ModAddK1order(&jt->d[j]);
+            distance[g].Add(&jt->d[j]);
             wild_step_count[g]++;
 
             if (IsDistinguishedPointFast(rx, dp_mask)) {
@@ -757,7 +757,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
     Int range_width(&range_max);
     range_width.Sub(&range_min);
     Int spawn_span;
-    ComputeSpawnSpan(range_width, spawn_span);
+    if (is_wild) { ComputeSpawnSpan(range_width, spawn_span); } else { ComputeTameSpan(range_width, spawn_span); }
 
     int gridX = 0, gridY = 0;
     if (!GPUEngine::GetGridSize(gpu_id, &gridX, &gridY) || gridX <= 0 || gridY <= 0) {
@@ -808,38 +808,26 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
     if (max_launches < 1) max_launches = 1;
     uint64_t current_launch = 0;
 
-    Int w_half(&range_width);
-    w_half.ShiftR(1);
-
-    Point target_shifted(target_pub);
-    if (is_wild && !w_half.IsZero()) {
-        Point neg_half = secp->ComputePublicKey(&w_half);
-        neg_half.y.ModNeg();
-        target_shifted = SafeAddAffine(secp, target_pub, neg_half);
-    }
-
     const uint64_t rng_salt = (uint64_t)gpu_id * 100003ULL + 0x243F6A8885A308D3ULL;
 
     auto make_kangaroo_state = [&](Point &out_p, Int &out_base, uint64_t salt_val) {
         Int loc_span(&spawn_span);
         Int loc_min(&range_min);
-        Int loc_whalf(&w_half);
-        Point loc_tshift(target_shifted);
         while (true) {
             if (is_wild) {
                 Int r_scalar;
                 ThreadRandRange(r_scalar, loc_span, salt_val);
                 Point P;
                 if (r_scalar.IsZero()) {
-                    P = loc_tshift;
+                    P = target_pub;
                 } else {
                     Point offset_pt = secp->ComputePublicKey(&r_scalar);
-                    P = SafeAddAffine(secp, loc_tshift, offset_pt);
+                    P = SafeAddAffine(secp, target_pub, offset_pt);
                 }
                 if (P.isZero()) continue;
+
                 out_p = P;
                 out_base.Set(&r_scalar);
-                out_base.ModSubK1order(&loc_whalf);
                 return;
             } else {
                 Int k_start;
@@ -865,8 +853,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
 
         Int loc_span(&spawn_span);
         Int loc_min(&range_min);
-        Int loc_whalf(&w_half);
-        Point loc_tshift(target_shifted);
+        Point loc_tshift(target_pub);
         Int dy, rx, ry, _s, _p;
 
         int pos = start_idx;
@@ -950,7 +937,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                             make_kangaroo_state(P, base_dist[idx], thread_salt);
                         } else {
                             base_dist[idx].Set(&scalars[b]);
-                            base_dist[idx].ModSubK1order(&loc_whalf);
                         }
                         px[idx].Set(&P.x);
                         py[idx].Set(&P.y);
@@ -967,7 +953,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                         px[idx].Set(&rx);
                         py[idx].Set(&ry);
                         base_dist[idx].Set(&scalars[b]);
-                        base_dist[idx].ModSubK1order(&loc_whalf);
                     }
                     zero_dists[idx].SetInt32(0);
                 }
@@ -1067,7 +1052,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 } else {
                     real_dist.Set(&base_dist[item.kIdx]);
                     Int d_walk((Int*)&item.d);
-                    real_dist.ModAddK1order(&d_walk);
+                    real_dist.Add(&d_walk);
                 }
 
                 DPRecord rec;
@@ -1109,8 +1094,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                 bool special[256];
                 Int loc_span(&spawn_span);
                 Int loc_min(&range_min);
-                Int loc_whalf(&w_half);
-                Point loc_tshift(target_shifted);
+                Point loc_tshift(target_pub);
                 Int dy, rx, ry, _s, _p;
 
                 for (size_t b = 0; b < r_chunk; ++b) {
@@ -1188,7 +1172,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                                 make_kangaroo_state(P, base_dist[kIdx], rng_salt);
                             } else {
                                 base_dist[kIdx].Set(&scalars[b]);
-                                base_dist[kIdx].ModSubK1order(&loc_whalf);
                             }
                             item.px.Set(&P.x);
                             item.py.Set(&P.y);
@@ -1202,7 +1185,6 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
                             ry.ModMulK1(&_s);
                             ry.ModSub(&pts[b].y);
                             base_dist[kIdx].Set(&scalars[b]);
-                            base_dist[kIdx].ModSubK1order(&loc_whalf);
                             item.px.Set(&rx);
                             item.py.Set(&ry);
                         }

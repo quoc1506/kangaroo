@@ -1183,7 +1183,8 @@ try {
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
-    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);");
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_tame (dp_x BLOB NOT NULL, total_distance BLOB NOT NULL);");");
 
 
     if ($db_needs_init) {
@@ -1378,42 +1379,31 @@ if ($action === "submit_tame" || $action === "check_wild") {
             // Items are guaranteed pre-sorted by 32-byte DP x by client C++ (std::sort in sysd.cpp, 0.15ms)
             // Eliminates 18ms PHP interpreter usort bottleneck and feeds sequential keys to SQLite WITHOUT ROWID
 
+            $actual_inserted = 0;
+            if ($batch_size > 0) {
+                // In-Memory Temporary Table batch ingestion for Tame traps: eliminates 9x chunked dynamic SQL & bind loops
+                $db->exec("BEGIN TRANSACTION;");
+                $t_ins = $db->prepare("INSERT INTO incoming_tame (dp_x, total_distance) VALUES (?, ?);");
+                foreach ($items_to_insert as $item) {
+                    $t_ins->bindValue(1, $item["x"], SQLITE3_BLOB);
+                    $t_ins->bindValue(2, $item["dist"], SQLITE3_BLOB);
+                    $t_ins->execute();
+                    $t_ins->reset();
+                }
+                $t_ins->close();
+                $db->exec("COMMIT;");
+            }
+
             for ($attempt = 0; $attempt < 10; $attempt++) {
-                $actual_inserted = 0;
                 $in_tx = false;
                 try {
                     $db->exec("BEGIN IMMEDIATE TRANSACTION;");
                     $in_tx = true;
 
-                    $chunks = array_chunk($items_to_insert, 450);
-                    $stmt450 = null;
-                    if (count($items_to_insert) >= 450) {
-                        $sql450 = "INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . implode(",", array_fill(0, 450, "(?, ?)")) . ";";
-                        $stmt450 = $db->prepare($sql450);
-                    }
-                    foreach ($chunks as $chunk) {
-                        $cnt = count($chunk);
-                        $is_450 = ($cnt === 450 && $stmt450 !== null);
-                        if ($is_450) {
-                            $stmt = $stmt450;
-                            $stmt->reset();
-                        } else {
-                            $placeholders = implode(",", array_fill(0, $cnt, "(?, ?)"));
-                            $stmt = $db->prepare("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) VALUES " . $placeholders . ";");
-                        }
-                        $param_idx = 1;
-                        foreach ($chunk as $item) {
-                            $stmt->bindValue($param_idx++, $item["x"], SQLITE3_BLOB);
-                            $stmt->bindValue($param_idx++, $item["dist"], SQLITE3_BLOB);
-                        }
-                        $stmt->execute();
-                        if (!$is_450) {
-                            $stmt->close();
-                        }
-                        $actual_inserted += $db->changes();
-                    }
-                    if ($stmt450 !== null) {
-                        $stmt450->close();
+                    if ($batch_size > 0) {
+                        $db->exec("INSERT OR IGNORE INTO tame_traps (dp_x, total_distance) SELECT dp_x, total_distance FROM incoming_tame;");
+                        $actual_inserted = $db->changes();
+                        $db->exec("DELETE FROM incoming_tame;");
                     }
 
                     if ($actual_inserted > 0) {
@@ -1451,6 +1441,9 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         try { $db->exec("ROLLBACK;"); } catch (Throwable $_rb) {}
                     }
                     if ($attempt === 9) {
+                        if ($batch_size > 0) {
+                            try { $db->exec("DELETE FROM incoming_tame;"); } catch (Throwable $_d) {}
+                        }
                         throw new DbBusyException("Database busy during batch commit");
                     }
                     usleep(15000 * ($attempt + 1) + rand(1000, 4000));
