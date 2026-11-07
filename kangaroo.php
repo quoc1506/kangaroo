@@ -1602,8 +1602,6 @@ if ($action === "submit_tame" || $action === "check_wild") {
                         ]);
                         exit;
                     }
-                }
-            }
 
 
 
