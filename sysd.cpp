@@ -73,7 +73,7 @@
 #ifdef NB_JUMP
 #undef NB_JUMP
 #endif
-#define NB_JUMP 32
+#define NB_JUMP 64
 
 // CPU_GRP_SIZE = 1024: TOÁN HỌC & KIẾN TRÚC TỐI ƯU CỦA JEAN-LUC PONS (KHÔNG ĐƯỢC GIẢM VỀ 128/256).
 // Lý do: Phép đảo modulo 256-bit (Int::ModInv - Lehmer/DivStep62) cực nặng, tốn ~800-1200 chu kỳ CPU.

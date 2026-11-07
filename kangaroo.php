@@ -1176,6 +1176,7 @@ try {
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
 
+
     if ($db_needs_init) {
         $db->exec("
             CREATE TABLE IF NOT EXISTS system_settings (

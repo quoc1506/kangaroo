@@ -415,8 +415,10 @@ def patch_constants():
     # 5. Ly do khong dung 4096: Overhead o 2048 da duoi 0.05%, 4096 khong tang hashrate thuc te nhung lam nhan doi do tre phan hoi Stop/BINGO.
     if "#define NB_RUN 64" in c:
         c = c.replace("#define NB_RUN 64", "#define NB_RUN 2048")
-        with open("Constants.h", "w") as f:
-            f.write(c)
+    if "#define NB_JUMP 32" in c:
+        c = c.replace("#define NB_JUMP 32", "#define NB_JUMP 64")
+    with open("Constants.h", "w") as f:
+        f.write(c)
 
 if __name__ == "__main__":
     patch_timer()
