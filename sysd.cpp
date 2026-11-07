@@ -503,7 +503,6 @@ inline uint64_t ComputeMaxKangarooSteps(int dp_bits, int max_jump_bit = 73) {
     if (target_exp >= 63) return 0x7FFFFFFFFFFFFFFFULL;
     return (1ULL << target_exp);
 }
-}
 
 // TAME Worker Thread (CPU - L1 Cache Aligned Montgomery Walk)
 static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int dp_bits, size_t flush_dp_target, Int range_min, Int range_max) {
