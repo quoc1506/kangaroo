@@ -1183,7 +1183,7 @@ try {
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
-    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);");
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB PRIMARY KEY, bin_dist BLOB NOT NULL) WITHOUT ROWID;");
     $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_tame (dp_x BLOB NOT NULL, total_distance BLOB NOT NULL);");
 
 
@@ -1381,16 +1381,25 @@ if ($action === "submit_tame" || $action === "check_wild") {
 
             $actual_inserted = 0;
             if ($batch_size > 0) {
-                // In-Memory Temporary Table batch ingestion for Tame traps: eliminates 9x chunked dynamic SQL & bind loops
+                // Multi-row chunk ingestion (250 rows / 500 params per INSERT):
+                // Eliminates 16,000 FFI context switches per 4,000 DP batch down to only 16 executions
                 $db->exec("BEGIN TRANSACTION;");
-                $t_ins = $db->prepare("INSERT INTO incoming_tame (dp_x, total_distance) VALUES (?, ?);");
-                foreach ($items_to_insert as $item) {
-                    $t_ins->bindValue(1, $item["x"], SQLITE3_BLOB);
-                    $t_ins->bindValue(2, $item["dist"], SQLITE3_BLOB);
+                $chunk_size = 250;
+                $total_items = count($items_to_insert);
+                for ($offset = 0; $offset < $total_items; $offset += $chunk_size) {
+                    $slice = array_slice($items_to_insert, $offset, $chunk_size);
+                    $slice_count = count($slice);
+                    if ($slice_count === 0) continue;
+                    $placeholders = implode(",", array_fill(0, $slice_count, "(?, ?)"));
+                    $t_ins = $db->prepare("INSERT INTO incoming_tame (dp_x, total_distance) VALUES " . $placeholders . ";");
+                    $p_idx = 1;
+                    foreach ($slice as $item) {
+                        $t_ins->bindValue($p_idx++, $item["x"], SQLITE3_BLOB);
+                        $t_ins->bindValue($p_idx++, $item["dist"], SQLITE3_BLOB);
+                    }
                     $t_ins->execute();
-                    $t_ins->reset();
+                    $t_ins->close();
                 }
-                $t_ins->close();
                 $db->exec("COMMIT;");
             }
 
@@ -1435,6 +1444,14 @@ if ($action === "submit_tame" || $action === "check_wild") {
                     $db->exec("COMMIT;");
                     $in_tx = false;
                     prune_stale_workers($db);
+
+                    // Active WAL Checkpoint (PASSIVE mode - 5% chance on successful trap insertion):
+                    // Prevents WAL file from bloating into gigabytes when concurrent reader locks are present
+                    if ($actual_inserted > 0 && mt_rand(1, 20) === 1) {
+                        try {
+                            $db->exec("PRAGMA wal_checkpoint(PASSIVE);");
+                        } catch (Throwable $_cp_ex) {}
+                    }
                     break;
                 } catch (Throwable $ex) {
                     if ($in_tx) {
@@ -1493,26 +1510,50 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $target_pubkey = PUZZLE140_TARGET_PUBKEY;
             }
 
-            // In-Memory Temporary Table JOIN check: eliminates 9x chunked queries & B-Tree rescans
+            // In-Memory Temporary Table JOIN check: Index-Organized Table (WITHOUT ROWID) with multi-row chunks
             $matched_rows = [];
             if ($batch_size > 0) {
+                // Multi-row chunk ingestion with INSERT OR REPLACE (250 rows / 500 params per chunk):
+                // Safe against internal duplicate wild DPs on PRIMARY KEY (dp_x) WITHOUT ROWID
                 $db->exec("BEGIN TRANSACTION;");
-                $ins_stmt = $db->prepare("INSERT INTO incoming_wild (dp_x, bin_dist) VALUES (?, ?);");
-                foreach ($dp_list as $dp_item) {
-                    $ins_stmt->bindValue(1, $dp_item["bin_x"], SQLITE3_BLOB);
-                    $ins_stmt->bindValue(2, $dp_item["bin_dist"], SQLITE3_BLOB);
+                $chunk_size = 250;
+                $total_items = count($dp_list);
+                for ($offset = 0; $offset < $total_items; $offset += $chunk_size) {
+                    $slice = array_slice($dp_list, $offset, $chunk_size);
+                    $slice_count = count($slice);
+                    if ($slice_count === 0) continue;
+                    $placeholders = implode(",", array_fill(0, $slice_count, "(?, ?)"));
+                    $ins_stmt = $db->prepare("INSERT OR REPLACE INTO incoming_wild (dp_x, bin_dist) VALUES " . $placeholders . ";");
+                    $p_idx = 1;
+                    foreach ($slice as $dp_item) {
+                        $ins_stmt->bindValue($p_idx++, $dp_item["bin_x"], SQLITE3_BLOB);
+                        $ins_stmt->bindValue($p_idx++, $dp_item["bin_dist"], SQLITE3_BLOB);
+                    }
                     $ins_stmt->execute();
-                    $ins_stmt->reset();
+                    $ins_stmt->close();
                 }
-                $ins_stmt->close();
                 $db->exec("COMMIT;");
 
+                // Resilient JOIN execution with 5-attempt retry loop & exponential backoff (Task 3)
                 $sql_join = "SELECT t.dp_x, t.total_distance, w.bin_dist FROM incoming_wild w JOIN tame_traps t ON t.dp_x = w.dp_x;";
-                $sres = $db->query($sql_join);
-                while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
-                    $matched_rows[] = $row;
+                for ($j_attempt = 0; $j_attempt < 5; $j_attempt++) {
+                    try {
+                        $sres = $db->query($sql_join);
+                        if ($sres !== false) {
+                            while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
+                                $matched_rows[] = $row;
+                            }
+                            $sres->finalize();
+                            break;
+                        }
+                    } catch (Throwable $_j_ex) {
+                        if ($j_attempt === 4) {
+                            $db->exec("DELETE FROM incoming_wild;");
+                            throw new DbBusyException("Database busy during wild collision check: " . $_j_ex->getMessage());
+                        }
+                        usleep(10000 * ($j_attempt + 1) + rand(1000, 3000));
+                    }
                 }
-                $sres->finalize();
                 $db->exec("DELETE FROM incoming_wild;");
             }
 
