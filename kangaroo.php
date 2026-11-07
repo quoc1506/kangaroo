@@ -329,9 +329,8 @@ function fp_inv($a, $P, $ONE) {
 }
 
 function fn_mod($a, $N) {
-    if (u256_cmp($a, $N) >= 0) {
-        list($r, $_) = u256_sub($a, $N);
-        return $r;
+    while (u256_cmp($a, $N) >= 0) {
+        list($a, $_) = u256_sub($a, $N);
     }
     return $a;
 }
@@ -850,8 +849,17 @@ function query_active_workers($db) {
             $act_res = $db->query("SELECT hashrate, last_seen FROM active_workers WHERE last_seen >= datetime('now', '-120 seconds');");
             while ($act = $act_res->fetchArray(SQLITE3_ASSOC)) {
                 $online_count++;
-                if (preg_match("/([\d\.]+)/", $act["hashrate"], $m)) {
-                    $total_hashrate_mhs += floatval($m[1]);
+                if (preg_match("/([\d\.]+)\s*([a-zA-Z\/]+)?/", $act["hashrate"], $m)) {
+                    $val = floatval($m[1]);
+                    $unit = isset($m[2]) ? strtoupper(trim($m[2])) : "MH/S";
+                    if ($unit === "GH/S" || $unit === "G") {
+                        $val *= 1000.0;
+                    } elseif ($unit === "TH/S" || $unit === "T") {
+                        $val *= 1000000.0;
+                    } elseif ($unit === "KH/S" || $unit === "K") {
+                        $val /= 1000.0;
+                    }
+                    $total_hashrate_mhs += $val;
                 }
             }
             $act_res->finalize();
@@ -1175,6 +1183,7 @@ try {
     $db->exec("PRAGMA cache_size = " . ($is_verify_mode ? "-4096" : "-262144") . ";");
     $db->exec("PRAGMA mmap_size = " . ($is_verify_mode ? "33554432" : "2147483648") . ";");
     $db->exec("PRAGMA temp_store = MEMORY;");
+    $db->exec("CREATE TEMP TABLE IF NOT EXISTS incoming_wild (dp_x BLOB NOT NULL, bin_dist BLOB NOT NULL);");
 
 
     if ($db_needs_init) {
@@ -1491,58 +1500,46 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 $target_pubkey = PUZZLE140_TARGET_PUBKEY;
             }
 
-            $chunks = array_chunk($dp_list, 450);
-            $stmt_chk_450 = null;
-            if (count($dp_list) >= 450) {
-                $sql_chk_450 = "SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN (" . implode(",", array_fill(0, 450, "?")) . ");";
-                $stmt_chk_450 = $db->prepare($sql_chk_450);
-            }
-            foreach ($chunks as $chunk) {
-                $cnt = count($chunk);
-                if ($cnt === 0) {
-                    continue;
+            // In-Memory Temporary Table JOIN check: eliminates 9x chunked queries & B-Tree rescans
+            $matched_rows = [];
+            if ($batch_size > 0) {
+                $db->exec("BEGIN TRANSACTION;");
+                $ins_stmt = $db->prepare("INSERT INTO incoming_wild (dp_x, bin_dist) VALUES (?, ?);");
+                foreach ($dp_list as $dp_item) {
+                    $ins_stmt->bindValue(1, $dp_item["bin_x"], SQLITE3_BLOB);
+                    $ins_stmt->bindValue(2, $dp_item["bin_dist"], SQLITE3_BLOB);
+                    $ins_stmt->execute();
+                    $ins_stmt->reset();
                 }
-                $is_450 = ($cnt === 450 && $stmt_chk_450 !== null);
-                if ($is_450) {
-                    $schk = $stmt_chk_450;
-                    $schk->reset();
-                } else {
-                    $placeholders = implode(",", array_fill(0, $cnt, "?"));
-                    $schk = $db->prepare("SELECT dp_x, total_distance FROM tame_traps WHERE dp_x IN ($placeholders);");
-                }
-                $map_by_x = [];
-                foreach ($chunk as $c_idx => $dp_item) {
-                    $schk->bindValue($c_idx + 1, $dp_item["bin_x"], SQLITE3_BLOB);
-                    $map_by_x[$dp_item["bin_x"]][] = $dp_item["bin_dist"];
-                }
-                $sres = $schk->execute();
-                $matched_rows = [];
+                $ins_stmt->close();
+                $db->exec("COMMIT;");
+
+                $sql_join = "SELECT t.dp_x, t.total_distance, w.bin_dist FROM incoming_wild w JOIN tame_traps t ON t.dp_x = w.dp_x;";
+                $sres = $db->query($sql_join);
                 while ($row = $sres->fetchArray(SQLITE3_ASSOC)) {
                     $matched_rows[] = $row;
                 }
                 $sres->finalize();
-                if (!$is_450) {
-                    $schk->close();
+                $db->exec("DELETE FROM incoming_wild;");
+            }
+
+            foreach ($matched_rows as $row) {
+                $bin_x = $row["dp_x"];
+                $raw_tame_dist = $row["total_distance"];
+                if (strlen($raw_tame_dist) < 32) {
+                    $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
+                }
+                $tame_dist_hex = bin2hex($raw_tame_dist);
+                $wild_dist_hex = bin2hex($row["bin_dist"]);
+                $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
+
+                if (!$cands["is_verified"]) {
+                    continue;
                 }
 
-                foreach ($matched_rows as $row) {
-                    $bin_x = $row["dp_x"];
-                    $wild_dists = isset($map_by_x[$bin_x]) ? $map_by_x[$bin_x] : [];
-                    $raw_tame_dist = $row["total_distance"];
-                    if (strlen($raw_tame_dist) < 32) {
-                        $raw_tame_dist = str_pad($raw_tame_dist, 32, "\0", STR_PAD_LEFT);
-                    }
-                    $tame_dist_hex = bin2hex($raw_tame_dist);
-                    foreach ($wild_dists as $bin_dist) {
-                        $wild_dist_hex = bin2hex($bin_dist);
-                        $cands = solve_candidate_keys($range_min, $range_max, $tame_dist_hex, $wild_dist_hex, $target_pubkey);
-
-                        if (!$cands["is_verified"]) {
-                            continue;
-                        }
-
-                        $collision_dp_hex = "0x" . bin2hex($bin_x);
-                        $total_traps_now = intval(get_required_setting($db, "total_tame_traps"));
+                $collision_dp_hex = "0x" . bin2hex($bin_x);
+                // Defensive reading: prevents 500 error if key is unseeded
+                $total_traps_now = intval(find_setting_or_null($db, "total_tame_traps") ?? 0);
 
                         if ($batch_size > 0) {
                             increment_setting_int($db, "total_wild_dps", $batch_size);
@@ -1608,9 +1605,7 @@ if ($action === "submit_tame" || $action === "check_wild") {
                 }
             }
 
-            if ($stmt_chk_450 !== null) {
-                $stmt_chk_450->close();
-            }
+
 
             for ($w_att = 0; $w_att < 5; $w_att++) {
                 $in_w_tx = false;

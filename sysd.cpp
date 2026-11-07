@@ -267,6 +267,7 @@ static void ComputeSpawnSpan(Int &range_width, Int &out_span) {
 
 class JumpTable {
 public:
+    int max_bit = 73;
     alignas(64) Int d[NB_JUMP];
     alignas(64) Point J[NB_JUMP];
     alignas(64) Int Jx[NB_JUMP];
@@ -284,6 +285,7 @@ public:
         // For Puzzle 140 (139 bits): bit range 60 to 73 gives average jump ~ 2^69.4 (30-40% step reduction)
         int max_bit = (w_bits / 2) + 4;
         if (max_bit > 120) max_bit = 120;
+        this->max_bit = max_bit;
         int span = (max_bit > 16) ? 13 : std::max(1, max_bit - 1);
         int min_bit = max_bit - span;
         if (min_bit < 1) min_bit = 1;
@@ -491,10 +493,16 @@ inline bool IsDistinguishedPointFast(const Int &x, uint64_t mask) {
     return (x.bits64[3] & mask) == 0ULL;
 }
 
-inline uint64_t ComputeMaxKangarooSteps(int dp_bits) {
+// Guards GPU Add128 distance accumulator against 128-bit overflow.
+// With jump size up to 2^max_jump_bit, total steps S must satisfy:
+// S * 2^max_jump_bit < 2^127 => log2(S) <= 126 - max_jump_bit.
+inline uint64_t ComputeMaxKangarooSteps(int dp_bits, int max_jump_bit = 73) {
     if (dp_bits <= 21) return 67108864ULL;
-    if (dp_bits >= 58) return ~0ULL;
-    return (1ULL << (dp_bits + 5));
+    int max_safe_exp = 126 - std::min(120, std::max(1, max_jump_bit));
+    int target_exp = std::min(dp_bits + 5, max_safe_exp);
+    if (target_exp >= 63) return 0x7FFFFFFFFFFFFFFFULL;
+    return (1ULL << target_exp);
+}
 }
 
 // TAME Worker Thread (CPU - L1 Cache Aligned Montgomery Walk)
@@ -506,7 +514,7 @@ static void WorkerTameThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     const uint64_t rng_salt = (uint64_t)thread_id * 7919ULL + 0x517CC1B727220A95ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
-    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits, jt->max_bit);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) Int px[CPU_GRP_SIZE];
@@ -629,7 +637,7 @@ static void WorkerWildThread(int thread_id, Secp256K1 *secp, JumpTable *jt, int 
 
     const uint64_t rng_salt = (uint64_t)thread_id * 104729ULL + 0x9E3779B97F4A7C15ULL;
     const uint64_t dp_mask = MakeDPMask(dp_bits);
-    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits, jt->max_bit);
 
     IntGroup grp(CPU_GRP_SIZE);
     alignas(64) Int px[CPU_GRP_SIZE];
@@ -796,7 +804,7 @@ static void WorkerGpuThread(int gpu_id, size_t active_gpu_count, Secp256K1 *secp
     std::vector<Int> base_dist(total_kangaroos);
     std::vector<uint32_t> gpu_dp_count(total_kangaroos, 0);
     std::vector<uint64_t> gpu_spawn_launch(total_kangaroos, 0);
-    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits);
+    const uint64_t max_kangaroo_steps = ComputeMaxKangarooSteps(dp_bits, jt->max_bit);
     uint64_t max_launches = max_kangaroo_steps / NB_RUN;
     if (max_launches < 1) max_launches = 1;
     uint64_t current_launch = 0;
